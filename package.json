@@ -1,0 +1,51 @@
+{
+  "name": "@praesidia/audit-verifier",
+  "version": "0.1.0",
+  "description": "Offline verifier CLI for Praesidia compliance bundles. Zero runtime dependencies.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "praesidia-verify": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0",
+    "@types/node": "^20.0.0"
+  },
+  "keywords": [
+    "praesidia",
+    "audit",
+    "compliance",
+    "verifier",
+    "ed25519",
+    "merkle",
+    "offline"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
