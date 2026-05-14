@@ -137,6 +137,79 @@ export function signEd25519(
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// ECDSA-P256-SHA256
+// ════════════════════════════════════════════════════════════════════════
+
+/**
+ * Verify an ECDSA-P256-SHA256 signature. Returns `false` (never throws)
+ * on any malformed input or mismatched signature.
+ *
+ * NX-TAC-02 — The KMS substrate path in be-core (AWS KMS, Vault Transit)
+ * mints ECDSA-P256 keys and signs with `ECDSA_SHA_256`. Bundles emitted
+ * by those tenants carried `signatureAlgorithm: 'ECDSA_P256_SHA256'`
+ * but the offline verifier only knew Ed25519, rejecting every
+ * KMS-substrate bundle as malformed. This helper closes that gap.
+ *
+ * On-the-wire format (matches `CryptoUtilsService.verifySignature`):
+ *   - publicKey: SPKI DER (≈ 91 bytes for P-256).
+ *   - signature: base64 of DER-encoded (r, s).
+ *
+ * @param message       The exact bytes that were signed.
+ * @param signatureB64  Standard base64 of the DER-encoded ECDSA signature.
+ * @param publicKey     SPKI-DER-encoded P-256 public key.
+ */
+export function verifyEcdsaP256(
+  message: Uint8Array,
+  signatureB64: string,
+  publicKey: Uint8Array,
+): boolean {
+  try {
+    if (typeof signatureB64 !== 'string' || signatureB64.length === 0) {
+      return false;
+    }
+    if (publicKey.length === 0) {
+      return false;
+    }
+    const sig = Buffer.from(signatureB64, 'base64');
+    if (sig.length === 0) {
+      return false;
+    }
+    const keyObject = crypto.createPublicKey({
+      key: Buffer.from(publicKey),
+      format: 'der',
+      type: 'spki',
+    });
+    return crypto.verify('sha256', Buffer.from(message), keyObject, sig);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Dispatcher across the supported signature algorithms. Manifest and
+ * bundle code call this rather than the per-algorithm helpers so the
+ * verifier surface stays algorithm-agnostic.
+ *
+ * Unknown algorithms fail closed.
+ */
+export type BundleSignatureAlgorithm = 'Ed25519' | 'ECDSA_P256_SHA256';
+
+export function verifySignature(
+  algorithm: BundleSignatureAlgorithm,
+  message: Uint8Array,
+  signatureB64: string,
+  publicKey: Uint8Array,
+): boolean {
+  if (algorithm === 'Ed25519') {
+    return verifyEd25519(message, signatureB64, publicKey);
+  }
+  if (algorithm === 'ECDSA_P256_SHA256') {
+    return verifyEcdsaP256(message, signatureB64, publicKey);
+  }
+  return false;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Merkle (RFC 6962, SHA-256, duplicate-last for odd levels)
 // ════════════════════════════════════════════════════════════════════════
 

@@ -42,7 +42,8 @@
 import {
   canonicalJson,
   sha256,
-  verifyEd25519,
+  verifySignature,
+  type BundleSignatureAlgorithm,
   merkleVerify,
   type MerkleProof,
   GENESIS_PREV_ROW_HASH,
@@ -67,7 +68,11 @@ interface BundleManifest {
   rootCount: number;
   keyVersions: ManifestKeyVersionEntry[];
   generatedAt: string;
-  signatureAlgorithm: 'Ed25519';
+  // NX-TAC-02 — Bundles emitted by KMS-substrate tenants carry
+  // 'ECDSA_P256_SHA256'. Bundles emitted by the local-aes-gcm
+  // substrate continue to carry 'Ed25519'. The verifier dispatches
+  // on this field via `verifySignature`.
+  signatureAlgorithm: BundleSignatureAlgorithm;
   signature: string;
   signatureKeyVersion: number;
 }
@@ -217,13 +222,25 @@ export async function verifyBundle(
   const rowsNdjson = gunzip(byName.get('rows.ndjson.gz')!.data);
   const rows = parseNdjson<BundleRow>(rowsNdjson);
 
-  const rowSigResult = verifyRowSignatures(rows, publicKeys);
+  // NX-TAC-02 — Thread the manifest's signatureAlgorithm into the
+  // row + root signature checks. Every signature in a bundle uses
+  // the same algorithm as the manifest (be-core's producer never
+  // mixes algorithms within one bundle).
+  const rowSigResult = verifyRowSignatures(
+    rows,
+    publicKeys,
+    manifest.signatureAlgorithm,
+  );
   const chainResult = verifyChain(rows);
 
   // 5) Parse + verify roots.
   const rootsNdjson = gunzip(byName.get('roots.ndjson.gz')!.data);
   const roots = parseNdjson<BundleRoot>(rootsNdjson);
-  const rootSigResult = verifyRootSignatures(roots, publicKeys);
+  const rootSigResult = verifyRootSignatures(
+    roots,
+    publicKeys,
+    manifest.signatureAlgorithm,
+  );
 
   // 6) Parse + verify inclusion proofs.
   const proofsNdjson = gunzip(byName.get('proofs.ndjson.gz')!.data);
@@ -293,7 +310,15 @@ function verifyManifest(
     signatureAlgorithm: manifest.signatureAlgorithm,
   };
   const bytes = canonicalJson(signable);
-  const ok = verifyEd25519(bytes, manifest.signature, pub);
+  // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
+  // A bundle whose `signatureAlgorithm` is ECDSA_P256_SHA256 is now
+  // verifiable (was previously rejected outright).
+  const ok = verifySignature(
+    manifest.signatureAlgorithm,
+    bytes,
+    manifest.signature,
+    pub,
+  );
   return ok
     ? { ok: true, checked: 1, failed: 0 }
     : {
@@ -307,6 +332,7 @@ function verifyManifest(
 function verifyRowSignatures(
   rows: BundleRow[],
   publicKeys: Map<number, Uint8Array>,
+  algorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
@@ -323,7 +349,7 @@ function verifyRowSignatures(
     }
     const signable = signableRow(row);
     const bytes = canonicalJson(signable);
-    if (!verifyEd25519(bytes, row.signature, pub)) {
+    if (!verifySignature(algorithm, bytes, row.signature, pub)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;
@@ -368,6 +394,7 @@ function verifyChain(rows: BundleRow[]): ComponentResult {
 function verifyRootSignatures(
   roots: BundleRoot[],
   publicKeys: Map<number, Uint8Array>,
+  algorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
@@ -390,7 +417,7 @@ function verifyRootSignatures(
       periodEnd: root.periodEnd,
       rowCount: root.rowCount,
     });
-    if (!verifyEd25519(bytes, root.signature, pub)) {
+    if (!verifySignature(algorithm, bytes, root.signature, pub)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
