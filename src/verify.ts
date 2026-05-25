@@ -115,6 +115,16 @@ interface BundleRow {
   keyVersion: number;
   signedAt: string | null;
   prevRowHash: string;
+  /**
+   * AUDIT-2026-05-01 — Per-row signature algorithm tag. Optional so
+   * pre-AUDIT-01 bundles (which only carried `manifest.signatureAlgorithm`)
+   * continue to verify; in that case the verifier falls back to the
+   * manifest's tag and ultimately to `'Ed25519'`. Bundles produced
+   * after AUDIT-01 ship the tag on every row so a tenant whose history
+   * mixes substrates (Ed25519 pre-KMS → ECDSA-P256 post-KMS) verifies
+   * row-by-row under the correct primitive.
+   */
+  signatureAlgorithm?: BundleSignatureAlgorithm;
 }
 
 interface BundleRoot {
@@ -142,6 +152,14 @@ interface BundleRoot {
     receipt: string;
     anchoredAt: string;
   }>;
+  /**
+   * AUDIT-2026-05-01 — Per-root signature algorithm. AUDIT-02 already
+   * wired the writer to emit this on every root; the verifier now
+   * dispatches on the per-root tag (rather than the manifest-level one)
+   * so a bundle with mixed-substrate roots verifies correctly.
+   * Optional for back-compat with pre-AUDIT-02 bundles.
+   */
+  signatureAlgorithm?: BundleSignatureAlgorithm;
 }
 
 interface BundleProofEntry {
@@ -390,7 +408,7 @@ function verifyManifest(
 function verifyRowSignatures(
   rows: BundleRow[],
   publicKeys: Map<number, PublicKeyRecord>,
-  algorithm: BundleSignatureAlgorithm,
+  manifestAlgorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
@@ -405,6 +423,26 @@ function verifyRowSignatures(
       }
       continue;
     }
+    // AUDIT-2026-05-01 — Per-row algorithm dispatch.
+    //
+    // A tenant whose history straddles a substrate cutover
+    // (`local-aes-gcm` Ed25519 → `aws-kms` ECDSA-P256-SHA256) can have
+    // rows of BOTH algorithms in the same bundle. The exporter ships
+    // `signatureAlgorithm` on every row (AUDIT-2026-05-01); fall back
+    // to the manifest's algorithm — and ultimately to `'Ed25519'` via
+    // the manifest default — for pre-AUDIT-01 bundles that omit the
+    // field.
+    //
+    // Downgrade defence: if an attacker swaps `signatureAlgorithm` from
+    // `'ECDSA_P256_SHA256'` to `'Ed25519'` (or vice versa) on a row to
+    // try to coerce the verifier into the wrong primitive,
+    // `crypto.createPublicKey` will succeed but `crypto.verify` will
+    // fail because the key type does not match the algorithm. The
+    // dispatcher therefore returns `false` and the row is rejected —
+    // the algorithm field is not part of the canonical signing bytes,
+    // but the key-type mismatch makes the downgrade unobservable to
+    // the verifier in the success direction.
+    const rowAlgorithm = row.signatureAlgorithm ?? manifestAlgorithm;
     // AUDIT-2026-05-14 — REVOKED-key acceptance window.
     //
     // A row signed BEFORE the key was revoked still verifies (the
@@ -429,7 +467,7 @@ function verifyRowSignatures(
     }
     const signable = signableRow(row);
     const bytes = canonicalJson(signable);
-    if (!verifySignature(algorithm, bytes, row.signature, entry.publicKey)) {
+    if (!verifySignature(rowAlgorithm, bytes, row.signature, entry.publicKey)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;
@@ -474,7 +512,7 @@ function verifyChain(rows: BundleRow[]): ComponentResult {
 function verifyRootSignatures(
   roots: BundleRoot[],
   publicKeys: Map<number, PublicKeyRecord>,
-  algorithm: BundleSignatureAlgorithm,
+  manifestAlgorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
@@ -514,7 +552,12 @@ function verifyRootSignatures(
       periodEnd: root.periodEnd,
       rowCount: root.rowCount,
     });
-    if (!verifySignature(algorithm, bytes, root.signature, entry.publicKey)) {
+    // AUDIT-2026-05-01 — Per-root algorithm dispatch with manifest
+    // fallback (mirrors `verifyRowSignatures`). A bundle whose history
+    // straddles a substrate cutover ships roots of both algorithms;
+    // the per-root tag lets each one verify under its own primitive.
+    const rootAlgorithm = root.signatureAlgorithm ?? manifestAlgorithm;
+    if (!verifySignature(rootAlgorithm, bytes, root.signature, entry.publicKey)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;

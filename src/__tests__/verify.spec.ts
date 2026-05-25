@@ -17,6 +17,7 @@
 
 import { describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
+import * as zlib from 'node:zlib';
 
 import { verifyBundle } from '../verify.js';
 import {
@@ -25,6 +26,8 @@ import {
   sha256,
   merkleBuild,
   merkleProof,
+  isLowSP256,
+  extractEcdsaSFromSignature,
   GENESIS_PREV_ROW_HASH,
 } from '../crypto.js';
 import { writeZip, gzipDeterministic, readZip } from '../zip.js';
@@ -745,6 +748,295 @@ describe('verifyBundle', () => {
         { provider: 'rekor', receipt: 'rekor:9001' },
         { provider: 's3', receipt: 's3:b:k:v' },
       ]);
+    });
+  });
+
+  /**
+   * AUDIT-2026-05-01 — Algorithm-aware verifier.
+   *
+   * Bundles produced under the `aws-kms` substrate carry
+   * `signatureAlgorithm: 'ECDSA_P256_SHA256'`. The verifier now
+   * dispatches per-envelope (manifest, row, root) on the declared
+   * algorithm so KMS-substrate bundles round-trip cleanly. The
+   * downgrade defence relies on the natural key-type mismatch inside
+   * `crypto.verify` — `signatureAlgorithm` is intentionally NOT part
+   * of the canonical signing bytes, but a forged downgrade ends up
+   * feeding (e.g.) an Ed25519 SPKI to `crypto.verify('sha256', ...)`,
+   * which returns `false`.
+   */
+  describe('AUDIT-2026-05-01 — algorithm-aware envelope dispatch', () => {
+    /**
+     * Helper — sign `message` with `privateKey` using ECDSA-P256-SHA256
+     * and re-sign until the result satisfies the canonical low-s rule
+     * (AUDIT-21). Mirrors the substrate's sign-side flip so the
+     * fixture bundles always carry signatures the verifier will accept.
+     */
+    function signLowSP256(
+      message: Buffer,
+      privateKey: crypto.KeyObject,
+    ): Buffer {
+      for (let i = 0; i < 64; i++) {
+        const candidate = crypto.sign('sha256', message, privateKey);
+        if (isLowSP256(candidate)) {
+          return candidate;
+        }
+        // Flip s to n - s and rebuild a canonical DER. Reuses the
+        // helper signature `(r, s) → (r, n - s)`; cheaper than
+        // rolling fresh randomness.
+        const s = extractEcdsaSFromSignature(candidate)!;
+        const P256_N = BigInt(
+          '0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551',
+        );
+        return reencodeDerWithS(candidate, P256_N - s);
+      }
+      throw new Error('unreachable');
+    }
+
+    /** DER re-encode with a new s value — same helper as the low-s spec. */
+    function reencodeDerWithS(sig: Buffer, newS: bigint): Buffer {
+      if (sig[0] !== 0x30) {
+        throw new Error('not DER');
+      }
+      let off = 2;
+      const firstLen = sig[1]!;
+      if (firstLen & 0x80) {
+        off += firstLen & 0x7f;
+      }
+      if (sig[off] !== 0x02) {
+        throw new Error('expected INTEGER r');
+      }
+      const rLen = sig[off + 1]!;
+      const rBytes = sig.subarray(off + 2, off + 2 + rLen);
+      let sHex = newS.toString(16);
+      if (sHex.length % 2 === 1) {
+        sHex = '0' + sHex;
+      }
+      let sBytes = Buffer.from(sHex, 'hex');
+      while (sBytes.length > 1 && sBytes[0] === 0x00) {
+        sBytes = sBytes.subarray(1);
+      }
+      if (sBytes[0]! & 0x80) {
+        sBytes = Buffer.concat([Buffer.from([0x00]), sBytes]);
+      }
+      const rField = Buffer.concat([Buffer.from([0x02, rBytes.length]), rBytes]);
+      const sField = Buffer.concat([Buffer.from([0x02, sBytes.length]), sBytes]);
+      const inner = Buffer.concat([rField, sField]);
+      return Buffer.concat([Buffer.from([0x30, inner.length]), inner]);
+    }
+
+    /**
+     * Build a single-row ECDSA-P256 signed bundle. Mirrors the
+     * Ed25519 `buildFixtureBundle` but routes every signature through
+     * `crypto.sign('sha256', ...)` against a P-256 keypair. The
+     * resulting bundle declares `signatureAlgorithm: 'ECDSA_P256_SHA256'`
+     * on the manifest, the root, and every row.
+     */
+    function buildEcdsaFixtureBundle(): { zip: Buffer } {
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'P-256',
+      });
+      const publicKeyDer = publicKey.export({ format: 'der', type: 'spki' });
+      const publicKeyDerB64 = Buffer.from(publicKeyDer).toString('base64');
+      const keyVersion = 1;
+      const orgId = '00000000-0000-0000-0000-000000000abc';
+      const baseTs = Date.UTC(2026, 4, 1, 0, 0, 0);
+
+      // ── Single row, deterministic shape ─────────────────────────────
+      const partial = {
+        organizationId: orgId,
+        action: 'agent.created',
+        actorId: '00000000-0000-0000-0000-00000000aa01',
+        actorType: 'user',
+        resourceType: 'agent',
+        resourceId: 'agent-0',
+        teamId: null,
+        agentId: 'agent-0',
+        summary: 'Created agent: Agent 0',
+        details: { agentId: 'agent-0', name: 'Agent 0' },
+        createdAt: isoSecond(baseTs, 0),
+      };
+      const signable = signableRow(partial);
+      const canonical = canonicalJson(signable);
+      const rowSig = signLowSP256(canonical, privateKey);
+      const rowSignatureB64 = rowSig.toString('base64');
+
+      const row: FixtureRow & { signatureAlgorithm: string } = {
+        id: 'row-0',
+        ...partial,
+        signature: rowSignatureB64,
+        keyVersion,
+        signedAt: isoSecond(baseTs, 1),
+        prevRowHash: GENESIS_PREV_ROW_HASH,
+        signatureAlgorithm: 'ECDSA_P256_SHA256',
+      };
+
+      // ── Merkle root over the single leaf ────────────────────────────
+      const leaf = new Uint8Array(Buffer.concat([canonical, rowSig]));
+      const tree = merkleBuild([leaf]);
+      const rootHashB64 = Buffer.from(tree.root).toString('base64');
+      const periodStart = isoSecond(baseTs, 0);
+      const periodEnd = isoSecond(baseTs, 60 * 60);
+      const rootMessage = canonicalJson({
+        rootHash: rootHashB64,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+      });
+      const rootSigBytes = signLowSP256(rootMessage, privateKey);
+      const root: FixtureRoot & { signatureAlgorithm: string } = {
+        id: 'root-1',
+        organizationId: orgId,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+        rootHash: rootHashB64,
+        signature: rootSigBytes.toString('base64'),
+        keyVersion,
+        signedAt: isoSecond(baseTs, 60 * 60 + 5),
+        anchoredAt: null,
+        anchorReceipt: null,
+        signatureAlgorithm: 'ECDSA_P256_SHA256',
+      };
+
+      // ── Single inclusion proof ──────────────────────────────────────
+      const proof = merkleProof([leaf], 0);
+      const proofs: FixtureProof[] = [
+        {
+          rowId: row.id,
+          index: proof.index,
+          proof: proof.siblings.map((s) => Buffer.from(s).toString('base64')),
+          rootHash: rootHashB64,
+        },
+      ];
+
+      // ── Manifest signed under ECDSA-P256 ────────────────────────────
+      const generatedAt = isoSecond(baseTs, 60 * 60 + 30);
+      const manifestSans = {
+        version: 1,
+        orgId,
+        from: periodStart,
+        to: periodEnd,
+        rowCount: 1,
+        rootCount: 1,
+        keyVersions: [{ keyVersion, publicKey: publicKeyDerB64 }],
+        generatedAt,
+        signatureAlgorithm: 'ECDSA_P256_SHA256' as const,
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSigBytes = signLowSP256(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSigBytes.toString('base64'),
+        signatureKeyVersion: keyVersion,
+      };
+
+      const publicKeys: Record<string, string> = {
+        [String(keyVersion)]: publicKeyDerB64,
+      };
+      const rowsNdjson = Buffer.from(JSON.stringify(row) + '\n', 'utf8');
+      const rootsNdjson = Buffer.from(JSON.stringify(root) + '\n', 'utf8');
+      const proofsNdjson = Buffer.from(
+        proofs.map((p) => JSON.stringify(p)).join('\n') + '\n',
+        'utf8',
+      );
+
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: gzipDeterministic(proofsNdjson) },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+      ]);
+
+      return { zip };
+    }
+
+    it('round-trips an ECDSA-P256-SHA256 signed bundle', async () => {
+      const { zip } = buildEcdsaFixtureBundle();
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
+      expect(report.manifest.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.rowSignatures.checked).toBe(1);
+      expect(report.rowSignatures.failed).toBe(0);
+      expect(report.rootSignatures.ok).toBe(true);
+      expect(report.inclusionProofs.ok).toBe(true);
+    });
+
+    it('round-trips an Ed25519-signed bundle (unchanged behavior)', async () => {
+      // The existing pristine-fixture happy-path covers this, but we
+      // re-assert here so the AUDIT-01 acceptance bullet is explicit.
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.rootSignatures.ok).toBe(true);
+    });
+
+    it("rejects a bundle whose row signatureAlgorithm is downgraded to a primitive the key can't satisfy", async () => {
+      // Build an ECDSA bundle, then re-pack with the row's
+      // signatureAlgorithm flipped to 'Ed25519'. The bundle's
+      // public-keys.json still carries the ECDSA SPKI, so
+      // `crypto.verify(null, msg, ecdsaKey, sig)` fails — the verifier
+      // surfaces the row as a signature failure.
+      const base = buildEcdsaFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const rowsText = zlib
+        .gunzipSync(entries.get('rows.ndjson.gz')!)
+        .toString('utf8')
+        .trim();
+      const tamperedRow = JSON.parse(rowsText);
+      tamperedRow.signatureAlgorithm = 'Ed25519';
+      const tamperedRowsNdjson = Buffer.from(
+        JSON.stringify(tamperedRow) + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        {
+          name: 'rows.ndjson.gz',
+          data: gzipDeterministic(tamperedRowsNdjson),
+        },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.failed).toBe(1);
+      expect(report.rowSignatures.firstFailure).toBe('row-0');
+    });
+
+    it('historical bundles without per-row signatureAlgorithm fall back to manifest algorithm', async () => {
+      // The pristine Ed25519 fixture (`buildFixtureBundle`) does NOT
+      // emit `signatureAlgorithm` on rows — it represents a pre-AUDIT-01
+      // bundle that only tagged the manifest. The verifier must still
+      // verify, falling back through (row → manifest → 'Ed25519'). The
+      // existing happy-path test covers the success direction; this
+      // test asserts the fallback is what is actually being exercised
+      // by inspecting the row payload before re-verifying.
+      const { zip } = buildBundleWithTamper({});
+      const entries = readBundleEntries(zip);
+      const rowsText = zlib
+        .gunzipSync(entries.get('rows.ndjson.gz')!)
+        .toString('utf8');
+      const firstRow = JSON.parse(
+        rowsText.split('\n').filter((l) => l.length > 0)[0]!,
+      ) as Record<string, unknown>;
+      expect(firstRow.signatureAlgorithm).toBeUndefined();
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
     });
   });
 });
