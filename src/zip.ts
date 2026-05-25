@@ -3,7 +3,15 @@
  *
  * Matches the STORED-method (method 0) entries produced by be-core's
  * `ZipStreamWriter` (AGV-035). No compression at the zip layer, no
- * encryption, no ZIP64, UTF-8 filenames, CRC-32 mandatory.
+ * encryption, UTF-8 filenames, CRC-32 mandatory.
+ *
+ * AUDIT-2026-05-15 — adds ZIP64 (APPNOTE 4.5) read support so the
+ * verifier accepts bundles that exceed the 4 GiB classic limits (a
+ * busy tenant at the 90-day cap can easily blow past 4 GiB). The
+ * writer in `bundle-exporter.service.ts` only emits ZIP64 records
+ * when needed, so small bundles remain byte-identical to the
+ * pre-AUDIT-15 layout and the readZip path here transparently handles
+ * both forms.
  *
  * We deliberately avoid third-party libs (yauzl / jszip / adm-zip) so
  * the verifier keeps a zero-dependency footprint.
@@ -17,6 +25,18 @@ const LFH_SIG = 0x04034b50;
 const CDH_SIG = 0x02014b50;
 // ── ZIP end-of-central-directory record    'PK\x05\x06'                  ─
 const EOCD_SIG = 0x06054b50;
+// ── ZIP64 EOCD locator                     'PK\x06\x07'                  ─
+const ZIP64_LOCATOR_SIG = 0x07064b50;
+// ── ZIP64 EOCD record                      'PK\x06\x06'                  ─
+const ZIP64_EOCD_SIG = 0x06064b50;
+
+// Sentinels used in classic headers to signal that the real value is
+// carried in the ZIP64 extra field / ZIP64 EOCD record.
+const ZIP64_U32_LIMIT = 0xffffffff;
+const ZIP64_U16_LIMIT = 0xffff;
+
+// ZIP64 extra field header ID (APPNOTE 4.5.3).
+const ZIP64_EXTRA_ID = 0x0001;
 
 export interface ZipEntry {
   name: string;
@@ -32,9 +52,10 @@ export class ZipReadError extends Error {
 }
 
 /**
- * Parse a PKZIP archive in-memory. Supports only the subset produced by
- * `ZipStreamWriter`: STORED method, no encryption, no ZIP64. Anything
- * else throws {@link ZipReadError}.
+ * Parse a PKZIP archive in-memory. Supports the subset produced by
+ * `ZipStreamWriter`: STORED method (and DEFLATE for cross-tool
+ * interop), no encryption, UTF-8 filenames, with optional ZIP64
+ * extensions. Anything else throws {@link ZipReadError}.
  *
  * @param buffer  The raw zip bytes.
  * @returns       Ordered list of entries as they appeared in the
@@ -49,9 +70,47 @@ export function readZip(buffer: Buffer): ZipEntry[] {
     throw new ZipReadError('end-of-central-directory record not found');
   }
 
-  const totalEntries = buffer.readUInt16LE(eocdOffset + 10);
-  const cdSize = buffer.readUInt32LE(eocdOffset + 12);
-  const cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+  let totalEntries = buffer.readUInt16LE(eocdOffset + 10);
+  let cdSize = buffer.readUInt32LE(eocdOffset + 12);
+  let cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+
+  // AUDIT-2026-05-15: if ANY classic EOCD field is a sentinel, look
+  // for a ZIP64 EOCD locator immediately before the classic EOCD.
+  // APPNOTE 4.3.16 — the locator is 20 bytes and sits at
+  // (eocdOffset - 20). Its presence is authoritative: even if only
+  // one field overflowed in the classic record, the locator promotes
+  // every count/size/offset to the ZIP64 values.
+  const classicHasSentinel =
+    totalEntries === ZIP64_U16_LIMIT ||
+    cdSize === ZIP64_U32_LIMIT ||
+    cdOffset === ZIP64_U32_LIMIT;
+  if (classicHasSentinel) {
+    const locatorOffset = eocdOffset - 20;
+    if (
+      locatorOffset < 0 ||
+      buffer.readUInt32LE(locatorOffset) !== ZIP64_LOCATOR_SIG
+    ) {
+      throw new ZipReadError(
+        'classic EOCD has ZIP64 sentinel(s) but ZIP64 EOCD locator not found',
+      );
+    }
+    const zip64EocdOffset = Number(buffer.readBigUInt64LE(locatorOffset + 8));
+    if (
+      zip64EocdOffset < 0 ||
+      zip64EocdOffset + 56 > buffer.length ||
+      buffer.readUInt32LE(zip64EocdOffset) !== ZIP64_EOCD_SIG
+    ) {
+      throw new ZipReadError(
+        'ZIP64 EOCD locator points to invalid ZIP64 EOCD record',
+      );
+    }
+    // We accept ANY zip64 EOCD record size >= 44 bytes (the minimum
+    // record body) — readers MUST tolerate extensible-data appended
+    // after the documented fields (APPNOTE 4.3.14.3).
+    totalEntries = Number(buffer.readBigUInt64LE(zip64EocdOffset + 32));
+    cdSize = Number(buffer.readBigUInt64LE(zip64EocdOffset + 40));
+    cdOffset = Number(buffer.readBigUInt64LE(zip64EocdOffset + 48));
+  }
 
   if (cdOffset + cdSize > buffer.length) {
     throw new ZipReadError('central directory extends past file end');
@@ -77,13 +136,55 @@ export function readZip(buffer: Buffer): ZipEntry[] {
         `unsupported zip compression method ${method} (expected STORED or DEFLATE)`,
       );
     }
-    const compressedSize = buffer.readUInt32LE(p + 20);
-    const uncompressedSize = buffer.readUInt32LE(p + 24);
+    let compressedSize = buffer.readUInt32LE(p + 20);
+    let uncompressedSize = buffer.readUInt32LE(p + 24);
     const nameLen = buffer.readUInt16LE(p + 28);
     const extraLen = buffer.readUInt16LE(p + 30);
     const commentLen = buffer.readUInt16LE(p + 32);
-    const localHeaderOffset = buffer.readUInt32LE(p + 42);
+    let localHeaderOffset = buffer.readUInt32LE(p + 42);
     const name = buffer.toString('utf8', p + 46, p + 46 + nameLen);
+
+    // AUDIT-2026-05-15: walk the central-dir extra-fields region for
+    // a ZIP64 extra (header ID 0x0001) — promote each 32-bit sentinel
+    // to its 64-bit value in the documented order (uncompressed,
+    // compressed, local-header offset, disk-start). The order is
+    // FIXED by APPNOTE 4.5.3 and only present-values are encoded, so
+    // we MUST consume them in the same order in which the classic
+    // header had sentinels.
+    const cdhExtraStart = p + 46 + nameLen;
+    const zip64 = findZip64Extra(buffer, cdhExtraStart, extraLen);
+    if (zip64) {
+      let zp = zip64.dataStart;
+      const zEnd = zip64.dataStart + zip64.dataSize;
+      if (uncompressedSize === ZIP64_U32_LIMIT) {
+        if (zp + 8 > zEnd) {
+          throw new ZipReadError(
+            `ZIP64 extra for ${name} truncated reading uncompressedSize`,
+          );
+        }
+        uncompressedSize = Number(buffer.readBigUInt64LE(zp));
+        zp += 8;
+      }
+      if (compressedSize === ZIP64_U32_LIMIT) {
+        if (zp + 8 > zEnd) {
+          throw new ZipReadError(
+            `ZIP64 extra for ${name} truncated reading compressedSize`,
+          );
+        }
+        compressedSize = Number(buffer.readBigUInt64LE(zp));
+        zp += 8;
+      }
+      if (localHeaderOffset === ZIP64_U32_LIMIT) {
+        if (zp + 8 > zEnd) {
+          throw new ZipReadError(
+            `ZIP64 extra for ${name} truncated reading localHeaderOffset`,
+          );
+        }
+        localHeaderOffset = Number(buffer.readBigUInt64LE(zp));
+        zp += 8;
+      }
+    }
+
     p += 46 + nameLen + extraLen + commentLen;
 
     // Walk into the local file header to find the data offset.
@@ -137,6 +238,38 @@ function findEocd(buffer: Buffer): number {
   return -1;
 }
 
+/**
+ * Walk an extra-fields region looking for the ZIP64 extra (header ID
+ * 0x0001). Returns the position + length of the data payload, or null
+ * when absent. Extra fields are a sequence of `{u16 id, u16 size,
+ * size bytes payload}` records; unknown IDs MUST be skipped (APPNOTE
+ * 4.5.1) so this loop is tolerant of producers that interleave their
+ * own tags (e.g. Unix permissions).
+ */
+function findZip64Extra(
+  buffer: Buffer,
+  start: number,
+  totalLen: number,
+): { dataStart: number; dataSize: number } | null {
+  let p = start;
+  const end = start + totalLen;
+  while (p + 4 <= end) {
+    const id = buffer.readUInt16LE(p);
+    const size = buffer.readUInt16LE(p + 2);
+    if (p + 4 + size > end) {
+      // Truncated extra field — treat as absent rather than throwing,
+      // matching reference-reader tolerance for slightly malformed
+      // archives written by older tools.
+      return null;
+    }
+    if (id === ZIP64_EXTRA_ID) {
+      return { dataStart: p + 4, dataSize: size };
+    }
+    p += 4 + size;
+  }
+  return null;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Test-only ZIP writer — same wire format as be-core's ZipStreamWriter,
 // flattened into a single in-memory Buffer (no streaming concerns since
@@ -169,9 +302,20 @@ function computeCrc32(buf: Buffer): number {
  * Reproducible: timestamps are pinned to `1980-01-01 00:00:00`, matching
  * `ZipStreamWriter`. Same input → byte-identical output.
  *
+ * AUDIT-2026-05-15: when `forceZip64` is set, the produced archive
+ * carries ZIP64 records on every entry plus a ZIP64 EOCD record +
+ * locator before the classic EOCD. Used by tests to exercise the
+ * verifier's ZIP64 read path without materialising a 4 GiB fixture.
+ * The default (false) keeps the byte layout identical to pre-AUDIT-15
+ * for fixtures that pinned bytes.
+ *
  * NOT exported from `index.ts` — fixture-builder helper only.
  */
-export function writeZip(entries: ZipEntry[]): Buffer {
+export function writeZip(
+  entries: ZipEntry[],
+  opts: { forceZip64?: boolean } = {},
+): Buffer {
+  const forceZip64 = opts.forceZip64 === true;
   const chunks: Buffer[] = [];
   let offset = 0;
   const central: Array<{
@@ -185,22 +329,32 @@ export function writeZip(entries: ZipEntry[]): Buffer {
     const nameBuf = Buffer.from(entry.name, 'utf8');
     const crc32 = computeCrc32(entry.data);
     const localHeaderOffset = offset;
+    const useZip64 = forceZip64 || entry.data.length >= ZIP64_U32_LIMIT;
+    const extra = useZip64
+      ? buildZip64Extra({
+          uncompressedSize: entry.data.length,
+          compressedSize: entry.data.length,
+        })
+      : Buffer.alloc(0);
 
     const local = Buffer.alloc(30);
     local.writeUInt32LE(LFH_SIG, 0);
-    local.writeUInt16LE(20, 4); // version needed
+    local.writeUInt16LE(useZip64 ? 45 : 20, 4); // version needed
     local.writeUInt16LE(0x0800, 6); // UTF-8 filename
     local.writeUInt16LE(0, 8); // STORED
     local.writeUInt16LE(0, 10); // mod time
     local.writeUInt16LE(0x21, 12); // mod date (Jan 1, 1980)
     local.writeUInt32LE(crc32, 14);
-    local.writeUInt32LE(entry.data.length, 18);
-    local.writeUInt32LE(entry.data.length, 22);
+    local.writeUInt32LE(useZip64 ? ZIP64_U32_LIMIT : entry.data.length, 18);
+    local.writeUInt32LE(useZip64 ? ZIP64_U32_LIMIT : entry.data.length, 22);
     local.writeUInt16LE(nameBuf.length, 26);
-    local.writeUInt16LE(0, 28);
+    local.writeUInt16LE(extra.length, 28);
 
-    chunks.push(local, nameBuf, entry.data);
-    offset += local.length + nameBuf.length + entry.data.length;
+    chunks.push(local, nameBuf);
+    if (extra.length > 0) chunks.push(extra);
+    chunks.push(entry.data);
+    offset +=
+      local.length + nameBuf.length + extra.length + entry.data.length;
 
     central.push({
       name: entry.name,
@@ -213,41 +367,129 @@ export function writeZip(entries: ZipEntry[]): Buffer {
   const centralStart = offset;
   for (const entry of central) {
     const nameBuf = Buffer.from(entry.name, 'utf8');
+    const sizeOverflow = forceZip64 || entry.size >= ZIP64_U32_LIMIT;
+    const offsetOverflow =
+      forceZip64 || entry.localHeaderOffset >= ZIP64_U32_LIMIT;
+    const useZip64 = sizeOverflow || offsetOverflow;
+    const extra = useZip64
+      ? buildZip64Extra({
+          uncompressedSize: sizeOverflow ? entry.size : undefined,
+          compressedSize: sizeOverflow ? entry.size : undefined,
+          localHeaderOffset: offsetOverflow ? entry.localHeaderOffset : undefined,
+        })
+      : Buffer.alloc(0);
+
     const cd = Buffer.alloc(46);
     cd.writeUInt32LE(CDH_SIG, 0);
-    cd.writeUInt16LE(20, 4);
-    cd.writeUInt16LE(20, 6);
+    cd.writeUInt16LE(useZip64 ? 45 : 20, 4);
+    cd.writeUInt16LE(useZip64 ? 45 : 20, 6);
     cd.writeUInt16LE(0x0800, 8);
     cd.writeUInt16LE(0, 10);
     cd.writeUInt16LE(0, 12);
     cd.writeUInt16LE(0x21, 14);
     cd.writeUInt32LE(entry.crc32, 16);
-    cd.writeUInt32LE(entry.size, 20);
-    cd.writeUInt32LE(entry.size, 24);
+    cd.writeUInt32LE(sizeOverflow ? ZIP64_U32_LIMIT : entry.size, 20);
+    cd.writeUInt32LE(sizeOverflow ? ZIP64_U32_LIMIT : entry.size, 24);
     cd.writeUInt16LE(nameBuf.length, 28);
-    cd.writeUInt16LE(0, 30);
+    cd.writeUInt16LE(extra.length, 30);
     cd.writeUInt16LE(0, 32);
     cd.writeUInt16LE(0, 34);
     cd.writeUInt16LE(0, 36);
     cd.writeUInt32LE(0, 38);
-    cd.writeUInt32LE(entry.localHeaderOffset, 42);
+    cd.writeUInt32LE(
+      offsetOverflow ? ZIP64_U32_LIMIT : entry.localHeaderOffset,
+      42,
+    );
     chunks.push(cd, nameBuf);
-    offset += cd.length + nameBuf.length;
+    if (extra.length > 0) chunks.push(extra);
+    offset += cd.length + nameBuf.length + extra.length;
   }
   const centralSize = offset - centralStart;
+
+  const archiveNeedsZip64 =
+    forceZip64 ||
+    centralStart >= ZIP64_U32_LIMIT ||
+    centralSize >= ZIP64_U32_LIMIT ||
+    central.length >= ZIP64_U16_LIMIT;
+
+  if (archiveNeedsZip64) {
+    const zip64Eocd = Buffer.alloc(56);
+    zip64Eocd.writeUInt32LE(ZIP64_EOCD_SIG, 0);
+    zip64Eocd.writeBigUInt64LE(BigInt(56 - 12), 4);
+    zip64Eocd.writeUInt16LE(45, 12);
+    zip64Eocd.writeUInt16LE(45, 14);
+    zip64Eocd.writeUInt32LE(0, 16);
+    zip64Eocd.writeUInt32LE(0, 20);
+    zip64Eocd.writeBigUInt64LE(BigInt(central.length), 24);
+    zip64Eocd.writeBigUInt64LE(BigInt(central.length), 32);
+    zip64Eocd.writeBigUInt64LE(BigInt(centralSize), 40);
+    zip64Eocd.writeBigUInt64LE(BigInt(centralStart), 48);
+    const zip64EocdOffset = offset;
+    chunks.push(zip64Eocd);
+    offset += zip64Eocd.length;
+
+    const locator = Buffer.alloc(20);
+    locator.writeUInt32LE(ZIP64_LOCATOR_SIG, 0);
+    locator.writeUInt32LE(0, 4);
+    locator.writeBigUInt64LE(BigInt(zip64EocdOffset), 8);
+    locator.writeUInt32LE(1, 16);
+    chunks.push(locator);
+    offset += locator.length;
+  }
 
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(EOCD_SIG, 0);
   eocd.writeUInt16LE(0, 4);
   eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(central.length, 8);
-  eocd.writeUInt16LE(central.length, 10);
-  eocd.writeUInt32LE(centralSize, 12);
-  eocd.writeUInt32LE(centralStart, 16);
+  eocd.writeUInt16LE(
+    central.length >= ZIP64_U16_LIMIT ? ZIP64_U16_LIMIT : central.length,
+    8,
+  );
+  eocd.writeUInt16LE(
+    central.length >= ZIP64_U16_LIMIT ? ZIP64_U16_LIMIT : central.length,
+    10,
+  );
+  eocd.writeUInt32LE(
+    centralSize >= ZIP64_U32_LIMIT || forceZip64
+      ? ZIP64_U32_LIMIT
+      : centralSize,
+    12,
+  );
+  eocd.writeUInt32LE(
+    centralStart >= ZIP64_U32_LIMIT || forceZip64
+      ? ZIP64_U32_LIMIT
+      : centralStart,
+    16,
+  );
   eocd.writeUInt16LE(0, 20);
   chunks.push(eocd);
 
   return Buffer.concat(chunks);
+}
+
+/**
+ * Build a ZIP64 extra field (header ID 0x0001). Mirror of the writer
+ * helper in `bundle-exporter.service.ts` — kept here so the verifier
+ * package stays standalone (zero runtime deps + zero be-core imports).
+ */
+function buildZip64Extra(values: {
+  uncompressedSize?: number;
+  compressedSize?: number;
+  localHeaderOffset?: number;
+}): Buffer {
+  const parts: number[] = [];
+  if (values.uncompressedSize !== undefined) parts.push(values.uncompressedSize);
+  if (values.compressedSize !== undefined) parts.push(values.compressedSize);
+  if (values.localHeaderOffset !== undefined)
+    parts.push(values.localHeaderOffset);
+  const dataSize = parts.length * 8;
+  const buf = Buffer.alloc(4 + dataSize);
+  buf.writeUInt16LE(ZIP64_EXTRA_ID, 0);
+  buf.writeUInt16LE(dataSize, 2);
+  for (let i = 0; i < parts.length; i++) {
+    buf.writeBigUInt64LE(BigInt(parts[i]!), 4 + i * 8);
+  }
+  return buf;
 }
 
 /** Gzip a buffer (test fixture helper). Deterministic — no extra fields. */
