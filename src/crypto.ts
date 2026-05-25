@@ -52,6 +52,97 @@ const LEAF_PREFIX = Buffer.from([0x00]);
 const NODE_PREFIX = Buffer.from([0x01]);
 const EMPTY_ROOT = Buffer.alloc(32, 0x00);
 
+// ── ECDSA P-256 group order (low-s gate) ────────────────────────────────
+//
+// AUDIT-2026-05/21 — mirror of be-core CryptoUtilsService.
+//
+// Plain ECDSA is malleable: for any valid signature (r, s) over the
+// P-256 curve, the pair (r, n - s) also verifies. An external auditor
+// running this verifier must reject the malleated form so it cannot be
+// used to fork the audit trail (different bytes, same logical
+// signature) post-export.
+//
+// We enforce the BIP-66 / EIP-2 canonical "low-s" rule: `s <= n/2`.
+// Same constants as be-core; any divergence breaks bundle compat.
+const P256_N = BigInt(
+  '0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551',
+);
+const P256_HALF_N = P256_N >> 1n;
+
+/**
+ * Extract `s` from a DER-encoded ECDSA signature (or from a raw
+ * 64-byte `r || s` concatenation). Returns `null` on any parse error.
+ *
+ * DER layout (X9.62 / RFC 3279):
+ *   0x30 <total-len>
+ *     0x02 <r-len> <r-bytes>
+ *     0x02 <s-len> <s-bytes>
+ *
+ * INTEGER fields carry a leading 0x00 pad when the natural high bit
+ * is set (so ASN.1 reads them as positive); strip that pad before
+ * parsing the magnitude.
+ *
+ * Exported for direct unit testing.
+ */
+export function extractEcdsaSFromSignature(sig: Buffer): bigint | null {
+  if (sig.length === 64) {
+    return BigInt('0x' + sig.subarray(32, 64).toString('hex'));
+  }
+  if (sig.length < 8 || sig[0] !== 0x30) {
+    return null;
+  }
+  let offset = 2;
+  const firstLen = sig[1];
+  if (typeof firstLen !== 'number') {
+    return null;
+  }
+  if (firstLen & 0x80) {
+    offset += firstLen & 0x7f;
+  }
+  if (sig[offset] !== 0x02) {
+    return null;
+  }
+  const rLen = sig[offset + 1];
+  if (typeof rLen !== 'number') {
+    return null;
+  }
+  offset += 2 + rLen;
+  if (sig[offset] !== 0x02) {
+    return null;
+  }
+  const sLen = sig[offset + 1];
+  if (typeof sLen !== 'number') {
+    return null;
+  }
+  const sStart = offset + 2;
+  const sEnd = sStart + sLen;
+  if (sEnd > sig.length) {
+    return null;
+  }
+  let sBytes = sig.subarray(sStart, sEnd);
+  if (sBytes.length > 32 && sBytes[0] === 0x00) {
+    sBytes = sBytes.subarray(1);
+  }
+  if (sBytes.length === 0) {
+    return null;
+  }
+  return BigInt('0x' + sBytes.toString('hex'));
+}
+
+/**
+ * Returns `true` iff `sig` is in canonical low-s form
+ * (`0 < s <= n/2`). Malformed bytes or `s == 0` return `false`.
+ *
+ * Exported for direct unit testing.
+ */
+export function isLowSP256(sig: Buffer): boolean {
+  const s = extractEcdsaSFromSignature(sig);
+  if (s === null) {
+    return false;
+  }
+  return s > 0n && s <= P256_HALF_N;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // SHA-256
 // ════════════════════════════════════════════════════════════════════════
@@ -172,6 +263,15 @@ export function verifyEcdsaP256(
     }
     const sig = Buffer.from(signatureB64, 'base64');
     if (sig.length === 0) {
+      return false;
+    }
+    // AUDIT-2026-05/21 — Reject high-s (non-canonical) ECDSA
+    // signatures BEFORE handing them to OpenSSL. Both (r, s) and
+    // (r, n - s) verify under raw ECDSA, so a third party could
+    // re-encode a signed audit row or root into a distinct-but-
+    // valid form and partition the audit trail. BIP-66 / EIP-2
+    // close this with the `s <= n/2` canonical rule; we mirror it.
+    if (!isLowSP256(sig)) {
       return false;
     }
     const keyObject = crypto.createPublicKey({
