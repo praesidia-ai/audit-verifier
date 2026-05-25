@@ -64,6 +64,13 @@ interface FixtureRoot {
   signedAt: string;
   anchoredAt: string | null;
   anchorReceipt: string | null;
+  // AUDIT-2026-05-09 — multi-anchor receipts array. Optional so the
+  // legacy single-slot fixture still compiles without changes.
+  anchorReceipts?: Array<{
+    provider: string;
+    receipt: string;
+    anchoredAt: string;
+  }>;
 }
 
 interface FixtureProof {
@@ -583,6 +590,161 @@ describe('verifyBundle', () => {
       const report = await verifyBundle(zip, { noRekor: true });
       expect(report.ok).toBe(true);
       expect(report.rowSignatures.ok).toBe(true);
+    });
+  });
+
+  /**
+   * AUDIT-2026-05-09 — Multi-anchor receipt verification.
+   *
+   * The exporter now emits `anchorReceipts: [{provider, receipt,
+   * anchoredAt}, ...]` per root so dual-anchored roots (e.g. Rekor +
+   * S3) preserve BOTH receipts. The verifier dispatches on
+   * `provider` and verifies each entry independently; the report's
+   * `rekor` component aggregates the per-entry results.
+   */
+  describe('AUDIT-2026-05-09 — multi-anchor receipts', () => {
+    /**
+     * Rebuild the pristine fixture's `roots.ndjson.gz` to attach an
+     * `anchorReceipts` array. Re-signing isn't needed because the
+     * receipts are not part of the root's signed envelope (which is
+     * `{rootHash, periodStart, periodEnd, rowCount}` — see
+     * `verifyRootSignatures`).
+     */
+    function rebuildWithReceipts(
+      receipts: Array<{ provider: string; receipt: string; anchoredAt: string }>,
+      legacyAnchorReceipt: string | null = null,
+    ): Buffer {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const root = base.roots[0]!;
+      const patched: FixtureRoot = {
+        ...root,
+        anchoredAt: receipts[0]?.anchoredAt ?? null,
+        anchorReceipt: legacyAnchorReceipt,
+        anchorReceipts: receipts,
+      };
+      const rootsNdjson = Buffer.from(JSON.stringify(patched) + '\n', 'utf8');
+      return writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+    }
+
+    it('verifies a dual-anchor root (rekor + s3) — both providers checked independently', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 'rekor',
+          receipt: '{"logIndex":9001}',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+        {
+          provider: 's3',
+          receipt: 's3:my-bucket:audit-roots/org/period.json:v123',
+          anchoredAt: '2026-05-01T01:00:05.000Z',
+        },
+      ]);
+
+      const report = await verifyBundle(zip, {
+        // Default rekor fetcher just parses JSON — our '{"logIndex":9001}'
+        // receipt is parseable so it passes.
+      });
+      expect(report.ok).toBe(true);
+      expect(report.rekor.ok).toBe(true);
+      // Two entries on one root → checked = 2.
+      expect(report.rekor.checked).toBe(2);
+      expect(report.rekor.failed).toBe(0);
+    });
+
+    it('synthesizes a rekor entry from the legacy anchorReceipt scalar when anchorReceipts is empty', async () => {
+      // Empty multi-anchor array but legacy slot populated. The
+      // verifier must still verify the legacy receipt (the migration
+      // backfill writes this synthesis into the array, but bundles
+      // captured from older snapshots may not have run the backfill).
+      const zip = rebuildWithReceipts(
+        [],
+        '{"logIndex":9001}',
+      );
+
+      const report = await verifyBundle(zip, {});
+      expect(report.ok).toBe(true);
+      expect(report.rekor.ok).toBe(true);
+      expect(report.rekor.checked).toBe(1);
+      expect(report.rekor.failed).toBe(0);
+    });
+
+    it('flags an unknown provider as failed with reason=unknown_provider but still reports per-entry', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 'rekor',
+          receipt: '{"logIndex":9001}',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+        {
+          provider: 'mystery-notary',
+          receipt: 'notary:abc123',
+          anchoredAt: '2026-05-01T01:00:05.000Z',
+        },
+      ]);
+
+      const report = await verifyBundle(zip, {});
+      expect(report.ok).toBe(false);
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.checked).toBe(2);
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toContain('mystery-notary');
+      expect(report.rekor.reason).toContain('unknown_provider');
+    });
+
+    it('rejects a malformed s3 receipt shape (offline check)', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 's3',
+          // Missing versionId segment.
+          receipt: 's3:my-bucket:audit-roots/period.json',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+      ]);
+
+      const report = await verifyBundle(zip, {});
+      expect(report.ok).toBe(false);
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toContain('s3');
+      expect(report.rekor.reason).toContain('malformed');
+    });
+
+    it('honours a caller-supplied anchorReceiptVerifier for ALL providers (overrides defaults)', async () => {
+      const calls: Array<{ provider: string; receipt: string }> = [];
+      const zip = rebuildWithReceipts([
+        {
+          provider: 'rekor',
+          receipt: 'rekor:9001',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+        {
+          provider: 's3',
+          receipt: 's3:b:k:v',
+          anchoredAt: '2026-05-01T01:00:05.000Z',
+        },
+      ]);
+
+      const report = await verifyBundle(zip, {
+        anchorReceiptVerifier: async (entry) => {
+          calls.push({ provider: entry.provider, receipt: entry.receipt });
+          return { ok: true };
+        },
+      });
+
+      expect(report.ok).toBe(true);
+      expect(report.rekor.ok).toBe(true);
+      expect(calls).toEqual([
+        { provider: 'rekor', receipt: 'rekor:9001' },
+        { provider: 's3', receipt: 's3:b:k:v' },
+      ]);
     });
   });
 });

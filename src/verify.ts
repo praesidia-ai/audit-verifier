@@ -128,7 +128,20 @@ interface BundleRoot {
   keyVersion: number;
   signedAt: string;
   anchoredAt: string | null;
+  /** Legacy single-slot Rekor receipt — populated by pre-AUDIT-09 producers. */
   anchorReceipt: string | null;
+  /**
+   * AUDIT-2026-05-09 — Multi-anchor receipt log. Each entry is one
+   * provider's independent receipt for THIS root. The verifier walks
+   * each entry, dispatches on `provider`, and reports per-provider
+   * success/failure in `report.rekor`. Optional for back-compat with
+   * bundles emitted before the multi-anchor migration.
+   */
+  anchorReceipts?: Array<{
+    provider: string;
+    receipt: string;
+    anchoredAt: string;
+  }>;
 }
 
 interface BundleProofEntry {
@@ -185,6 +198,30 @@ export interface VerifyOptions {
    * `anchorReceipt` string; returns `true` on success.
    */
   rekorFetcher?: (anchorReceipt: string) => Promise<boolean>;
+  /**
+   * AUDIT-2026-05-09 — Optional hook for verifying provider-specific
+   * anchor receipts in the multi-anchor `anchorReceipts` array. The
+   * verifier dispatches on `entry.provider`:
+   *
+   *   - `'rekor'`   → falls back to `rekorFetcher` when this hook is
+   *                   absent (preserves the legacy single-anchor path).
+   *   - `'s3'`      → checks that the receipt parses as an
+   *                   `s3:<bucket>:<key>:<versionId>` triple. The
+   *                   verifier is OFFLINE by contract; we DON'T make a
+   *                   network HEAD call. A caller wanting on-line
+   *                   verification supplies this hook.
+   *   - other       → reported as
+   *                   `{ ok: false, reason: 'unknown_provider' }` and
+   *                   counted as a failure in `report.rekor`. The
+   *                   overall bundle still verifies if every other
+   *                   anchor passes; the unknown entry surfaces in
+   *                   `firstFailure` so the auditor can investigate.
+   */
+  anchorReceiptVerifier?: (entry: {
+    provider: string;
+    receipt: string;
+    anchoredAt: string;
+  }) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 const EXPECTED_ENTRIES = [
@@ -574,6 +611,22 @@ function verifyInclusionProofs(
   };
 }
 
+/**
+ * AUDIT-2026-05-09 — Multi-anchor receipt verification.
+ *
+ * Walks `root.anchorReceipts` (the multi-anchor array introduced by
+ * the AUDIT-09 migration) and dispatches each entry on its `provider`
+ * key. Each provider verifies independently — the report counts every
+ * receipt across every root, so a 3-root bundle each with a Rekor +
+ * S3 anchor produces `checked = 6`.
+ *
+ * Back-compat: when a root has NO `anchorReceipts` array (older
+ * bundles emitted before the multi-anchor exporter shipped) but DOES
+ * carry the legacy `anchorReceipt` string, the verifier synthesizes a
+ * single `{ provider: 'rekor', receipt, anchoredAt }` entry so the
+ * legacy receipt is still checked. This is the same shape the
+ * migration's backfill writes into the database.
+ */
 async function verifyRekorReceipts(
   roots: BundleRoot[],
   options: VerifyOptions,
@@ -581,30 +634,35 @@ async function verifyRekorReceipts(
   if (options.noRekor) {
     return { ok: true, checked: 0, failed: 0, reason: 'skipped via --no-rekor' };
   }
-  const fetcher = options.rekorFetcher ?? defaultRekorFetcher;
+  const rekorFetcher = options.rekorFetcher ?? defaultRekorFetcher;
   let checked = 0;
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
   for (const root of roots) {
-    if (!root.anchorReceipt) continue;
-    checked += 1;
-    try {
-      const ok = await fetcher(root.anchorReceipt);
-      if (!ok) {
+    const entries = collectAnchorEntries(root);
+    if (entries.length === 0) continue;
+    for (const entry of entries) {
+      checked += 1;
+      let result: { ok: boolean; reason?: string };
+      try {
+        result = await verifyAnchorReceipt(entry, options, rekorFetcher);
+      } catch (err) {
+        result = {
+          ok: false,
+          reason: `verify_threw: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        };
+      }
+      if (!result.ok) {
         failed += 1;
         if (!firstFailure) {
           firstFailure = root.id;
-          reason = 'Rekor receipt verification failed';
+          reason = result.reason
+            ? `${entry.provider}: ${result.reason}`
+            : `${entry.provider} receipt verification failed`;
         }
-      }
-    } catch (err) {
-      failed += 1;
-      if (!firstFailure) {
-        firstFailure = root.id;
-        reason = `Rekor fetch error: ${
-          err instanceof Error ? err.message : String(err)
-        }`;
       }
     }
   }
@@ -615,6 +673,94 @@ async function verifyRekorReceipts(
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
   };
+}
+
+/**
+ * AUDIT-2026-05-09 — Normalize the root's anchor representations into
+ * a single per-provider entry list. Prefers the multi-anchor
+ * `anchorReceipts` array; synthesizes a legacy rekor entry from
+ * `anchorReceipt` only when the array is absent or empty.
+ */
+function collectAnchorEntries(
+  root: BundleRoot,
+): Array<{ provider: string; receipt: string; anchoredAt: string }> {
+  if (Array.isArray(root.anchorReceipts) && root.anchorReceipts.length > 0) {
+    return root.anchorReceipts;
+  }
+  if (root.anchorReceipt) {
+    return [
+      {
+        provider: 'rekor',
+        receipt: root.anchorReceipt,
+        // Use the root's `anchoredAt` when present, falling back to
+        // `signedAt` so the synthesized entry always carries a
+        // timestamp (matches the migration's backfill shape).
+        anchoredAt: root.anchoredAt ?? root.signedAt,
+      },
+    ];
+  }
+  return [];
+}
+
+/**
+ * AUDIT-2026-05-09 — Dispatch a single anchor receipt entry to the
+ * appropriate verifier. The caller-supplied `anchorReceiptVerifier`
+ * (when present) wins for ALL providers — auditors who need on-line
+ * verification of S3 receipts, for example, supply a hook that does
+ * a HEAD against the bucket. Without the hook, behaviour per provider:
+ *
+ *   - `'rekor'` → existing `rekorFetcher` (default: parses JSON).
+ *   - `'s3'`    → offline shape check on `s3:<bucket>:<key>:<vid>`.
+ *   - other     → `{ ok: false, reason: 'unknown_provider' }`.
+ */
+async function verifyAnchorReceipt(
+  entry: { provider: string; receipt: string; anchoredAt: string },
+  options: VerifyOptions,
+  rekorFetcher: (anchorReceipt: string) => Promise<boolean>,
+): Promise<{ ok: boolean; reason?: string }> {
+  if (typeof entry.receipt !== 'string' || entry.receipt.length === 0) {
+    return { ok: false, reason: 'empty_receipt' };
+  }
+  if (options.anchorReceiptVerifier) {
+    return options.anchorReceiptVerifier(entry);
+  }
+  if (entry.provider === 'rekor') {
+    const ok = await rekorFetcher(entry.receipt);
+    return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
+  }
+  if (entry.provider === 's3') {
+    return verifyS3ReceiptShape(entry.receipt);
+  }
+  return { ok: false, reason: 'unknown_provider' };
+}
+
+/**
+ * Offline check that an S3 receipt parses as `s3:<bucket>:<key>:<vid>`.
+ * The key may legally contain colons, so we slice the first and last
+ * colon-segments and treat everything in between as the key — matches
+ * `S3AnchorService.verifyReceipt`'s parser.
+ *
+ * Returns `{ ok: false, reason: 'malformed' }` on a bad shape. The
+ * verifier is offline by contract; live HEAD-against-bucket checks are
+ * the responsibility of a caller-supplied `anchorReceiptVerifier`.
+ */
+function verifyS3ReceiptShape(receipt: string): { ok: boolean; reason?: string } {
+  if (!receipt.startsWith('s3:')) {
+    return { ok: false, reason: 'malformed' };
+  }
+  const rest = receipt.slice('s3:'.length);
+  const firstColon = rest.indexOf(':');
+  if (firstColon < 0) return { ok: false, reason: 'malformed' };
+  const bucket = rest.slice(0, firstColon);
+  const afterBucket = rest.slice(firstColon + 1);
+  const lastColon = afterBucket.lastIndexOf(':');
+  if (lastColon < 0) return { ok: false, reason: 'malformed' };
+  const key = afterBucket.slice(0, lastColon);
+  const versionId = afterBucket.slice(lastColon + 1);
+  if (!bucket || !key || !versionId) {
+    return { ok: false, reason: 'malformed' };
+  }
+  return { ok: true };
 }
 
 /**
