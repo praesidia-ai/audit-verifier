@@ -57,6 +57,12 @@ import { readZip, gunzip, type ZipEntry } from './zip.js';
 interface ManifestKeyVersionEntry {
   keyVersion: number;
   publicKey: string;
+  // AUDIT-2026-05-14 — Manifest v2 carries lifecycle metadata for
+  // every key version it embeds, so an offline verifier can apply the
+  // signed-before-revocation rule without re-fetching tenant state.
+  // Optional for forward-compat with v1 bundles that pre-date AUDIT-14.
+  status?: 'ACTIVE' | 'ROTATED' | 'REVOKED';
+  revokedAt?: string | null;
 }
 
 interface BundleManifest {
@@ -75,6 +81,21 @@ interface BundleManifest {
   signatureAlgorithm: BundleSignatureAlgorithm;
   signature: string;
   signatureKeyVersion: number;
+}
+
+/**
+ * AUDIT-2026-05-14 — Per-key entry as written in `public-keys.json`.
+ *
+ * Manifest v1 wrote `{ [keyVersion]: base64 }` (raw string per entry).
+ * Manifest v2 writes `{ [keyVersion]: { publicKey, status, revokedAt } }`
+ * so the verifier can enforce the signed-before-revocation rule for
+ * REVOKED keys WITHOUT needing live tenant state. The parser accepts
+ * both shapes — strings are coerced to ACTIVE entries.
+ */
+interface PublicKeyRecord {
+  publicKey: Uint8Array;
+  status: 'ACTIVE' | 'ROTATED' | 'REVOKED';
+  revokedAt: Date | null;
 }
 
 interface BundleRow {
@@ -205,14 +226,14 @@ export async function verifyBundle(
 
   const publicKeysRaw = JSON.parse(
     byName.get('public-keys.json')!.data.toString('utf8'),
-  ) as Record<string, string>;
-  const publicKeys = new Map<number, Uint8Array>();
+  ) as Record<string, unknown>;
+  const publicKeys = new Map<number, PublicKeyRecord>();
   for (const [k, v] of Object.entries(publicKeysRaw)) {
     const ver = Number(k);
     if (!Number.isInteger(ver)) {
       throw new Error(`public-keys.json contains non-integer key version: ${k}`);
     }
-    publicKeys.set(ver, new Uint8Array(Buffer.from(v, 'base64')));
+    publicKeys.set(ver, parsePublicKeyEntry(v, k));
   }
 
   // 3) Verify manifest signature.
@@ -285,10 +306,10 @@ export async function verifyBundle(
 
 function verifyManifest(
   manifest: BundleManifest,
-  publicKeys: Map<number, Uint8Array>,
+  publicKeys: Map<number, PublicKeyRecord>,
 ): ComponentResult {
-  const pub = publicKeys.get(manifest.signatureKeyVersion);
-  if (!pub) {
+  const entry = publicKeys.get(manifest.signatureKeyVersion);
+  if (!entry) {
     return {
       ok: false,
       checked: 1,
@@ -317,7 +338,7 @@ function verifyManifest(
     manifest.signatureAlgorithm,
     bytes,
     manifest.signature,
-    pub,
+    entry.publicKey,
   );
   return ok
     ? { ok: true, checked: 1, failed: 0 }
@@ -331,15 +352,15 @@ function verifyManifest(
 
 function verifyRowSignatures(
   rows: BundleRow[],
-  publicKeys: Map<number, Uint8Array>,
+  publicKeys: Map<number, PublicKeyRecord>,
   algorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
   for (const row of rows) {
-    const pub = publicKeys.get(row.keyVersion);
-    if (!pub) {
+    const entry = publicKeys.get(row.keyVersion);
+    if (!entry) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;
@@ -347,9 +368,31 @@ function verifyRowSignatures(
       }
       continue;
     }
+    // AUDIT-2026-05-14 — REVOKED-key acceptance window.
+    //
+    // A row signed BEFORE the key was revoked still verifies (the
+    // signature is forensically valid; revocation is a forward-looking
+    // operator action). A row signed AFTER `revokedAt` MUST be
+    // rejected with `key_revoked_after_signing`, because the only
+    // legitimate way to produce such a signature would have been an
+    // operator who continued signing with a revoked key — exactly the
+    // failure mode `revokeKey` is meant to halt. The bundle exporter
+    // ships every status (ACTIVE / ROTATED / REVOKED) so the verifier
+    // can apply this rule offline.
+    if (entry.status === 'REVOKED') {
+      const revocationCheck = checkSignedBeforeRevocation(row, entry);
+      if (revocationCheck !== null) {
+        failed += 1;
+        if (!firstFailure) {
+          firstFailure = row.id;
+          reason = revocationCheck;
+        }
+        continue;
+      }
+    }
     const signable = signableRow(row);
     const bytes = canonicalJson(signable);
-    if (!verifySignature(algorithm, bytes, row.signature, pub)) {
+    if (!verifySignature(algorithm, bytes, row.signature, entry.publicKey)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;
@@ -393,21 +436,38 @@ function verifyChain(rows: BundleRow[]): ComponentResult {
 
 function verifyRootSignatures(
   roots: BundleRoot[],
-  publicKeys: Map<number, Uint8Array>,
+  publicKeys: Map<number, PublicKeyRecord>,
   algorithm: BundleSignatureAlgorithm,
 ): ComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
   for (const root of roots) {
-    const pub = publicKeys.get(root.keyVersion);
-    if (!pub) {
+    const entry = publicKeys.get(root.keyVersion);
+    if (!entry) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
         reason = `root keyVersion ${root.keyVersion} not in public-keys.json`;
       }
       continue;
+    }
+    // AUDIT-2026-05-14 — same signed-before-revocation rule the row
+    // verifier applies. A root signed after its key was revoked is a
+    // forensics anomaly even if the underlying rows are clean.
+    if (entry.status === 'REVOKED') {
+      const revocationCheck = checkSignedBeforeRevocation(
+        { id: root.id, signedAt: root.signedAt },
+        entry,
+      );
+      if (revocationCheck !== null) {
+        failed += 1;
+        if (!firstFailure) {
+          firstFailure = root.id;
+          reason = revocationCheck;
+        }
+        continue;
+      }
     }
     // Mirror the writer's envelope exactly — see MerkleRootService
     // (AGV-033) `computeRootForPeriod`.
@@ -417,7 +477,7 @@ function verifyRootSignatures(
       periodEnd: root.periodEnd,
       rowCount: root.rowCount,
     });
-    if (!verifySignature(algorithm, bytes, root.signature, pub)) {
+    if (!verifySignature(algorithm, bytes, root.signature, entry.publicKey)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
@@ -633,4 +693,107 @@ function parseNdjson<T>(buf: Buffer): T[] {
     out.push(JSON.parse(line) as T);
   }
   return out;
+}
+
+/**
+ * AUDIT-2026-05-14 — Parse one entry from `public-keys.json`.
+ *
+ * Accepts BOTH shapes:
+ *   - Manifest v1 (pre-AUDIT-14): `string` — bare base64 public key,
+ *     coerced to `{ status: 'ACTIVE', revokedAt: null }`.
+ *   - Manifest v2 (AUDIT-14+):    `{ publicKey, status, revokedAt }`.
+ *
+ * This lets the v2 verifier read older bundles without a manual
+ * conversion step. New bundles always emit the object shape.
+ */
+function parsePublicKeyEntry(
+  raw: unknown,
+  versionKey: string,
+): PublicKeyRecord {
+  if (typeof raw === 'string') {
+    return {
+      publicKey: new Uint8Array(Buffer.from(raw, 'base64')),
+      status: 'ACTIVE',
+      revokedAt: null,
+    };
+  }
+  if (raw && typeof raw === 'object') {
+    const obj = raw as {
+      publicKey?: unknown;
+      status?: unknown;
+      revokedAt?: unknown;
+    };
+    if (typeof obj.publicKey !== 'string') {
+      throw new Error(
+        `public-keys.json[${versionKey}] missing string publicKey field`,
+      );
+    }
+    const status = obj.status;
+    if (
+      status !== 'ACTIVE' &&
+      status !== 'ROTATED' &&
+      status !== 'REVOKED'
+    ) {
+      throw new Error(
+        `public-keys.json[${versionKey}] has invalid status: ${String(status)}`,
+      );
+    }
+    let revokedAt: Date | null = null;
+    if (obj.revokedAt != null) {
+      if (typeof obj.revokedAt !== 'string') {
+        throw new Error(
+          `public-keys.json[${versionKey}].revokedAt must be ISO string or null`,
+        );
+      }
+      const parsed = new Date(obj.revokedAt);
+      if (Number.isNaN(parsed.getTime())) {
+        throw new Error(
+          `public-keys.json[${versionKey}].revokedAt is not a valid ISO date`,
+        );
+      }
+      revokedAt = parsed;
+    }
+    return {
+      publicKey: new Uint8Array(Buffer.from(obj.publicKey, 'base64')),
+      status,
+      revokedAt,
+    };
+  }
+  throw new Error(
+    `public-keys.json[${versionKey}] must be a string or {publicKey,status,revokedAt} object`,
+  );
+}
+
+/**
+ * AUDIT-2026-05-14 — Returns `null` when the signed-before-revocation
+ * check passes for a REVOKED key, otherwise a verifier `reason` string.
+ *
+ * Caller has already confirmed `entry.status === 'REVOKED'`. Three
+ * reject codes:
+ *   - `key_revoked_no_timestamp` — bundle is malformed (REVOKED with
+ *     no `revokedAt`). Fail closed so a producer bug doesn't silently
+ *     accept signatures against a revoked key.
+ *   - `key_revoked_no_signed_at` — signed-at missing on the artifact.
+ *     We can't decide pre/post revocation; fail closed.
+ *   - `key_revoked_after_signing` — the artifact's `signedAt` is
+ *     strictly AFTER the key's `revokedAt`. The expected hostile case.
+ */
+function checkSignedBeforeRevocation(
+  artifact: { id: string; signedAt: string | null },
+  entry: PublicKeyRecord,
+): string | null {
+  if (entry.revokedAt === null) {
+    return 'key_revoked_no_timestamp';
+  }
+  if (!artifact.signedAt) {
+    return 'key_revoked_no_signed_at';
+  }
+  const signedMs = new Date(artifact.signedAt).getTime();
+  if (Number.isNaN(signedMs)) {
+    return 'key_revoked_no_signed_at';
+  }
+  if (signedMs > entry.revokedAt.getTime()) {
+    return 'key_revoked_after_signing';
+  }
+  return null;
 }

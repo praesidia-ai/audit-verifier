@@ -473,4 +473,116 @@ describe('verifyBundle', () => {
     expect(report.manifest.ok).toBe(false);
     expect(report.manifest.failed).toBe(1);
   });
+
+  /**
+   * AUDIT-2026-05-14 — Revoked-key acceptance window.
+   *
+   * The exporter now emits each key in `public-keys.json` as
+   * `{ publicKey, status, revokedAt }`. The verifier MUST accept rows
+   * signed BEFORE `revokedAt` (otherwise revoking a key would orphan
+   * the entire pre-revocation history) and reject rows signed AFTER
+   * it (otherwise revocation has no forward-looking force).
+   */
+  describe('AUDIT-2026-05-14 — REVOKED key window', () => {
+    /**
+     * Re-pack the pristine fixture's `public-keys.json` to declare the
+     * (single) signing key as REVOKED at `revokedAt`. Re-signing isn't
+     * needed because every row + manifest signature was minted with
+     * THAT key; the test only flips the lifecycle metadata.
+     */
+    function rebuildWithRevokedKey(revokedAt: string | null): Buffer {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const publicKeyB64 = Buffer.from(base.manifestPublicKey).toString(
+        'base64',
+      );
+      const publicKeys: Record<
+        string,
+        { publicKey: string; status: string; revokedAt: string | null }
+      > = {
+        '1': {
+          publicKey: publicKeyB64,
+          status: 'REVOKED',
+          revokedAt,
+        },
+      };
+      return writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+    }
+
+    it('row signedAt < revokedAt + REVOKED status → row verifies normally', async () => {
+      // Every fixture row signs at baseTs + i*60 + 1s.
+      // baseTs = 2026-05-01T00:00:00Z, last row signedAt = +03:01.
+      // Revoke at +05:00 — comfortably after every row's signedAt.
+      const revokedAt = new Date(
+        Date.UTC(2026, 4, 1, 0, 5, 0),
+      ).toISOString();
+      const zip = rebuildWithRevokedKey(revokedAt);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.rowSignatures.failed).toBe(0);
+      expect(report.rowSignatures.checked).toBe(4);
+    });
+
+    it('row signedAt > revokedAt + REVOKED status → fails with key_revoked_after_signing', async () => {
+      // Revoke BEFORE the first row signs (at baseTs - 1h).
+      const revokedAt = new Date(
+        Date.UTC(2026, 3, 30, 23, 0, 0),
+      ).toISOString();
+      const zip = rebuildWithRevokedKey(revokedAt);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.failed).toBe(4);
+      expect(report.rowSignatures.firstFailure).toBe('row-0');
+      expect(report.rowSignatures.reason).toBe('key_revoked_after_signing');
+    });
+
+    it('REVOKED entry with no revokedAt → fails with key_revoked_no_timestamp', async () => {
+      const zip = rebuildWithRevokedKey(null);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.reason).toBe('key_revoked_no_timestamp');
+    });
+
+    it('legacy v1 public-keys.json (bare base64 string) still verifies', async () => {
+      // Pre-AUDIT-14 bundles wrote `{ "1": "<base64>" }`. The verifier
+      // must keep reading those without forcing operators to rebuild
+      // their archive.
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const publicKeyB64 = Buffer.from(base.manifestPublicKey).toString(
+        'base64',
+      );
+      const legacyShape: Record<string, string> = { '1': publicKeyB64 };
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(legacyShape, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+    });
+  });
 });
