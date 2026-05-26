@@ -90,6 +90,7 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('root signatures   ', report.rootSignatures));
   lines.push(fmtComponent('inclusion proofs  ', report.inclusionProofs));
   lines.push(fmtComponent('rekor receipts    ', report.rekor));
+  lines.push(fmtComponent('platform attest.  ', report.platformAttestation));
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
   process.stdout.write(lines.join('\n') + '\n');

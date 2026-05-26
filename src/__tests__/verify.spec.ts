@@ -1039,4 +1039,256 @@ describe('verifyBundle', () => {
       expect(report.rowSignatures.ok).toBe(true);
     });
   });
+
+  /**
+   * AUDIT-2026-05-30 — Platform key-binding attestation.
+   *
+   * A bundle now ships `platform-attestation.json`: an ECDSA-P256
+   * signature minted by a platform-wide key (NOT a tenant key) over
+   * `{orgId, [keyVersion, fingerprint, status, revokedAt, issuedAt]}`.
+   * The verifier accepts a caller-supplied platform pubkey via
+   * `options.platformPublicKeyDerB64` so tests can pin a fresh key
+   * without rebuilding the CLI's bundled pin.
+   *
+   * Cases covered:
+   *   - Pristine bundle with a valid platform attestation → ok.
+   *   - Tampered attestation signature → fails with `signature:` reason.
+   *   - Tampered attestation orgId → fails with `org_mismatch`.
+   *   - Mismatched per-key fingerprint → fails.
+   *   - Missing attestation entry (pre-AUDIT-30 bundle) → warn but
+   *     proceed (`missing_legacy`); overall bundle.ok stays true.
+   */
+  describe('AUDIT-2026-05-30 — platform attestation', () => {
+    /** Helper — sign with ECDSA-P256 and ensure low-s canonical form. */
+    function platformSign(
+      message: Buffer,
+      privateKey: crypto.KeyObject,
+    ): Buffer {
+      for (let i = 0; i < 64; i++) {
+        const candidate = crypto.sign('sha256', message, privateKey);
+        if (isLowSP256(candidate)) {
+          return candidate;
+        }
+        const s = extractEcdsaSFromSignature(candidate)!;
+        const P256_N = BigInt(
+          '0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551',
+        );
+        return reencodeDerWithS(candidate, P256_N - s);
+      }
+      throw new Error('unreachable');
+    }
+    /** Re-encode DER with a new s value (mirrors the AUDIT-01 helper). */
+    function reencodeDerWithS(sig: Buffer, newS: bigint): Buffer {
+      if (sig[0] !== 0x30) throw new Error('not DER');
+      let off = 2;
+      const firstLen = sig[1]!;
+      if (firstLen & 0x80) off += firstLen & 0x7f;
+      if (sig[off] !== 0x02) throw new Error('expected INTEGER r');
+      const rLen = sig[off + 1]!;
+      const rBytes = sig.subarray(off + 2, off + 2 + rLen);
+      let sHex = newS.toString(16);
+      if (sHex.length % 2 === 1) sHex = '0' + sHex;
+      let sBytes = Buffer.from(sHex, 'hex');
+      while (sBytes.length > 1 && sBytes[0] === 0x00) {
+        sBytes = sBytes.subarray(1);
+      }
+      if (sBytes[0]! & 0x80) {
+        sBytes = Buffer.concat([Buffer.from([0x00]), sBytes]);
+      }
+      const rField = Buffer.concat([
+        Buffer.from([0x02, rBytes.length]),
+        rBytes,
+      ]);
+      const sField = Buffer.concat([
+        Buffer.from([0x02, sBytes.length]),
+        sBytes,
+      ]);
+      const inner = Buffer.concat([rField, sField]);
+      return Buffer.concat([Buffer.from([0x30, inner.length]), inner]);
+    }
+
+    /** Sha256-hex of a base64-encoded public key blob. */
+    function fingerprintB64(b64: string): string {
+      return crypto
+        .createHash('sha256')
+        .update(Buffer.from(b64, 'base64'))
+        .digest('hex');
+    }
+
+    /**
+     * Build a complete bundle whose `platform-attestation.json` is
+     * minted by a fresh ECDSA-P256 keypair. Returns the bundle bytes
+     * + the platform pubkey (base64-DER) so the verifier can pin it.
+     */
+    function buildBundleWithPlatformAttestation(opts: {
+      tamperOrgId?: boolean;
+      tamperSignature?: boolean;
+      tamperFingerprint?: boolean;
+      omitEntry?: boolean;
+    }): { zip: Buffer; platformPublicKeyDerB64: string } {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, string>;
+      const manifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string };
+
+      // Fresh platform keypair for THIS bundle. Pin it via options.
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'P-256',
+      });
+      const platformPublicKeyDer = publicKey.export({
+        format: 'der',
+        type: 'spki',
+      }) as Buffer;
+      const platformPublicKeyDerB64 = platformPublicKeyDer.toString('base64');
+      const platformFingerprint = crypto
+        .createHash('sha256')
+        .update(platformPublicKeyDer)
+        .digest('hex');
+
+      const keyVersions = Object.keys(publicKeys)
+        .map((v) => ({
+          keyVersion: Number(v),
+          fingerprint: opts.tamperFingerprint
+            ? '0'.repeat(64)
+            : fingerprintB64(publicKeys[v]!),
+          status: 'ACTIVE',
+          revokedAt: null as string | null,
+          issuedAt: '2026-05-01T00:00:00.000Z',
+        }))
+        .sort((a, b) => a.keyVersion - b.keyVersion);
+
+      const attestation = {
+        orgId: opts.tamperOrgId
+          ? '00000000-0000-0000-0000-0000DEADBEEF'
+          : manifest.orgId,
+        keyVersions,
+        issuedAt: '2026-05-01T01:00:00.000Z',
+        platformSigningKeyFingerprint: platformFingerprint,
+        signatureAlgorithm: 'ECDSA_P256_SHA256' as const,
+      };
+      const canonical = canonicalJson(attestation);
+      const sigBytes = platformSign(canonical, privateKey);
+      let signatureB64 = sigBytes.toString('base64');
+      if (opts.tamperSignature) {
+        const buf = Buffer.from(signatureB64, 'base64');
+        buf[buf.length - 1] = buf[buf.length - 1]! ^ 0xff;
+        signatureB64 = buf.toString('base64');
+      }
+      const envelope = { attestation, signature: signatureB64 };
+
+      const zipEntries = [
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+      ];
+      if (!opts.omitEntry) {
+        zipEntries.push({
+          name: 'platform-attestation.json',
+          data: Buffer.from(JSON.stringify(envelope, null, 2), 'utf8'),
+        });
+      }
+      zipEntries.push({
+        name: 'README.md',
+        data: entries.get('README.md')!,
+      });
+
+      return {
+        zip: writeZip(zipEntries),
+        platformPublicKeyDerB64,
+      };
+    }
+
+    it('verifies a pristine platform-attested bundle', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({});
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      expect(report.ok).toBe(true);
+      expect(report.platformAttestation.ok).toBe(true);
+      expect(report.platformAttestation.checked).toBe(1);
+      expect(report.platformAttestation.failed).toBe(0);
+    });
+
+    it('rejects a tampered attestation signature', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({ tamperSignature: true });
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      expect(report.ok).toBe(false);
+      expect(report.platformAttestation.ok).toBe(false);
+      expect(report.platformAttestation.failed).toBe(1);
+      expect(report.platformAttestation.reason).toMatch(/signature/);
+    });
+
+    it('rejects an attestation whose orgId does not match the manifest', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({ tamperOrgId: true });
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      expect(report.ok).toBe(false);
+      expect(report.platformAttestation.ok).toBe(false);
+      expect(report.platformAttestation.reason).toMatch(/org_mismatch/);
+    });
+
+    it('rejects an attestation whose per-key fingerprint disagrees with public-keys.json', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({ tamperFingerprint: true });
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      expect(report.ok).toBe(false);
+      expect(report.platformAttestation.ok).toBe(false);
+      // Signature is still valid (we re-sign the tampered body); the
+      // failure surface is the keyversion fingerprint mismatch.
+      expect(report.platformAttestation.reason).toMatch(
+        /keyversion_fingerprint_mismatch/,
+      );
+    });
+
+    it('treats a missing platform-attestation.json as legacy → warn but proceed', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({ omitEntry: true });
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      // Overall bundle still verifies (legacy bundles predate AUDIT-30).
+      expect(report.ok).toBe(true);
+      expect(report.platformAttestation.ok).toBe(true);
+      expect(report.platformAttestation.checked).toBe(0);
+      expect(report.platformAttestation.reason).toBe('missing_legacy');
+    });
+
+    it('treats an unpinned platform pubkey (placeholder mode) as warn-but-proceed', async () => {
+      // No `platformPublicKeyDerB64` override AND the bundled pin is
+      // still the empty placeholder — the verifier reports
+      // `placeholder_platform_key` and does NOT fail the bundle.
+      // We use the pristine fixture (no attestation entry) so the
+      // verifier short-circuits in placeholder mode before parsing
+      // anything.
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
+      expect(report.platformAttestation.ok).toBe(true);
+      expect(report.platformAttestation.reason).toBe(
+        'placeholder_platform_key',
+      );
+    });
+  });
 });

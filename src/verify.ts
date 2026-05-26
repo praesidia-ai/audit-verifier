@@ -39,6 +39,8 @@
  *                                 receipt is present.
  */
 
+import * as crypto from 'node:crypto';
+
 import {
   canonicalJson,
   sha256,
@@ -49,6 +51,11 @@ import {
   GENESIS_PREV_ROW_HASH,
 } from './crypto.js';
 import { readZip, gunzip, type ZipEntry } from './zip.js';
+import {
+  PLATFORM_PUBLIC_KEY_DER_B64,
+  PLATFORM_PUBLIC_KEY_FINGERPRINT,
+  isPlatformPubkeyPinned,
+} from './platform-pubkey.js';
 
 // ────────────────────────────────────────────────────────────────────────
 // Bundle wire types — what `BundleExporterService` (AGV-035) writes.
@@ -195,6 +202,28 @@ export interface VerifyReport {
   rootSignatures: ComponentResult;
   inclusionProofs: ComponentResult;
   rekor: ComponentResult;
+  /**
+   * AUDIT-2026-05-30 — Platform key-binding attestation.
+   *
+   * The bundle's `platform-attestation.json` is a SEPARATE signature
+   * (under a platform-wide key, NOT a tenant key) over the
+   * `(orgId, [keyVersion, fingerprint, status, revokedAt, issuedAt])`
+   * tuple. The verifier checks that signature against a pubkey pinned
+   * into this CLI (`platform-pubkey.ts`) so an auditor knows the
+   * platform itself — not just the tenant — vouched for the binding.
+   *
+   * Behavior modes:
+   *   - Bundle is missing `platform-attestation.json` (legacy /
+   *     pre-AUDIT-30):       `{ ok: true, reason: 'missing_legacy' }`
+   *     (warn but do not fail the bundle).
+   *   - Pinned platform pubkey is still the placeholder (verifier
+   *     pre-prod release):    `{ ok: true, reason:
+   *     'placeholder_platform_key' }` (warn but do not fail).
+   *   - Otherwise: strict — signature, fingerprint match, and
+   *     per-key fingerprint match against `public-keys.json` all
+   *     enforced.
+   */
+  platformAttestation: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -240,6 +269,17 @@ export interface VerifyOptions {
     receipt: string;
     anchoredAt: string;
   }) => Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * AUDIT-2026-05-30 — Override the pinned platform public key. The
+   * default is the bytes baked into the CLI release (see
+   * `platform-pubkey.ts`); tests + ops use this hook to pin a
+   * caller-supplied key without recompiling the package.
+   *
+   * Accepts base64-encoded SPKI DER of an EC P-256 public key. An
+   * empty / missing override falls back to the bundled pin (and to
+   * placeholder-mode warn-but-proceed when that pin is empty).
+   */
+  platformPublicKeyDerB64?: string;
 }
 
 const EXPECTED_ENTRIES = [
@@ -326,13 +366,24 @@ export async function verifyBundle(
   // 7) Optional Rekor fetch.
   const rekorResult = await verifyRekorReceipts(roots, options);
 
+  // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
+  // The entry is OPTIONAL on disk so legacy bundles (pre-AUDIT-30)
+  // still load; if missing, the verifier warns-but-proceeds.
+  const platformResult = verifyPlatformAttestation(
+    byName.get('platform-attestation.json') ?? null,
+    publicKeysRaw,
+    manifest.orgId,
+    options,
+  );
+
   const ok =
     manifestResult.ok &&
     rowSigResult.ok &&
     chainResult.ok &&
     rootSigResult.ok &&
     proofResult.ok &&
-    rekorResult.ok;
+    rekorResult.ok &&
+    platformResult.ok;
 
   return {
     ok,
@@ -342,6 +393,7 @@ export async function verifyBundle(
     rootSignatures: rootSigResult,
     inclusionProofs: proofResult,
     rekor: rekorResult,
+    platformAttestation: platformResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -827,6 +879,237 @@ async function defaultRekorFetcher(anchorReceipt: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// AUDIT-2026-05-30 — Platform key-binding attestation verifier
+// ════════════════════════════════════════════════════════════════════════
+
+interface PlatformAttestationBody {
+  orgId: string;
+  keyVersions: Array<{
+    keyVersion: number;
+    fingerprint: string;
+    status: string;
+    revokedAt: string | null;
+    issuedAt: string;
+  }>;
+  issuedAt: string;
+  platformSigningKeyFingerprint: string;
+  signatureAlgorithm: 'ECDSA_P256_SHA256';
+}
+
+interface PlatformAttestationEnvelope {
+  attestation: PlatformAttestationBody;
+  signature: string;
+}
+
+/**
+ * AUDIT-2026-05-30 — Verify the bundle's platform key-binding
+ * attestation.
+ *
+ * The check chain (each step short-circuits to the next reason on
+ * failure):
+ *   1. Resolve the platform pubkey: caller-supplied
+ *      `options.platformPublicKeyDerB64` wins; otherwise fall back
+ *      to the bundled pin. If both are empty, return
+ *      `placeholder_platform_key` (warn but proceed).
+ *   2. If the entry is missing entirely, return `missing_legacy`
+ *      (warn but proceed) — pre-AUDIT-30 bundles legitimately did
+ *      not carry it.
+ *   3. Parse the envelope. Reject malformed JSON / shape with
+ *      `malformed`.
+ *   4. orgId in attestation MUST match manifest orgId — else
+ *      `org_mismatch`.
+ *   5. signature MUST verify under the resolved platform pubkey,
+ *      with low-s canonical form enforced (see crypto.ts).
+ *   6. The attestation's `platformSigningKeyFingerprint` MUST match
+ *      the sha256 of the resolved pubkey's DER bytes — defends
+ *      against an attacker who swaps the verifier's bundled pubkey
+ *      bytes without re-signing the attestation.
+ *   7. Every `keyVersions[i].fingerprint` MUST match the sha256 of
+ *      the corresponding entry in `public-keys.json`.
+ */
+function verifyPlatformAttestation(
+  entry: ZipEntry | null,
+  publicKeysRaw: Record<string, unknown>,
+  manifestOrgId: string,
+  options: VerifyOptions,
+): ComponentResult {
+  // Step 1 — resolve the pinned pubkey (caller override > bundled pin).
+  const callerOverride = options.platformPublicKeyDerB64;
+  const pinnedB64 =
+    callerOverride && callerOverride.length > 0
+      ? callerOverride
+      : isPlatformPubkeyPinned()
+        ? PLATFORM_PUBLIC_KEY_DER_B64
+        : '';
+  if (pinnedB64.length === 0) {
+    // Placeholder mode — warn but proceed. A real CLI release pins
+    // the prod platform pubkey via `platform-pubkey.ts`; until then
+    // dev / CI bundles built with ephemeral platform keys still
+    // verify end-to-end.
+    return {
+      ok: true,
+      checked: 0,
+      failed: 0,
+      reason: 'placeholder_platform_key',
+    };
+  }
+  const pinnedDer = Buffer.from(pinnedB64, 'base64');
+  // Compute the expected fingerprint over the same bytes the
+  // verifier will use for signature dispatch. Caller override and
+  // bundled pin take the same path so a substitution at either
+  // level fails the `platformSigningKeyFingerprint` check below.
+  const expectedFingerprint =
+    callerOverride && callerOverride.length > 0
+      ? crypto.createHash('sha256').update(pinnedDer).digest('hex')
+      : PLATFORM_PUBLIC_KEY_FINGERPRINT;
+
+  // Step 2 — missing entry (legacy bundle). Warn but proceed.
+  if (!entry) {
+    return {
+      ok: true,
+      checked: 0,
+      failed: 0,
+      reason: 'missing_legacy',
+    };
+  }
+
+  // Step 3 — parse the envelope.
+  let envelope: PlatformAttestationEnvelope;
+  try {
+    envelope = JSON.parse(
+      entry.data.toString('utf8'),
+    ) as PlatformAttestationEnvelope;
+  } catch {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'malformed: platform-attestation.json is not valid JSON',
+    };
+  }
+  if (
+    !envelope ||
+    typeof envelope !== 'object' ||
+    !envelope.attestation ||
+    typeof envelope.signature !== 'string'
+  ) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'malformed: missing attestation / signature fields',
+    };
+  }
+  const body = envelope.attestation;
+  if (
+    !body ||
+    typeof body.orgId !== 'string' ||
+    !Array.isArray(body.keyVersions) ||
+    typeof body.platformSigningKeyFingerprint !== 'string' ||
+    typeof body.issuedAt !== 'string' ||
+    body.signatureAlgorithm !== 'ECDSA_P256_SHA256'
+  ) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'malformed: attestation body has wrong shape',
+    };
+  }
+
+  // Step 4 — orgId must match the manifest.
+  if (body.orgId !== manifestOrgId) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `org_mismatch: attestation orgId ${body.orgId} != manifest orgId ${manifestOrgId}`,
+    };
+  }
+
+  // Step 5 — signature verification (ECDSA-P256-SHA256, low-s).
+  // The verifier re-canonicalizes the attestation body BYTES the
+  // same way the writer did (`canonicalJson`); the signature must
+  // verify under the pinned pubkey or we fail closed.
+  const message = canonicalJson(body as unknown as Record<string, unknown>);
+  if (
+    !verifySignature(
+      'ECDSA_P256_SHA256',
+      message,
+      envelope.signature,
+      new Uint8Array(pinnedDer),
+    )
+  ) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'signature: platform attestation does not verify under pinned key',
+    };
+  }
+
+  // Step 6 — declared fingerprint must match the pinned pubkey.
+  if (
+    expectedFingerprint.length > 0 &&
+    body.platformSigningKeyFingerprint !== expectedFingerprint
+  ) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `fingerprint_mismatch: attestation declares ${body.platformSigningKeyFingerprint} but pinned pubkey hashes to ${expectedFingerprint}`,
+    };
+  }
+
+  // Step 7 — every keyVersion fingerprint matches `public-keys.json`.
+  for (const kv of body.keyVersions) {
+    if (
+      typeof kv.keyVersion !== 'number' ||
+      typeof kv.fingerprint !== 'string'
+    ) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: 'malformed: keyVersions entry missing keyVersion/fingerprint',
+      };
+    }
+    const pkEntry = publicKeysRaw[String(kv.keyVersion)];
+    let pkB64: string | null = null;
+    if (typeof pkEntry === 'string') {
+      pkB64 = pkEntry;
+    } else if (pkEntry && typeof pkEntry === 'object') {
+      const obj = pkEntry as { publicKey?: unknown };
+      if (typeof obj.publicKey === 'string') {
+        pkB64 = obj.publicKey;
+      }
+    }
+    if (pkB64 === null) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `keyversion_not_in_bundle: attestation references keyVersion ${kv.keyVersion} which is missing from public-keys.json`,
+      };
+    }
+    const actualFingerprint = crypto
+      .createHash('sha256')
+      .update(Buffer.from(pkB64, 'base64'))
+      .digest('hex');
+    if (actualFingerprint !== kv.fingerprint) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `keyversion_fingerprint_mismatch: keyVersion ${kv.keyVersion} attests ${kv.fingerprint} but public-keys.json bytes hash to ${actualFingerprint}`,
+      };
+    }
+  }
+
+  return { ok: true, checked: 1, failed: 0 };
 }
 
 // ════════════════════════════════════════════════════════════════════════
