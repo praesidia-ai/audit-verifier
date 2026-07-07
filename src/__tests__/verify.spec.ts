@@ -572,7 +572,7 @@ describe('verifyBundle', () => {
    * the entire pre-revocation history) and reject rows signed AFTER
    * it (otherwise revocation has no forward-looking force).
    */
-  describe('AUDIT-2026-05-14 — REVOKED key window', () => {
+  describe('BUG-AUDIT-02 — REVOKED key fails closed (no signedAt grace)', () => {
     /**
      * Re-pack the pristine fixture's `public-keys.json` to declare the
      * (single) signing key as REVOKED at `revokedAt`. Re-signing isn't
@@ -608,20 +608,26 @@ describe('verifyBundle', () => {
       ]);
     }
 
-    it('row signedAt < revokedAt + REVOKED status → row verifies normally', async () => {
-      // Every fixture row signs at baseTs + i*60 + 1s.
-      // baseTs = 2026-05-01T00:00:00Z, last row signedAt = +03:01.
-      // Revoke at +05:00 — comfortably after every row's signedAt.
+    it('row signedAt BEFORE revokedAt + REVOKED status → still FAILS (grace removed)', async () => {
+      // Every fixture row signs at baseTs + i*60 + 1s. Revoke at +05:00,
+      // comfortably AFTER every row's signedAt — under the old grace this
+      // verified OK. `signedAt` is not signed, so a revoked-key holder
+      // could forge exactly this shape; the verifier now fails closed.
       const revokedAt = new Date(Date.UTC(2026, 4, 1, 0, 5, 0)).toISOString();
       const zip = rebuildWithRevokedKey(revokedAt);
 
       const report = await verifyBundle(zip, { noRekor: true });
-      expect(report.rowSignatures.ok).toBe(true);
-      expect(report.rowSignatures.failed).toBe(0);
-      expect(report.rowSignatures.checked).toBe(4);
+      expect(report.ok).toBe(false);
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.failed).toBe(4);
+      expect(report.rowSignatures.firstFailure).toBe('row-0');
+      expect(report.rowSignatures.reason).toBe('key_revoked');
+      // The root is signed by the same (now REVOKED) key → also fails.
+      expect(report.rootSignatures.ok).toBe(false);
+      expect(report.rootSignatures.reason).toBe('key_revoked');
     });
 
-    it('row signedAt > revokedAt + REVOKED status → fails with key_revoked_after_signing', async () => {
+    it('row signedAt AFTER revokedAt + REVOKED status → FAILS with key_revoked', async () => {
       // Revoke BEFORE the first row signs (at baseTs - 1h).
       const revokedAt = new Date(Date.UTC(2026, 3, 30, 23, 0, 0)).toISOString();
       const zip = rebuildWithRevokedKey(revokedAt);
@@ -631,16 +637,16 @@ describe('verifyBundle', () => {
       expect(report.rowSignatures.ok).toBe(false);
       expect(report.rowSignatures.failed).toBe(4);
       expect(report.rowSignatures.firstFailure).toBe('row-0');
-      expect(report.rowSignatures.reason).toBe('key_revoked_after_signing');
+      expect(report.rowSignatures.reason).toBe('key_revoked');
     });
 
-    it('REVOKED entry with no revokedAt → fails with key_revoked_no_timestamp', async () => {
+    it('REVOKED entry with no revokedAt → FAILS with key_revoked', async () => {
       const zip = rebuildWithRevokedKey(null);
 
       const report = await verifyBundle(zip, { noRekor: true });
       expect(report.ok).toBe(false);
       expect(report.rowSignatures.ok).toBe(false);
-      expect(report.rowSignatures.reason).toBe('key_revoked_no_timestamp');
+      expect(report.rowSignatures.reason).toBe('key_revoked');
     });
 
     it('legacy v1 public-keys.json (bare base64 string) still verifies', async () => {

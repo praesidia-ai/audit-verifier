@@ -559,27 +559,27 @@ function verifyRowSignatures(
     // but the key-type mismatch makes the downgrade unobservable to
     // the verifier in the success direction.
     const rowAlgorithm = row.signatureAlgorithm ?? manifestAlgorithm;
-    // AUDIT-2026-05-14 — REVOKED-key acceptance window.
+    // BUG-AUDIT-02 — Fail CLOSED on ANY signature made under a REVOKED
+    // key, regardless of `signedAt`.
     //
-    // A row signed BEFORE the key was revoked still verifies (the
-    // signature is forensically valid; revocation is a forward-looking
-    // operator action). A row signed AFTER `revokedAt` MUST be
-    // rejected with `key_revoked_after_signing`, because the only
-    // legitimate way to produce such a signature would have been an
-    // operator who continued signing with a revoked key — exactly the
-    // failure mode `revokeKey` is meant to halt. The bundle exporter
-    // ships every status (ACTIVE / ROTATED / REVOKED) so the verifier
-    // can apply this rule offline.
+    // The previous rule granted a grace to rows whose `signedAt` was
+    // <= `revokedAt`. But `signedAt` is NOT part of the signed preimage
+    // (see `signableRow` — the 11 signable fields exclude it), so a
+    // holder of the compromised (revoked) private key could forge a new
+    // row, sign it (the signature is cryptographically valid — they hold
+    // the key), and stamp any pre-revocation `signedAt` to slip past the
+    // gate. That defeats exactly the adversary revocation targets. There
+    // is no self-contained way to tell a genuine pre-revocation signature
+    // from a backdated forgery without binding `signedAt` into the signer
+    // preimage (a coordinated be-core change, deliberately out of scope),
+    // so the conservative choice is to reject every REVOKED-key signature.
     if (entry.status === 'REVOKED') {
-      const revocationCheck = checkSignedBeforeRevocation(row, entry);
-      if (revocationCheck !== null) {
-        failed += 1;
-        if (!firstFailure) {
-          firstFailure = row.id;
-          reason = revocationCheck;
-        }
-        continue;
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = row.id;
+        reason = 'key_revoked';
       }
+      continue;
     }
     const signable = signableRow(row);
     const bytes = canonicalJson(signable);
@@ -643,22 +643,18 @@ function verifyRootSignatures(
       }
       continue;
     }
-    // AUDIT-2026-05-14 — same signed-before-revocation rule the row
-    // verifier applies. A root signed after its key was revoked is a
-    // forensics anomaly even if the underlying rows are clean.
+    // BUG-AUDIT-02 — Fail CLOSED on ANY root signed under a REVOKED key.
+    // Same reasoning as the row path: the root envelope
+    // (`{rootHash, periodStart, periodEnd, rowCount}`) does not cover
+    // `signedAt`, so a backdated `signedAt` cannot be trusted to prove a
+    // pre-revocation signature. Reject unconditionally.
     if (entry.status === 'REVOKED') {
-      const revocationCheck = checkSignedBeforeRevocation(
-        { id: root.id, signedAt: root.signedAt },
-        entry,
-      );
-      if (revocationCheck !== null) {
-        failed += 1;
-        if (!firstFailure) {
-          firstFailure = root.id;
-          reason = revocationCheck;
-        }
-        continue;
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = root.id;
+        reason = 'key_revoked';
       }
+      continue;
     }
     // Mirror the writer's envelope exactly — see MerkleRootService
     // (AGV-033) `computeRootForPeriod`.
@@ -1306,35 +1302,12 @@ function parsePublicKeyEntry(
 }
 
 /**
- * AUDIT-2026-05-14 — Returns `null` when the signed-before-revocation
- * check passes for a REVOKED key, otherwise a verifier `reason` string.
- *
- * Caller has already confirmed `entry.status === 'REVOKED'`. Three
- * reject codes:
- *   - `key_revoked_no_timestamp` — bundle is malformed (REVOKED with
- *     no `revokedAt`). Fail closed so a producer bug doesn't silently
- *     accept signatures against a revoked key.
- *   - `key_revoked_no_signed_at` — signed-at missing on the artifact.
- *     We can't decide pre/post revocation; fail closed.
- *   - `key_revoked_after_signing` — the artifact's `signedAt` is
- *     strictly AFTER the key's `revokedAt`. The expected hostile case.
+ * BUG-AUDIT-02 — The signed-before-revocation grace was REMOVED. It
+ * trusted `artifact.signedAt`, which is not covered by any signature in
+ * the bundle, so a holder of a revoked key could backdate `signedAt` and
+ * pass. The verifier now rejects EVERY REVOKED-key signature outright
+ * (see `verifyRowSignatures` / `verifyRootSignatures`). Re-introducing a
+ * legitimate pre-revocation window requires binding `signedAt` into the
+ * signer preimage on both the be-core signer and here — a separate,
+ * coordinated ticket.
  */
-function checkSignedBeforeRevocation(
-  artifact: { id: string; signedAt: string | null },
-  entry: PublicKeyRecord,
-): string | null {
-  if (entry.revokedAt === null) {
-    return 'key_revoked_no_timestamp';
-  }
-  if (!artifact.signedAt) {
-    return 'key_revoked_no_signed_at';
-  }
-  const signedMs = new Date(artifact.signedAt).getTime();
-  if (Number.isNaN(signedMs)) {
-    return 'key_revoked_no_signed_at';
-  }
-  if (signedMs > entry.revokedAt.getTime()) {
-    return 'key_revoked_after_signing';
-  }
-  return null;
-}
