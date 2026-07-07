@@ -224,6 +224,17 @@ export interface VerifyReport {
    *     enforced.
    */
   platformAttestation: ComponentResult;
+  /**
+   * BUG-AUDIT-01 — Bundle completeness. `manifest.rowCount` and
+   * `manifest.rootCount` are BOTH covered by the manifest signature
+   * (they sit in the manifest signable set). The chain / proof checks
+   * only validate the rows that are PRESENT — an attacker who truncates
+   * the trailing rows + their proofs leaves a still-chaining prefix that
+   * otherwise verifies OK. This component fails closed when the number
+   * of rows / roots actually present disagrees with the SIGNED counts,
+   * closing the truncation bypass.
+   */
+  completeness: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -326,7 +337,9 @@ export async function verifyBundle(
   for (const [k, v] of Object.entries(publicKeysRaw)) {
     const ver = Number(k);
     if (!Number.isInteger(ver)) {
-      throw new Error(`public-keys.json contains non-integer key version: ${k}`);
+      throw new Error(
+        `public-keys.json contains non-integer key version: ${k}`,
+      );
     }
     publicKeys.set(ver, parsePublicKeyEntry(v, k));
   }
@@ -376,6 +389,11 @@ export async function verifyBundle(
     options,
   );
 
+  // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
+  // match what is actually present, or a trailing-truncation attack
+  // slips through (the surviving prefix still chains + proves).
+  const completenessResult = verifyCompleteness(manifest, rows, roots);
+
   const ok =
     manifestResult.ok &&
     rowSigResult.ok &&
@@ -383,7 +401,8 @@ export async function verifyBundle(
     rootSigResult.ok &&
     proofResult.ok &&
     rekorResult.ok &&
-    platformResult.ok;
+    platformResult.ok &&
+    completenessResult.ok;
 
   return {
     ok,
@@ -394,6 +413,7 @@ export async function verifyBundle(
     inclusionProofs: proofResult,
     rekor: rekorResult,
     platformAttestation: platformResult,
+    completeness: completenessResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -455,6 +475,50 @@ function verifyManifest(
         failed: 1,
         reason: 'manifest signature does not verify',
       };
+}
+
+/**
+ * BUG-AUDIT-01 — Compare the SIGNED `rowCount` / `rootCount` (both in
+ * the manifest signable set, so covered by the manifest signature)
+ * against the number of rows / roots actually decoded from the bundle.
+ *
+ * The chain check (`verifyChain`) only validates predecessor links
+ * among the rows that are PRESENT, and the inclusion-proof check only
+ * walks the proofs that are PRESENT — so deleting the trailing N rows
+ * plus their proofs leaves a shorter-but-still-consistent prefix that
+ * otherwise passes every other component. This check is the only place
+ * the verifier binds "how many rows the signer committed to" against
+ * "how many rows we were handed", so it MUST participate in `ok`.
+ *
+ * `checked = 2` (the row-count assertion + the root-count assertion).
+ */
+function verifyCompleteness(
+  manifest: BundleManifest,
+  rows: BundleRow[],
+  roots: BundleRoot[],
+): ComponentResult {
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  if (rows.length !== manifest.rowCount) {
+    failed += 1;
+    firstFailure = 'rows';
+    reason = `row count mismatch: bundle has ${rows.length} rows but signed manifest declares ${manifest.rowCount}`;
+  }
+  if (roots.length !== manifest.rootCount) {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = 'roots';
+      reason = `root count mismatch: bundle has ${roots.length} roots but signed manifest declares ${manifest.rootCount}`;
+    }
+  }
+  return {
+    ok: failed === 0,
+    checked: 2,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
 }
 
 function verifyRowSignatures(
@@ -609,7 +673,9 @@ function verifyRootSignatures(
     // straddles a substrate cutover ships roots of both algorithms;
     // the per-root tag lets each one verify under its own primitive.
     const rootAlgorithm = root.signatureAlgorithm ?? manifestAlgorithm;
-    if (!verifySignature(rootAlgorithm, bytes, root.signature, entry.publicKey)) {
+    if (
+      !verifySignature(rootAlgorithm, bytes, root.signature, entry.publicKey)
+    ) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
@@ -658,11 +724,7 @@ function verifyInclusionProofs(
       checked += 1;
       continue;
     }
-    if (
-      !entry.proof ||
-      !entry.rootHash ||
-      typeof entry.index !== 'number'
-    ) {
+    if (!entry.proof || !entry.rootHash || typeof entry.index !== 'number') {
       failed += 1;
       if (!firstFailure) {
         firstFailure = entry.rowId;
@@ -684,7 +746,9 @@ function verifyInclusionProofs(
     }
     const leaf = computeLeaf(row);
     const merkleProofObj: MerkleProof = {
-      siblings: entry.proof.map((s) => new Uint8Array(Buffer.from(s, 'base64'))),
+      siblings: entry.proof.map(
+        (s) => new Uint8Array(Buffer.from(s, 'base64')),
+      ),
       index: entry.index,
     };
     if (!merkleVerify(leaf, merkleProofObj, new Uint8Array(rootBytes))) {
@@ -727,7 +791,12 @@ async function verifyRekorReceipts(
   options: VerifyOptions,
 ): Promise<ComponentResult> {
   if (options.noRekor) {
-    return { ok: true, checked: 0, failed: 0, reason: 'skipped via --no-rekor' };
+    return {
+      ok: true,
+      checked: 0,
+      failed: 0,
+      reason: 'skipped via --no-rekor',
+    };
   }
   const rekorFetcher = options.rekorFetcher ?? defaultRekorFetcher;
   let checked = 0;
@@ -839,7 +908,10 @@ async function verifyAnchorReceipt(
  * verifier is offline by contract; live HEAD-against-bucket checks are
  * the responsibility of a caller-supplied `anchorReceiptVerifier`.
  */
-function verifyS3ReceiptShape(receipt: string): { ok: boolean; reason?: string } {
+function verifyS3ReceiptShape(receipt: string): {
+  ok: boolean;
+  reason?: string;
+} {
   if (!receipt.startsWith('s3:')) {
     return { ok: false, reason: 'malformed' };
   }
@@ -1047,7 +1119,8 @@ function verifyPlatformAttestation(
       ok: false,
       checked: 1,
       failed: 1,
-      reason: 'signature: platform attestation does not verify under pinned key',
+      reason:
+        'signature: platform attestation does not verify under pinned key',
     };
   }
 
@@ -1201,11 +1274,7 @@ function parsePublicKeyEntry(
       );
     }
     const status = obj.status;
-    if (
-      status !== 'ACTIVE' &&
-      status !== 'ROTATED' &&
-      status !== 'REVOKED'
-    ) {
+    if (status !== 'ACTIVE' && status !== 'ROTATED' && status !== 'REVOKED') {
       throw new Error(
         `public-keys.json[${versionKey}] has invalid status: ${String(status)}`,
       );

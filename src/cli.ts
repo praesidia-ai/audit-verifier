@@ -91,6 +91,7 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('inclusion proofs  ', report.inclusionProofs));
   lines.push(fmtComponent('rekor receipts    ', report.rekor));
   lines.push(fmtComponent('platform attest.  ', report.platformAttestation));
+  lines.push(fmtComponent('completeness      ', report.completeness));
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
   process.stdout.write(lines.join('\n') + '\n');
@@ -98,10 +99,17 @@ function printReport(report: VerifyReport, quiet: boolean): void {
 
 function fmtComponent(
   label: string,
-  c: { ok: boolean; checked: number; failed: number; firstFailure?: string; reason?: string },
+  c: {
+    ok: boolean;
+    checked: number;
+    failed: number;
+    firstFailure?: string;
+    reason?: string;
+  },
 ): string {
   const tag = c.ok ? 'OK  ' : 'FAIL';
-  const counts = c.failed > 0 ? `${c.failed}/${c.checked} failed` : `${c.checked} checked`;
+  const counts =
+    c.failed > 0 ? `${c.failed}/${c.checked} failed` : `${c.checked} checked`;
   let extra = '';
   if (!c.ok) {
     if (c.firstFailure) extra += `  first=${c.firstFailure}`;

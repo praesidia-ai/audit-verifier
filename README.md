@@ -56,6 +56,18 @@ checks every cryptographic invariant the bundle commits to:
 6. **Optional Rekor receipt** — when `--no-rekor` is NOT passed, the
    tool fetches each root's Sigstore Rekor receipt and validates the
    inclusion proof. Skipped when no `anchorReceipt` is present.
+7. **Completeness** — the number of rows / roots actually present must
+   equal the SIGNED `manifest.rowCount` / `manifest.rootCount`. This
+   fails closed on a trailing-truncation attack, where an attacker
+   deletes the last N rows (and their proofs): the surviving prefix
+   still chains and still proves, but the signed counts no longer match
+   what was handed to the verifier.
+8. **Platform key-binding attestation** — the optional
+   `platform-attestation.json` is checked against the CLI's pinned
+   platform key. Independently, every key in `public-keys.json` is
+   cross-checked byte-for-byte against the SIGNED `manifest.keyVersions`
+   set, so verification keys cannot be swapped even when the platform
+   attestation is absent or still the placeholder pin.
 
 ## Architecture
 

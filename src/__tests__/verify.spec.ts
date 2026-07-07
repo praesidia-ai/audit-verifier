@@ -102,12 +102,13 @@ function keypairFromSeed(seed: Buffer): {
   privateKey: Uint8Array;
 } {
   // PKCS#8 prefix for Ed25519 raw 32-byte private seed.
-  const PKCS8_PREFIX = Buffer.from(
-    '302e020100300506032b657004220420',
-    'hex',
-  );
+  const PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
   const der = Buffer.concat([PKCS8_PREFIX, seed]);
-  const priv = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+  const priv = crypto.createPrivateKey({
+    key: der,
+    format: 'der',
+    type: 'pkcs8',
+  });
   const pub = crypto.createPublicKey(priv);
   const jwk = pub.export({ format: 'jwk' }) as { x?: string };
   if (!jwk.x) throw new Error('failed to derive Ed25519 public key');
@@ -215,10 +216,11 @@ function buildFixtureBundle(): FixtureBundle {
   }
 
   // ── 2) Build the Merkle tree over leaf = canonical || sig_bytes ─────
-  const leaves = rowSignablePayloads.map((p) =>
-    new Uint8Array(
-      Buffer.concat([p.canonical, Buffer.from(p.signatureBase64, 'base64')]),
-    ),
+  const leaves = rowSignablePayloads.map(
+    (p) =>
+      new Uint8Array(
+        Buffer.concat([p.canonical, Buffer.from(p.signatureBase64, 'base64')]),
+      ),
   );
   const tree = merkleBuild(leaves);
   const rootHashB64 = Buffer.from(tree.root).toString('base64');
@@ -301,11 +303,17 @@ function buildFixtureBundle(): FixtureBundle {
   );
 
   const zip = writeZip([
-    { name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8') },
+    {
+      name: 'manifest.json',
+      data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+    },
     { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
     { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
     { name: 'proofs.ndjson.gz', data: gzipDeterministic(proofsNdjson) },
-    { name: 'public-keys.json', data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8') },
+    {
+      name: 'public-keys.json',
+      data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+    },
     { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
   ]);
 
@@ -327,10 +335,13 @@ function buildBundleWithTamper(opts: {
   postSignPrevRowHash?: (rows: FixtureRow[]) => void;
   postSignRootSignature?: (roots: FixtureRoot[]) => void;
   postSignProofSibling?: (proofs: FixtureProof[]) => void;
-  postSignManifestSignature?: (manifest: {
-    signature: string;
-  }) => void;
-}): { zip: Buffer; rows: FixtureRow[]; roots: FixtureRoot[]; proofs: FixtureProof[] } {
+  postSignManifestSignature?: (manifest: { signature: string }) => void;
+}): {
+  zip: Buffer;
+  rows: FixtureRow[];
+  roots: FixtureRoot[];
+  proofs: FixtureProof[];
+} {
   const base = buildFixtureBundle();
 
   // Apply tampers to the in-memory structs *after* signing.
@@ -485,6 +496,74 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * BUG-AUDIT-01 — Trailing-truncation bypass.
+   *
+   * `manifest.rowCount` / `manifest.rootCount` are covered by the
+   * manifest signature. An attacker who deletes the trailing rows (and
+   * their proofs) leaves a shorter prefix that still chains from genesis
+   * and whose surviving proofs still verify — so before this fix the
+   * bundle returned `ok: true`. The `completeness` component must now
+   * catch the count mismatch and fail the bundle (CLI exit 1).
+   */
+  describe('BUG-AUDIT-01 — completeness / truncation', () => {
+    /**
+     * Re-pack the pristine fixture keeping the ORIGINAL signed manifest
+     * (which declares rowCount=4) but dropping the trailing `dropRows`
+     * rows and their proofs from the ndjson members.
+     */
+    function rebuildTruncated(dropRows: number): Buffer {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const keptRows = base.rows.slice(0, base.rows.length - dropRows);
+      const keptRowIds = new Set(keptRows.map((r) => r.id));
+      const keptProofs = base.proofs.filter((p) => keptRowIds.has(p.rowId));
+      const rowsNdjson = Buffer.from(
+        keptRows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const proofsNdjson = Buffer.from(
+        keptProofs.map((p) => JSON.stringify(p)).join('\n') + '\n',
+        'utf8',
+      );
+      return writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: gzipDeterministic(proofsNdjson) },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+    }
+
+    it('fails a bundle with trailing rows + proofs truncated (was OK before the fix)', async () => {
+      const zip = rebuildTruncated(1); // drop the last row + its proof
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      // The surviving prefix still chains + proves — every crypto
+      // component is individually happy…
+      expect(report.chain.ok).toBe(true);
+      expect(report.inclusionProofs.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+      // …but completeness catches the signed-vs-present count mismatch.
+      expect(report.completeness.ok).toBe(false);
+      expect(report.completeness.failed).toBeGreaterThan(0);
+      expect(report.completeness.reason).toMatch(/row count mismatch/);
+      expect(report.bundle.rowsSeen).toBe(3);
+      expect(report.bundle.declaredRowCount).toBe(4);
+      // Overall bundle FAILS → CLI exit 1.
+      expect(report.ok).toBe(false);
+    });
+
+    it('passes completeness for a pristine (untruncated) bundle', async () => {
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.completeness.ok).toBe(true);
+      expect(report.completeness.checked).toBe(2);
+      expect(report.completeness.failed).toBe(0);
+    });
+  });
+
+  /**
    * AUDIT-2026-05-14 — Revoked-key acceptance window.
    *
    * The exporter now emits each key in `public-keys.json` as
@@ -533,9 +612,7 @@ describe('verifyBundle', () => {
       // Every fixture row signs at baseTs + i*60 + 1s.
       // baseTs = 2026-05-01T00:00:00Z, last row signedAt = +03:01.
       // Revoke at +05:00 — comfortably after every row's signedAt.
-      const revokedAt = new Date(
-        Date.UTC(2026, 4, 1, 0, 5, 0),
-      ).toISOString();
+      const revokedAt = new Date(Date.UTC(2026, 4, 1, 0, 5, 0)).toISOString();
       const zip = rebuildWithRevokedKey(revokedAt);
 
       const report = await verifyBundle(zip, { noRekor: true });
@@ -546,9 +623,7 @@ describe('verifyBundle', () => {
 
     it('row signedAt > revokedAt + REVOKED status → fails with key_revoked_after_signing', async () => {
       // Revoke BEFORE the first row signs (at baseTs - 1h).
-      const revokedAt = new Date(
-        Date.UTC(2026, 3, 30, 23, 0, 0),
-      ).toISOString();
+      const revokedAt = new Date(Date.UTC(2026, 3, 30, 23, 0, 0)).toISOString();
       const zip = rebuildWithRevokedKey(revokedAt);
 
       const report = await verifyBundle(zip, { noRekor: true });
@@ -614,7 +689,11 @@ describe('verifyBundle', () => {
      * `verifyRootSignatures`).
      */
     function rebuildWithReceipts(
-      receipts: Array<{ provider: string; receipt: string; anchoredAt: string }>,
+      receipts: Array<{
+        provider: string;
+        receipt: string;
+        anchoredAt: string;
+      }>,
       legacyAnchorReceipt: string | null = null,
     ): Buffer {
       const base = buildFixtureBundle();
@@ -667,10 +746,7 @@ describe('verifyBundle', () => {
       // verifier must still verify the legacy receipt (the migration
       // backfill writes this synthesis into the array, but bundles
       // captured from older snapshots may not have run the backfill).
-      const zip = rebuildWithReceipts(
-        [],
-        '{"logIndex":9001}',
-      );
+      const zip = rebuildWithReceipts([], '{"logIndex":9001}');
 
       const report = await verifyBundle(zip, {});
       expect(report.ok).toBe(true);
@@ -818,8 +894,14 @@ describe('verifyBundle', () => {
       if (sBytes[0]! & 0x80) {
         sBytes = Buffer.concat([Buffer.from([0x00]), sBytes]);
       }
-      const rField = Buffer.concat([Buffer.from([0x02, rBytes.length]), rBytes]);
-      const sField = Buffer.concat([Buffer.from([0x02, sBytes.length]), sBytes]);
+      const rField = Buffer.concat([
+        Buffer.from([0x02, rBytes.length]),
+        rBytes,
+      ]);
+      const sField = Buffer.concat([
+        Buffer.from([0x02, sBytes.length]),
+        sBytes,
+      ]);
       const inner = Buffer.concat([rField, sField]);
       return Buffer.concat([Buffer.from([0x30, inner.length]), inner]);
     }
