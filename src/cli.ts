@@ -92,6 +92,7 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('rekor receipts    ', report.rekor));
   lines.push(fmtComponent('platform attest.  ', report.platformAttestation));
   lines.push(fmtComponent('completeness      ', report.completeness));
+  lines.push(fmtComponent('key binding       ', report.keyBinding));
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
   process.stdout.write(lines.join('\n') + '\n');

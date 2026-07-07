@@ -564,6 +564,78 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * BUG-AUDIT-03 — Verification keys cross-checked against the signed
+   * manifest.keyVersions set.
+   *
+   * public-keys.json is unsigned; manifest.keyVersions is covered by the
+   * manifest signature. A swapped public-keys.json (a key not byte-present
+   * in the signed set) must fail the `keyBinding` component.
+   */
+  describe('BUG-AUDIT-03 — key binding cross-check', () => {
+    it('fails when public-keys.json is swapped for a key not in the signed manifest', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      // A completely different keypair, NOT the one in manifest.keyVersions.
+      const attacker = keypairFromSeed(Buffer.alloc(32, 9));
+      const attackerB64 = Buffer.from(attacker.publicKey).toString('base64');
+      const swappedKeys: Record<string, string> = { '1': attackerB64 };
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(swappedKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.keyBinding.ok).toBe(false);
+      expect(report.keyBinding.failed).toBe(1);
+      expect(report.keyBinding.firstFailure).toBe('1');
+      expect(report.keyBinding.reason).toMatch(/key_bytes_mismatch/);
+    });
+
+    it('fails when public-keys.json declares a keyVersion absent from the signed set', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, string>;
+      // Add an extra, unsigned key version.
+      const extra = keypairFromSeed(Buffer.alloc(32, 11));
+      publicKeys['2'] = Buffer.from(extra.publicKey).toString('base64');
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.keyBinding.ok).toBe(false);
+      expect(report.keyBinding.reason).toMatch(/key_not_in_signed_manifest/);
+    });
+
+    it('passes key binding for a pristine bundle', async () => {
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.keyBinding.ok).toBe(true);
+      expect(report.keyBinding.checked).toBe(1);
+      expect(report.keyBinding.failed).toBe(0);
+    });
+  });
+
+  /**
    * AUDIT-2026-05-14 — Revoked-key acceptance window.
    *
    * The exporter now emits each key in `public-keys.json` as

@@ -235,6 +235,18 @@ export interface VerifyReport {
    * closing the truncation bypass.
    */
   completeness: ComponentResult;
+  /**
+   * BUG-AUDIT-03 — Verification-key binding. Every signature is checked
+   * against the bytes in the UNSIGNED `public-keys.json`, while the
+   * SIGNED `manifest.keyVersions[]` (covered by the manifest signature)
+   * was only used self-referentially. This component cross-checks each
+   * key in `public-keys.json` byte-for-byte against the same-version
+   * entry in `manifest.keyVersions`, failing closed when a key used for
+   * verification is not byte-present in the signed set. It provides a
+   * tamper-evidence layer independent of the OPTIONAL platform
+   * attestation (which stays warn-but-proceed when absent / placeholder).
+   */
+  keyBinding: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -394,6 +406,10 @@ export async function verifyBundle(
   // slips through (the surviving prefix still chains + proves).
   const completenessResult = verifyCompleteness(manifest, rows, roots);
 
+  // 10) BUG-AUDIT-03 — Bind the (unsigned) `public-keys.json` bytes the
+  // verifier trusts against the SIGNED `manifest.keyVersions` set.
+  const keyBindingResult = verifyKeyBinding(manifest, publicKeysRaw);
+
   const ok =
     manifestResult.ok &&
     rowSigResult.ok &&
@@ -402,7 +418,8 @@ export async function verifyBundle(
     proofResult.ok &&
     rekorResult.ok &&
     platformResult.ok &&
-    completenessResult.ok;
+    completenessResult.ok &&
+    keyBindingResult.ok;
 
   return {
     ok,
@@ -414,6 +431,7 @@ export async function verifyBundle(
     rekor: rekorResult,
     platformAttestation: platformResult,
     completeness: completenessResult,
+    keyBinding: keyBindingResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -519,6 +537,103 @@ function verifyCompleteness(
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
   };
+}
+
+/**
+ * BUG-AUDIT-03 — Cross-check the verification keys against the SIGNED
+ * key set.
+ *
+ * Every row/root/manifest signature is verified with a key pulled from
+ * the UNSIGNED `public-keys.json`. `manifest.keyVersions[]` carries the
+ * same keys but IS covered by the manifest signature (it sits in the
+ * manifest signable set). Without this check the two are only compared
+ * self-referentially, so an attacker who can swap `public-keys.json`
+ * (and re-sign the rows with their own key) produces a bundle that
+ * verifies against its own planted key — the platform attestation is the
+ * only thing that would catch it, and that entry is OPTIONAL.
+ *
+ * Here we require every key present in `public-keys.json` to be
+ * byte-identical to the `manifest.keyVersions` entry of the same version.
+ * Because the manifest signature already gates `manifest.keyVersions`,
+ * binding the trusted keys to it means a verification key cannot be
+ * swapped without breaking the manifest signature too. `checked` counts
+ * one assertion per key version in `public-keys.json`.
+ */
+function verifyKeyBinding(
+  manifest: BundleManifest,
+  publicKeysRaw: Record<string, unknown>,
+): ComponentResult {
+  const signed = new Map<number, Uint8Array>();
+  for (const kv of manifest.keyVersions) {
+    if (typeof kv.publicKey === 'string') {
+      signed.set(
+        kv.keyVersion,
+        new Uint8Array(Buffer.from(kv.publicKey, 'base64')),
+      );
+    }
+  }
+
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+
+  for (const [k, raw] of Object.entries(publicKeysRaw)) {
+    checked += 1;
+    const ver = Number(k);
+    const usedB64 = extractPublicKeyB64(raw);
+    if (usedB64 === null) {
+      failed += 1;
+      if (firstFailure === undefined) {
+        firstFailure = k;
+        reason = `public-keys.json[${k}] has no decodable publicKey`;
+      }
+      continue;
+    }
+    const usedBytes = new Uint8Array(Buffer.from(usedB64, 'base64'));
+    const signedBytes = signed.get(ver);
+    if (signedBytes === undefined) {
+      failed += 1;
+      if (firstFailure === undefined) {
+        firstFailure = k;
+        reason = `key_not_in_signed_manifest: public-keys.json declares keyVersion ${k} which is absent from the signed manifest.keyVersions`;
+      }
+      continue;
+    }
+    if (!bytesEqual(usedBytes, signedBytes)) {
+      failed += 1;
+      if (firstFailure === undefined) {
+        firstFailure = k;
+        reason = `key_bytes_mismatch: public-keys.json[${k}] bytes differ from the signed manifest.keyVersions[${k}]`;
+      }
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** Extract the base64 public key from a `public-keys.json` entry (string or object shape). */
+function extractPublicKeyB64(raw: unknown): string | null {
+  if (typeof raw === 'string') return raw;
+  if (raw && typeof raw === 'object') {
+    const pk = (raw as { publicKey?: unknown }).publicKey;
+    if (typeof pk === 'string') return pk;
+  }
+  return null;
+}
+
+/** Constant-time-ish byte comparison (length + content). */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
 }
 
 function verifyRowSignatures(
