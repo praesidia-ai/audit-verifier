@@ -157,8 +157,18 @@ function signableRow(r: {
   };
 }
 
-/** Build a fully-signed, fully-verifiable compliance bundle in memory. */
-function buildFixtureBundle(): FixtureBundle {
+/**
+ * Build a fully-signed, fully-verifiable compliance bundle in memory.
+ *
+ * @param opts.firstRowPrevRowHash — BUGHUNT-SDK-02: override row-0's
+ *   `prevRowHash` (default genesis) to model a MID-CHAIN ranged export whose
+ *   first row links to an out-of-bundle predecessor. Row-0's signature is
+ *   minted over `canonical || thisPrevRowHash`, exactly as the backend writer
+ *   does, so the bundle stays internally valid under the anchor semantics.
+ */
+function buildFixtureBundle(opts?: {
+  firstRowPrevRowHash?: string;
+}): FixtureBundle {
   const seed = Buffer.alloc(32, 7); // deterministic seed
   const { publicKey, privateKey } = keypairFromSeed(seed);
   const keyVersion = 1;
@@ -197,7 +207,7 @@ function buildFixtureBundle(): FixtureBundle {
     // bind it (the backend writer signs `canonical || prev_row_hash`).
     let prevRowHash: string;
     if (i === 0) {
-      prevRowHash = GENESIS_PREV_ROW_HASH;
+      prevRowHash = opts?.firstRowPrevRowHash ?? GENESIS_PREV_ROW_HASH;
     } else {
       const prev = rowSignablePayloads[i - 1]!;
       const prevSigBytes = Buffer.from(prev.signatureBase64, 'base64');
@@ -342,6 +352,7 @@ function buildFixtureBundle(): FixtureBundle {
  * in a row payload AFTER signing), set the `postSign*` hook.
  */
 function buildBundleWithTamper(opts: {
+  firstRowPrevRowHash?: string;
   postSignRowByte?: (rows: FixtureRow[]) => void;
   postSignPrevRowHash?: (rows: FixtureRow[]) => void;
   postSignRootSignature?: (roots: FixtureRoot[]) => void;
@@ -353,7 +364,11 @@ function buildBundleWithTamper(opts: {
   roots: FixtureRoot[];
   proofs: FixtureProof[];
 } {
-  const base = buildFixtureBundle();
+  const base = buildFixtureBundle(
+    opts.firstRowPrevRowHash !== undefined
+      ? { firstRowPrevRowHash: opts.firstRowPrevRowHash }
+      : undefined,
+  );
 
   // Apply tampers to the in-memory structs *after* signing.
   if (opts.postSignRowByte) opts.postSignRowByte(base.rows);
@@ -658,6 +673,95 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * BUGHUNT-SDK-02 — Partial-range (non-genesis) bundles verify.
+   *
+   * Bundles are date-ranged and hard-capped at 90 days, so a bundle for
+   * any org older than 90 days CANNOT begin at the genesis row: its first
+   * row's `prevRowHash` links to a predecessor whose `signedAt < from` and
+   * is therefore not in the bundle. The verifier now treats the first
+   * row's `prevRowHash` as an opaque anchor and only enforces internal
+   * linkage for rows [1..]. Leading truncation is still caught by
+   * `completeness`; middle-row tamper still breaks an internal link.
+   */
+  describe('BUGHUNT-SDK-02 — partial-range chain anchor', () => {
+    it('verifies a mid-chain ranged bundle whose first row prevRowHash is NOT genesis', async () => {
+      // Anchor into the org's pre-range history (an out-of-bundle
+      // predecessor). Row-0's signature binds this value (canonical ||
+      // prevRowHash), exactly as the backend writer produces it.
+      const anchor = sha256(
+        Buffer.from('out-of-range predecessor row'),
+      ).toString('base64');
+      expect(anchor).not.toBe(GENESIS_PREV_ROW_HASH);
+
+      const { zip } = buildFixtureBundle({ firstRowPrevRowHash: anchor });
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      // The whole bundle verifies — the non-genesis first row is accepted
+      // as an anchor and rows [1..] still chain internally.
+      expect(report.ok).toBe(true);
+      expect(report.chain.ok).toBe(true);
+      expect(report.chain.failed).toBe(0);
+      // 4 rows → 3 inter-row link assertions (the anchor is not asserted).
+      expect(report.chain.checked).toBe(3);
+      expect(report.rowSignatures.ok).toBe(true);
+    });
+
+    it('still catches a MIDDLE-row chain break in a ranged bundle', async () => {
+      const anchor = sha256(Buffer.from('anchor')).toString('base64');
+      const { zip } = buildBundleWithTamper({
+        firstRowPrevRowHash: anchor,
+        postSignPrevRowHash: (rows) => {
+          // Break row-2's link to row-1 (a NON-leading row).
+          rows[2]!.prevRowHash = GENESIS_PREV_ROW_HASH;
+        },
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.chain.ok).toBe(false);
+      expect(report.chain.firstFailure).toBe('row-2');
+    });
+
+    it('leading-truncated ranged bundle STILL FAILS via completeness (dropped first row)', async () => {
+      // Genesis-rooted fixture, rowCount=4 in the signed manifest. Drop the
+      // FIRST row + its proof. The surviving rows [1..3] still internally
+      // chain (row-1 becomes the first row → its prevRowHash accepted as an
+      // anchor), so `chain` is happy — but `completeness` catches 3 != 4.
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const keptRows = base.rows.slice(1);
+      const keptRowIds = new Set(keptRows.map((r) => r.id));
+      const keptProofs = base.proofs.filter((p) => keptRowIds.has(p.rowId));
+      const rowsNdjson = Buffer.from(
+        keptRows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const proofsNdjson = Buffer.from(
+        keptProofs.map((p) => JSON.stringify(p)).join('\n') + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: gzipDeterministic(proofsNdjson) },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      // Internal linkage of the surviving prefix is intact + first row
+      // anchored…
+      expect(report.chain.ok).toBe(true);
+      // …but the signed count no longer matches → completeness fails.
+      expect(report.completeness.ok).toBe(false);
+      expect(report.completeness.reason).toMatch(/row count mismatch/);
+      expect(report.bundle.rowsSeen).toBe(3);
+      expect(report.bundle.declaredRowCount).toBe(4);
+      expect(report.ok).toBe(false);
+    });
+  });
+
+  /**
    * BUG-AUDIT-03 — Verification keys cross-checked against the signed
    * manifest.keyVersions set.
    *
@@ -903,8 +1007,11 @@ describe('verifyBundle', () => {
       ]);
 
       const report = await verifyBundle(zip, {
-        // Default rekor fetcher just parses JSON — our '{"logIndex":9001}'
-        // receipt is parseable so it passes.
+        // BUGHUNT-SDK-05 — the rekor receipt here is a stub; this test
+        // exercises multi-anchor DISPATCH + counting, not Rekor crypto
+        // (covered by the dedicated suite below), so pass an explicit
+        // rekorFetcher seam rather than a full signed Rekor entry.
+        rekorFetcher: async () => true,
       });
       expect(report.ok).toBe(true);
       expect(report.rekor.ok).toBe(true);
@@ -920,7 +1027,10 @@ describe('verifyBundle', () => {
       // captured from older snapshots may not have run the backfill).
       const zip = rebuildWithReceipts([], '{"logIndex":9001}');
 
-      const report = await verifyBundle(zip, {});
+      // BUGHUNT-SDK-05 — dispatch/counting test; stub the rekor crypto.
+      const report = await verifyBundle(zip, {
+        rekorFetcher: async () => true,
+      });
       expect(report.ok).toBe(true);
       expect(report.rekor.ok).toBe(true);
       expect(report.rekor.checked).toBe(1);
@@ -941,7 +1051,11 @@ describe('verifyBundle', () => {
         },
       ]);
 
-      const report = await verifyBundle(zip, {});
+      // BUGHUNT-SDK-05 — stub the rekor crypto so the ONLY failure is the
+      // unknown provider (this test is about provider dispatch, not SET).
+      const report = await verifyBundle(zip, {
+        rekorFetcher: async () => true,
+      });
       expect(report.ok).toBe(false);
       expect(report.rekor.ok).toBe(false);
       expect(report.rekor.checked).toBe(2);
@@ -996,6 +1110,182 @@ describe('verifyBundle', () => {
         { provider: 'rekor', receipt: 'rekor:9001' },
         { provider: 's3', receipt: 's3:b:k:v' },
       ]);
+    });
+  });
+
+  /**
+   * BUGHUNT-SDK-05 — Real offline Rekor receipt verification.
+   *
+   * The DEFAULT `rekor` check is now cryptographic: the receipt's Signed
+   * Entry Timestamp (SET) must verify under the pinned Rekor key AND its
+   * inclusion proof must reproduce `inclusionProof.rootHash`. A forged
+   * non-Rekor blob like `"{}"` no longer passes (the old `JSON.parse`
+   * default returned `true` for it). Tests pin a fresh Rekor key via
+   * `rekorPublicKeyPem` (the sovereign-instance / test seam) and mint a
+   * self-consistent single-leaf signed entry, then prove tampers fail.
+   */
+  describe('BUGHUNT-SDK-05 — real Rekor SET + inclusion verification', () => {
+    const LEAF = Buffer.from([0x00]);
+
+    function flipLastByteB64(b64: string): string {
+      const buf = Buffer.from(b64, 'base64');
+      buf[buf.length - 1] = buf[buf.length - 1]! ^ 0xff;
+      return buf.toString('base64');
+    }
+
+    /**
+     * Mint a self-consistent Rekor receipt (persisted flat shape) whose
+     * SET verifies under the returned P-256 pubkey and whose single-leaf
+     * inclusion proof verifies against its rootHash.
+     */
+    function buildRekorReceipt(opts?: {
+      tamperSet?: boolean;
+      tamperProof?: boolean;
+    }): { receiptJson: string; publicKeyPem: string } {
+      const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+        namedCurve: 'P-256',
+      });
+      const publicKeyPem = publicKey.export({
+        type: 'spki',
+        format: 'pem',
+      }) as string;
+      const spkiDer = publicKey.export({
+        type: 'spki',
+        format: 'der',
+      }) as Buffer;
+      const logID = crypto.createHash('sha256').update(spkiDer).digest('hex');
+      const logIndex = 9001;
+      const integratedTime = 1748131200;
+      const body = Buffer.from(
+        JSON.stringify({ kind: 'hashedrekord', apiVersion: '0.0.1' }),
+        'utf8',
+      ).toString('base64');
+
+      // Canonical SET payload — key order body,integratedTime,logID,logIndex.
+      const setPayload = Buffer.from(
+        '{' +
+          `"body":${JSON.stringify(body)},` +
+          `"integratedTime":${JSON.stringify(integratedTime)},` +
+          `"logID":${JSON.stringify(logID)},` +
+          `"logIndex":${JSON.stringify(logIndex)}` +
+          '}',
+        'utf8',
+      );
+      const setSig = crypto.sign('sha256', setPayload, privateKey);
+      const signedEntryTimestamp = opts?.tamperSet
+        ? flipLastByteB64(setSig.toString('base64'))
+        : setSig.toString('base64');
+
+      // Single-leaf tree: rootHash = sha256(0x00 || body_bytes).
+      const leafHash = crypto
+        .createHash('sha256')
+        .update(LEAF)
+        .update(Buffer.from(body, 'base64'))
+        .digest('hex');
+
+      const receipt = {
+        uuid: '24296fb24b8ad77a000000000000000000000000000000000000000000000001',
+        logIndex,
+        inclusionProof: {
+          logIndex: 0,
+          treeSize: 1,
+          rootHash: opts?.tamperProof ? '00'.repeat(32) : leafHash,
+          hashes: [] as string[],
+        },
+        signedEntryTimestamp,
+        logId: logID,
+        integratedTime,
+        body,
+      };
+      return { receiptJson: JSON.stringify(receipt), publicKeyPem };
+    }
+
+    /** Attach a rekor receipt to the pristine fixture's single root. */
+    function bundleWithRekorReceipt(receiptJson: string): Buffer {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const root = base.roots[0]!;
+      const patched: FixtureRoot = {
+        ...root,
+        anchoredAt: '2026-05-01T01:00:00.000Z',
+        anchorReceipt: null,
+        anchorReceipts: [
+          {
+            provider: 'rekor',
+            receipt: receiptJson,
+            anchoredAt: '2026-05-01T01:00:00.000Z',
+          },
+        ],
+      };
+      const rootsNdjson = Buffer.from(JSON.stringify(patched) + '\n', 'utf8');
+      return writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+    }
+
+    it('verifies a genuine signed Rekor receipt (SET + inclusion) by default', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt();
+      const zip = bundleWithRekorReceipt(receiptJson);
+      // Default rekor path (no rekorFetcher/anchorReceiptVerifier); pin the
+      // fresh signing key as a sovereign Rekor instance would.
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(true);
+      expect(report.rekor.checked).toBe(1);
+      expect(report.rekor.failed).toBe(0);
+      expect(report.ok).toBe(true);
+    });
+
+    it('FAILS a forged non-Rekor receipt ("{}") — no false OK', async () => {
+      const zip = bundleWithRekorReceipt('{}');
+      const report = await verifyBundle(zip, {}); // pure default path
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toContain('not_a_rekor_entry');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS a tampered SET signature', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        tamperSet: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toMatch(/set_/);
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS a tampered inclusion proof (rootHash mismatch)', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        tamperProof: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toContain('inclusion_root_mismatch');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS a genuine receipt whose logID is not the pinned Sigstore key', async () => {
+      // No override → the receipt's fresh logID does not match the bundled
+      // Sigstore pin, so the verifier fails closed rather than trusting an
+      // unpinned key (never silently falls back to a default key).
+      const { receiptJson } = buildRekorReceipt();
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {});
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toContain('set_logid_unpinned');
     });
   });
 

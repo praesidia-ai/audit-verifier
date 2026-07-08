@@ -28,7 +28,7 @@ USAGE
   praesidia-verify <bundle.zip> [options]
 
 OPTIONS
-  --no-rekor   Skip the optional Sigstore Rekor receipt fetch.
+  --no-rekor   Skip the offline Sigstore Rekor receipt verification.
   --quiet      Print only the final OK/FAIL summary line.
   --help, -h   Show this help message.
 
@@ -37,8 +37,9 @@ EXIT CODES
   1   Verification failure.
   2   I/O or bundle-format error.
 
-The bundle is read entirely offline. The verifier makes NO network
-calls except an optional Rekor receipt fetch (disable with --no-rekor).
+The bundle is verified entirely offline — the verifier makes NO network
+calls. The Rekor receipt is verified against a PINNED Sigstore public key
+(SET signature + inclusion proof); pass --no-rekor to skip that step.
 `;
 
 function parseArgs(argv: string[]): CliArgs {

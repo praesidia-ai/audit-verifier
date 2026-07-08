@@ -21,9 +21,14 @@
  *  2. Row signatures            — for each row, canonical-JSON over the
  *                                 11 signable fields (mirrors AGV-030)
  *                                 verified with `publicKeys[row.keyVersion]`.
- *  3. Chain integrity           — `row.prevRowHash` matches
- *                                 `sha256(prev.canonical || prev.sigBytes)`,
- *                                 starting from the all-zero genesis.
+ *  3. Chain integrity           — each row's `prevRowHash` matches
+ *                                 `sha256(prev.canonical || prev.sigBytes)`
+ *                                 of its in-bundle predecessor. The FIRST
+ *                                 row's `prevRowHash` is an opaque anchor
+ *                                 into the org's pre-range history (bundles
+ *                                 are date-ranged, not genesis-rooted), so
+ *                                 it is accepted, not required to be the
+ *                                 all-zero genesis (BUGHUNT-SDK-02).
  *  4. Merkle root signatures    — canonical-JSON over
  *                                 `{rootHash, periodStart, periodEnd, rowCount}`
  *                                 verified with `publicKeys[root.keyVersion]`.
@@ -33,10 +38,16 @@
  *                                 with `status` markers (e.g.
  *                                 `not_yet_rooted`) are SKIPPED — they
  *                                 are not failures.
- *  6. Rekor receipt (optional)  — when not skipped, fetch the receipt by
- *                                 UUID and compare body bytes against
- *                                 `root.anchorReceipt`. Skipped when no
- *                                 receipt is present.
+ *  6. Rekor receipt (optional)  — when not skipped, REAL offline
+ *                                 verification (BUGHUNT-SDK-05): the
+ *                                 receipt's Signed Entry Timestamp (SET)
+ *                                 is verified against the pinned Sigstore
+ *                                 Rekor public key and its inclusion proof
+ *                                 is walked to `inclusionProof.rootHash`
+ *                                 (see `rekor.ts`). A receipt that is not
+ *                                 a genuine, SET-signed, log-included
+ *                                 entry fails closed. Skipped only via
+ *                                 `--no-rekor` / `noRekor`.
  */
 
 import * as crypto from 'node:crypto';
@@ -48,9 +59,9 @@ import {
   type BundleSignatureAlgorithm,
   merkleVerify,
   type MerkleProof,
-  GENESIS_PREV_ROW_HASH,
 } from './crypto.js';
 import { readZip, gunzip, type ZipEntry } from './zip.js';
+import { verifyRekorReceipt } from './rekor.js';
 import {
   PLATFORM_PUBLIC_KEY_DER_B64,
   PLATFORM_PUBLIC_KEY_FINGERPRINT,
@@ -263,11 +274,23 @@ export interface VerifyOptions {
   /** Skip the optional Rekor receipt fetch (default: false). */
   noRekor?: boolean;
   /**
-   * Hook for the Rekor fetch — primarily a test seam. Defaults to a
-   * built-in fetch against rekor.sigstore.dev. Receives the raw
-   * `anchorReceipt` string; returns `true` on success.
+   * BUGHUNT-SDK-05 — Explicit override for the `rekor` receipt check
+   * (e.g. an on-line re-fetch). When supplied it wins for `rekor`
+   * receipts; when ABSENT the verifier now runs REAL offline
+   * verification (SET signature under the pinned Sigstore key +
+   * inclusion proof — see `rekor.ts`), NOT the old `JSON.parse`-only
+   * default that returned `true` for any valid JSON. Receives the raw
+   * receipt string; returns `true` on success.
    */
   rekorFetcher?: (anchorReceipt: string) => Promise<boolean>;
+  /**
+   * BUGHUNT-SDK-05 — Override the pinned Rekor signing public key (PEM
+   * SPKI, EC P-256) used to verify the SET. Defaults to the Sigstore
+   * key bundled in `rekor.ts`. Supply this for a sovereign / private
+   * Rekor instance (or tests). Ignored when a custom `rekorFetcher` /
+   * `anchorReceiptVerifier` is provided.
+   */
+  rekorPublicKeyPem?: string;
   /**
    * AUDIT-2026-05-09 — Optional hook for verifying provider-specific
    * anchor receipts in the multi-anchor `anchorReceipts` array. The
@@ -742,23 +765,48 @@ function verifyRowSignatures(
 
 function verifyChain(rows: BundleRow[]): ComponentResult {
   let failed = 0;
+  let checked = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
   let prev: BundleRow | null = null;
   for (const row of rows) {
-    const expected = prev ? computeChainLink(prev) : GENESIS_PREV_ROW_HASH;
-    if (row.prevRowHash !== expected) {
-      failed += 1;
-      if (!firstFailure) {
-        firstFailure = row.id;
-        reason = 'prev_row_hash does not chain to previous row';
+    // BUGHUNT-SDK-02 — the FIRST bundle row's `prevRowHash` is an OPAQUE
+    // ANCHOR into the org's pre-range history, NOT necessarily the genesis
+    // hash. Bundles are date-ranged and hard-capped at 90 days
+    // (`MAX_RANGE_DAYS`), so a bundle for any org older than 90 days
+    // CANNOT begin at the org's genesis row — its first row's `prevRowHash`
+    // is `sha256(canonical(predecessor) || predecessor.sig)` for a
+    // predecessor whose `signedAt < from` and is therefore absent from the
+    // bundle. Requiring the first row to chain to `GENESIS_PREV_ROW_HASH`
+    // falsely FAILED essentially every real ranged export.
+    //
+    // We now enforce internal linkage ONLY for rows [1..] — reorder,
+    // insert, or mutation of any non-leading row still breaks a link.
+    // Tamper resistance for the range is preserved elsewhere:
+    //   - Leading truncation (dropping the first K rows) is caught by
+    //     `completeness` (rowsSeen < signed manifest.rowCount).
+    //   - A forged first row needs a valid row signature, which binds
+    //     `prevRowHash` into the signed preimage (AUDIT-SDK-01), so the
+    //     anchor cannot be swapped freely.
+    if (prev) {
+      const expected = computeChainLink(prev);
+      checked += 1;
+      if (row.prevRowHash !== expected) {
+        failed += 1;
+        if (!firstFailure) {
+          firstFailure = row.id;
+          reason = 'prev_row_hash does not chain to previous row';
+        }
       }
     }
     prev = row;
   }
   return {
     ok: failed === 0,
-    checked: rows.length,
+    // `checked` counts the inter-row link assertions actually made
+    // (rows.length - 1, or 0 for an empty/single-row bundle); the first
+    // row's anchor is accepted, not asserted.
+    checked,
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
@@ -934,7 +982,6 @@ async function verifyRekorReceipts(
       reason: 'skipped via --no-rekor',
     };
   }
-  const rekorFetcher = options.rekorFetcher ?? defaultRekorFetcher;
   let checked = 0;
   let failed = 0;
   let firstFailure: string | undefined;
@@ -946,7 +993,7 @@ async function verifyRekorReceipts(
       checked += 1;
       let result: { ok: boolean; reason?: string };
       try {
-        result = await verifyAnchorReceipt(entry, options, rekorFetcher);
+        result = await verifyAnchorReceipt(entry, options);
       } catch (err) {
         result = {
           ok: false,
@@ -1016,7 +1063,6 @@ function collectAnchorEntries(
 async function verifyAnchorReceipt(
   entry: { provider: string; receipt: string; anchoredAt: string },
   options: VerifyOptions,
-  rekorFetcher: (anchorReceipt: string) => Promise<boolean>,
 ): Promise<{ ok: boolean; reason?: string }> {
   if (typeof entry.receipt !== 'string' || entry.receipt.length === 0) {
     return { ok: false, reason: 'empty_receipt' };
@@ -1025,8 +1071,15 @@ async function verifyAnchorReceipt(
     return options.anchorReceiptVerifier(entry);
   }
   if (entry.provider === 'rekor') {
-    const ok = await rekorFetcher(entry.receipt);
-    return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
+    // BUGHUNT-SDK-05 — a caller-supplied `rekorFetcher` is still honoured
+    // as an explicit seam (e.g. an on-line re-fetch); the DEFAULT is now
+    // real offline cryptographic verification (SET + inclusion proof),
+    // not the old `JSON.parse`-and-return-true false assurance.
+    if (options.rekorFetcher) {
+      const ok = await options.rekorFetcher(entry.receipt);
+      return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
+    }
+    return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem);
   }
   if (entry.provider === 's3') {
     return verifyS3ReceiptShape(entry.receipt);
@@ -1064,29 +1117,6 @@ function verifyS3ReceiptShape(receipt: string): {
     return { ok: false, reason: 'malformed' };
   }
   return { ok: true };
-}
-
-/**
- * Default Rekor fetcher. Uses Node's built-in `fetch` (Node ≥18).
- *
- * The `anchorReceipt` blob is opaque to the verifier — different
- * anchor backends serialize it differently (AGV-036 stores the
- * Rekor log entry JSON). We treat any non-empty receipt as a
- * successful pass when we cannot meaningfully re-fetch (no UUID
- * embedded). Callers wanting strict checks should supply a custom
- * `rekorFetcher`.
- */
-async function defaultRekorFetcher(anchorReceipt: string): Promise<boolean> {
-  // Minimal default: confirm the receipt parses as JSON. Strict re-fetch
-  // requires the Rekor entry UUID which is backend-specific; the
-  // CLI's `--no-rekor` flag exists precisely so an air-gapped auditor
-  // can skip this step entirely.
-  try {
-    JSON.parse(anchorReceipt);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ════════════════════════════════════════════════════════════════════════
