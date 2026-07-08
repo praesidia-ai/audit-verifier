@@ -697,8 +697,33 @@ function verifyRowSignatures(
       continue;
     }
     const signable = signableRow(row);
-    const bytes = canonicalJson(signable);
-    if (!verifySignature(rowAlgorithm, bytes, row.signature, entry.publicKey)) {
+    const canonical = canonicalJson(signable);
+    // AUDIT-SDK-01 — the backend signs each row over
+    //   message = canonical(row) || prev_row_hash_bytes
+    // (write path `audit-writer.service.ts` persistSignedLog; the online
+    // verify path `audit-query.service.ts` reconstructs the same message).
+    // The offline verifier MUST bind `prev_row_hash` into the preimage or
+    // EVERY genuine production row fails signature verification. Guard an
+    // absent/malformed `prev_row_hash` as a signature failure, mirroring
+    // the online verifier.
+    let prevRowHashBytes: Buffer;
+    try {
+      if (typeof row.prevRowHash !== 'string') {
+        throw new Error('prev_row_hash missing');
+      }
+      prevRowHashBytes = Buffer.from(row.prevRowHash, 'base64');
+    } catch {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = row.id;
+        reason = 'row prev_row_hash missing or malformed';
+      }
+      continue;
+    }
+    const message = Buffer.concat([canonical, prevRowHashBytes]);
+    if (
+      !verifySignature(rowAlgorithm, message, row.signature, entry.publicKey)
+    ) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;

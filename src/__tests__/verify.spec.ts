@@ -191,9 +191,10 @@ function buildFixtureBundle(): FixtureBundle {
     };
     const signable = signableRow(partial);
     const canonical = canonicalJson(signable);
-    const signatureBase64 = signEd25519(canonical, privateKey);
 
     // prev_row_hash chains from the previous row's (canonical || sig).
+    // AUDIT-SDK-01 — compute it BEFORE signing so the row signature can
+    // bind it (the backend writer signs `canonical || prev_row_hash`).
     let prevRowHash: string;
     if (i === 0) {
       prevRowHash = GENESIS_PREV_ROW_HASH;
@@ -204,6 +205,16 @@ function buildFixtureBundle(): FixtureBundle {
         Buffer.concat([prev.canonical, prevSigBytes]),
       ).toString('base64');
     }
+
+    // AUDIT-SDK-01 — sign `canonical || prev_row_hash_bytes`, byte-for-byte
+    // as `audit-writer.service.ts` persistSignedLog does. The prior fixture
+    // signed canonical-ONLY, which mirrored the verifier defect and hid it.
+    const rowMessage = Buffer.concat([
+      canonical,
+      Buffer.from(prevRowHash, 'base64'),
+    ]);
+    const signatureBase64 = signEd25519(rowMessage, privateKey);
+
     rows.push({
       id: `row-${i}`,
       ...partial,
@@ -505,6 +516,89 @@ describe('verifyBundle', () => {
    * bundle returned `ok: true`. The `completeness` component must now
    * catch the count mismatch and fail the bundle (CLI exit 1).
    */
+  describe('AUDIT-SDK-01 — row signature binds prev_row_hash', () => {
+    // The backend signs each row over `canonical(row) || prev_row_hash_bytes`
+    // (audit-writer.service.ts persistSignedLog). The pristine fixture now
+    // mirrors that preimage byte-for-byte; these tests pin the binding and
+    // prove a canonical-ONLY signature (the historical verifier defect AND
+    // the old self-consistent fixture bug) now FAILS.
+    const SEED = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+
+    it('verifies rows signed over canonical || prev_row_hash (backend-writer preimage)', async () => {
+      const { zip } = buildFixtureBundle();
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.rowSignatures.checked).toBe(4);
+      expect(report.rowSignatures.failed).toBe(0);
+      expect(report.ok).toBe(true);
+    });
+
+    it('FAILS a row signed over canonical-ONLY (the omitted prev_row_hash regression)', async () => {
+      const { privateKey } = keypairFromSeed(SEED);
+      const entries = readBundleEntries(buildFixtureBundle().zip);
+
+      // Re-sign row-0 the OLD (buggy) way — over canonical bytes only, with
+      // NO prev_row_hash bound. A verifier that omitted prev_row_hash would
+      // (wrongly) accept this; the fixed verifier must reject it.
+      const rows = zlib
+        .gunzipSync(entries.get('rows.ndjson.gz')!)
+        .toString('utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const canonicalOnly = canonicalJson(
+        signableRow(rows[0] as unknown as Parameters<typeof signableRow>[0]),
+      );
+      rows[0]!.signature = signEd25519(canonicalOnly, privateKey);
+
+      const tamperedRows = Buffer.from(
+        rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(tamperedRows) },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.firstFailure).toBe('row-0');
+      expect(report.rowSignatures.reason).toBe('row signature does not verify');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS closed when a row prev_row_hash is missing (cannot reconstruct preimage)', async () => {
+      const entries = readBundleEntries(buildFixtureBundle().zip);
+      const rows = zlib
+        .gunzipSync(entries.get('rows.ndjson.gz')!)
+        .toString('utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      delete rows[0]!.prevRowHash;
+
+      const tamperedRows = Buffer.from(
+        rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(tamperedRows) },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.rowSignatures.firstFailure).toBe('row-0');
+      expect(report.rowSignatures.reason).toMatch(/prev_row_hash/);
+    });
+  });
+
   describe('BUG-AUDIT-01 — completeness / truncation', () => {
     /**
      * Re-pack the pristine fixture keeping the ORIGINAL signed manifest
@@ -1017,7 +1111,14 @@ describe('verifyBundle', () => {
       };
       const signable = signableRow(partial);
       const canonical = canonicalJson(signable);
-      const rowSig = signLowSP256(canonical, privateKey);
+      // AUDIT-SDK-01 — single row → prev_row_hash is genesis; sign
+      // `canonical || prev_row_hash_bytes` exactly as the backend writer.
+      const prevRowHash = GENESIS_PREV_ROW_HASH;
+      const rowMessage = Buffer.concat([
+        canonical,
+        Buffer.from(prevRowHash, 'base64'),
+      ]);
+      const rowSig = signLowSP256(rowMessage, privateKey);
       const rowSignatureB64 = rowSig.toString('base64');
 
       const row: FixtureRow & { signatureAlgorithm: string } = {
@@ -1026,7 +1127,7 @@ describe('verifyBundle', () => {
         signature: rowSignatureB64,
         keyVersion,
         signedAt: isoSecond(baseTs, 1),
-        prevRowHash: GENESIS_PREV_ROW_HASH,
+        prevRowHash,
         signatureAlgorithm: 'ECDSA_P256_SHA256',
       };
 

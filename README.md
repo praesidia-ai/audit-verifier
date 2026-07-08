@@ -43,7 +43,11 @@ checks every cryptographic invariant the bundle commits to:
    the manifest fields, signed with the tenant's currently-active key.
 2. **Row signatures** — every row in `rows.ndjson.gz` is re-canonicalized
    from its signable fields and verified against the public key at
-   `row.keyVersion` from `public-keys.json`.
+   `row.keyVersion` from `public-keys.json`. The signed preimage is
+   `canonical_bytes || base64-decode(prev_row_hash)` — the row signature
+   binds the row's chain position, byte-for-byte as the backend writer
+   produces it. A row whose `prev_row_hash` is missing/malformed fails
+   closed.
 3. **Chain integrity** — `prev_row_hash` is recomputed from the previous
    row's `(canonical_bytes || signature_bytes)` digest and matched
    against the stored value. The first row chains to the all-zero
