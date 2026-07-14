@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege: this workflow only reads the repo and builds/tests it.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build + Test (tsc + vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install (reproducible)
+        run: npm ci
+
+      - name: Build (tsc)
+        run: npm run build
+
+      - name: Test (vitest)
+        run: npx vitest run
+
+      - name: praesidia-verify --help smoke
+        run: node dist/cli.js --help

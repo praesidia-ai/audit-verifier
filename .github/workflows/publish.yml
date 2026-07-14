@@ -1,0 +1,38 @@
+name: Publish
+
+# Tag/dispatch-gated npm publish. PUBLISHING IS INTENTIONALLY DISABLED.
+# The job is guarded by `if: false` so nothing is ever published until a human
+# flips it on. To enable: remove the `if: false` guard and add an NPM_TOKEN
+# repository secret. (publishConfig.access is already "public".)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: false # DISABLED — remove to enable npm publish
+    name: npm publish (@praesidia/audit-verifier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: npx vitest run
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

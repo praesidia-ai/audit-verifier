@@ -45,6 +45,10 @@
     "merkle",
     "offline"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/praesidia-ai/audit-verifier"
+  },
   "publishConfig": {
     "access": "public"
   }

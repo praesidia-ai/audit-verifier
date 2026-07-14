@@ -1,0 +1,24 @@
+# build output
+/dist
+
+# dependencies
+/node_modules
+
+# NOTE: package-lock.json IS committed in this standalone repo (reproducible
+# installs for CI + Docker `npm ci`). Do not add it here.
+
+# test / coverage
+/coverage
+/.nyc_output
+
+# logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# env
+.env
+.env.local
+.env.*.local
