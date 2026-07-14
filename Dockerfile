@@ -6,7 +6,8 @@
 #
 # Base: node:24-alpine (Active LTS), npm 11 (bundled). Runs as a non-root user.
 
-FROM node:24-alpine AS build
+FROM node:24.18-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS build
+# node:24.18-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -16,7 +17,8 @@ COPY README.md LICENSE ./
 RUN npm run build && npx vitest run
 
 # ---- runtime: minimal, non-root, zero runtime deps ----
-FROM node:24-alpine AS runtime
+FROM node:24.18-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS runtime
+# node:24.18-alpine
 ENV NODE_ENV=production
 WORKDIR /app
 RUN addgroup -S praesidia && adduser -S praesidia -G praesidia
