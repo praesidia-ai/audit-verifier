@@ -18,6 +18,7 @@
  */
 
 import * as zlib from 'node:zlib';
+import { TextDecoder } from 'node:util';
 
 // ── ZIP local file header signature       'PK\x03\x04'  (little-endian) ─
 const LFH_SIG = 0x04034b50;
@@ -51,6 +52,18 @@ export class ZipReadError extends Error {
   }
 }
 
+export interface ZipReadLimits {
+  maxEntries?: number;
+  maxEntryUncompressedBytes?: number;
+  maxTotalUncompressedBytes?: number;
+}
+
+const DEFAULT_MAX_ENTRIES = 64;
+const DEFAULT_MAX_ENTRY_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_GUNZIP_BYTES = 1024 * 1024 * 1024;
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+
 /**
  * Parse a PKZIP archive in-memory. Supports the subset produced by
  * `ZipStreamWriter`: STORED method (and DEFLATE for cross-tool
@@ -61,7 +74,25 @@ export class ZipReadError extends Error {
  * @returns       Ordered list of entries as they appeared in the
  *                central directory.
  */
-export function readZip(buffer: Buffer): ZipEntry[] {
+export function readZip(
+  buffer: Buffer,
+  limits: ZipReadLimits = {},
+): ZipEntry[] {
+  const maxEntries = limits.maxEntries ?? DEFAULT_MAX_ENTRIES;
+  const maxEntryBytes =
+    limits.maxEntryUncompressedBytes ?? DEFAULT_MAX_ENTRY_UNCOMPRESSED_BYTES;
+  const maxTotalBytes =
+    limits.maxTotalUncompressedBytes ?? DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES;
+  if (
+    !Number.isSafeInteger(maxEntries) ||
+    maxEntries <= 0 ||
+    !Number.isSafeInteger(maxEntryBytes) ||
+    maxEntryBytes <= 0 ||
+    !Number.isSafeInteger(maxTotalBytes) ||
+    maxTotalBytes <= 0
+  ) {
+    throw new ZipReadError('invalid zip resource limits');
+  }
   if (buffer.length < 22) {
     throw new ZipReadError('zip too small to contain an EOCD record');
   }
@@ -73,6 +104,14 @@ export function readZip(buffer: Buffer): ZipEntry[] {
   let totalEntries = buffer.readUInt16LE(eocdOffset + 10);
   let cdSize = buffer.readUInt32LE(eocdOffset + 12);
   let cdOffset = buffer.readUInt32LE(eocdOffset + 16);
+  let centralDirectoryEndLimit = eocdOffset;
+  if (
+    buffer.readUInt16LE(eocdOffset + 4) !== 0 ||
+    buffer.readUInt16LE(eocdOffset + 6) !== 0 ||
+    buffer.readUInt16LE(eocdOffset + 8) !== totalEntries
+  ) {
+    throw new ZipReadError('multi-disk zip archives are not supported');
+  }
 
   // AUDIT-2026-05-15: if ANY classic EOCD field is a sentinel, look
   // for a ZIP64 EOCD locator immediately before the classic EOCD.
@@ -94,7 +133,10 @@ export function readZip(buffer: Buffer): ZipEntry[] {
         'classic EOCD has ZIP64 sentinel(s) but ZIP64 EOCD locator not found',
       );
     }
-    const zip64EocdOffset = Number(buffer.readBigUInt64LE(locatorOffset + 8));
+    const zip64EocdOffset = safeZip64Number(
+      buffer.readBigUInt64LE(locatorOffset + 8),
+      'EOCD offset',
+    );
     if (
       zip64EocdOffset < 0 ||
       zip64EocdOffset + 56 > buffer.length ||
@@ -104,19 +146,50 @@ export function readZip(buffer: Buffer): ZipEntry[] {
         'ZIP64 EOCD locator points to invalid ZIP64 EOCD record',
       );
     }
+    if (
+      buffer.readUInt32LE(zip64EocdOffset + 16) !== 0 ||
+      buffer.readUInt32LE(zip64EocdOffset + 20) !== 0 ||
+      buffer.readBigUInt64LE(zip64EocdOffset + 24) !==
+        buffer.readBigUInt64LE(zip64EocdOffset + 32) ||
+      buffer.readUInt32LE(locatorOffset + 4) !== 0 ||
+      buffer.readUInt32LE(locatorOffset + 16) !== 1
+    ) {
+      throw new ZipReadError('multi-disk ZIP64 archives are not supported');
+    }
+    centralDirectoryEndLimit = zip64EocdOffset;
     // We accept ANY zip64 EOCD record size >= 44 bytes (the minimum
     // record body) — readers MUST tolerate extensible-data appended
     // after the documented fields (APPNOTE 4.3.14.3).
-    totalEntries = Number(buffer.readBigUInt64LE(zip64EocdOffset + 32));
-    cdSize = Number(buffer.readBigUInt64LE(zip64EocdOffset + 40));
-    cdOffset = Number(buffer.readBigUInt64LE(zip64EocdOffset + 48));
+    totalEntries = safeZip64Number(
+      buffer.readBigUInt64LE(zip64EocdOffset + 32),
+      'entry count',
+    );
+    cdSize = safeZip64Number(
+      buffer.readBigUInt64LE(zip64EocdOffset + 40),
+      'central-directory size',
+    );
+    cdOffset = safeZip64Number(
+      buffer.readBigUInt64LE(zip64EocdOffset + 48),
+      'central-directory offset',
+    );
   }
 
-  if (cdOffset + cdSize > buffer.length) {
+  if (totalEntries > maxEntries) {
+    throw new ZipReadError(
+      `zip entry count ${totalEntries} exceeds limit ${maxEntries}`,
+    );
+  }
+
+  if (
+    cdOffset > centralDirectoryEndLimit ||
+    cdSize > centralDirectoryEndLimit - cdOffset
+  ) {
     throw new ZipReadError('central directory extends past file end');
   }
 
   const entries: ZipEntry[] = [];
+  const names = new Set<string>();
+  let totalUncompressed = 0;
   let p = cdOffset;
   for (let i = 0; i < totalEntries; i++) {
     if (p + 46 > buffer.length) {
@@ -125,7 +198,12 @@ export function readZip(buffer: Buffer): ZipEntry[] {
     if (buffer.readUInt32LE(p) !== CDH_SIG) {
       throw new ZipReadError('bad central directory signature');
     }
+    const flags = buffer.readUInt16LE(p + 8);
+    if ((flags & 0x0001) !== 0) {
+      throw new ZipReadError('encrypted zip entries are not supported');
+    }
     const method = buffer.readUInt16LE(p + 10);
+    const expectedCrc = buffer.readUInt32LE(p + 16);
     if (method !== 0 && method !== 8) {
       // We accept STORED (the format ZipStreamWriter produces) and
       // also DEFLATE in case a future archiver re-compresses our
@@ -142,7 +220,23 @@ export function readZip(buffer: Buffer): ZipEntry[] {
     const extraLen = buffer.readUInt16LE(p + 30);
     const commentLen = buffer.readUInt16LE(p + 32);
     let localHeaderOffset = buffer.readUInt32LE(p + 42);
-    const name = buffer.toString('utf8', p + 46, p + 46 + nameLen);
+    const cdhEnd = p + 46 + nameLen + extraLen + commentLen;
+    if (cdhEnd > cdOffset + cdSize || cdhEnd > buffer.length) {
+      throw new ZipReadError('central directory entry extends past its bounds');
+    }
+    let name: string;
+    try {
+      name = UTF8_DECODER.decode(buffer.subarray(p + 46, p + 46 + nameLen));
+    } catch {
+      throw new ZipReadError('zip entry name is not valid UTF-8');
+    }
+    if (name.length === 0 || name.includes('\0')) {
+      throw new ZipReadError('zip entry has an invalid empty/NUL name');
+    }
+    if (names.has(name)) {
+      throw new ZipReadError(`duplicate zip entry name: ${name}`);
+    }
+    names.add(name);
 
     // AUDIT-2026-05-15: walk the central-dir extra-fields region for
     // a ZIP64 extra (header ID 0x0001) — promote each 32-bit sentinel
@@ -162,7 +256,10 @@ export function readZip(buffer: Buffer): ZipEntry[] {
             `ZIP64 extra for ${name} truncated reading uncompressedSize`,
           );
         }
-        uncompressedSize = Number(buffer.readBigUInt64LE(zp));
+        uncompressedSize = safeZip64Number(
+          buffer.readBigUInt64LE(zp),
+          `uncompressed size for ${name}`,
+        );
         zp += 8;
       }
       if (compressedSize === ZIP64_U32_LIMIT) {
@@ -171,7 +268,10 @@ export function readZip(buffer: Buffer): ZipEntry[] {
             `ZIP64 extra for ${name} truncated reading compressedSize`,
           );
         }
-        compressedSize = Number(buffer.readBigUInt64LE(zp));
+        compressedSize = safeZip64Number(
+          buffer.readBigUInt64LE(zp),
+          `compressed size for ${name}`,
+        );
         zp += 8;
       }
       if (localHeaderOffset === ZIP64_U32_LIMIT) {
@@ -180,24 +280,61 @@ export function readZip(buffer: Buffer): ZipEntry[] {
             `ZIP64 extra for ${name} truncated reading localHeaderOffset`,
           );
         }
-        localHeaderOffset = Number(buffer.readBigUInt64LE(zp));
+        localHeaderOffset = safeZip64Number(
+          buffer.readBigUInt64LE(zp),
+          `local-header offset for ${name}`,
+        );
         zp += 8;
       }
     }
 
-    p += 46 + nameLen + extraLen + commentLen;
+    p = cdhEnd;
+
+    if (uncompressedSize > maxEntryBytes) {
+      throw new ZipReadError(
+        `entry ${name} uncompressed size ${uncompressedSize} exceeds limit ${maxEntryBytes}`,
+      );
+    }
+    if (totalUncompressed > maxTotalBytes - uncompressedSize) {
+      throw new ZipReadError('zip total uncompressed size exceeds limit');
+    }
+    totalUncompressed += uncompressedSize;
 
     // Walk into the local file header to find the data offset.
-    if (localHeaderOffset + 30 > buffer.length) {
+    if (localHeaderOffset >= cdOffset || localHeaderOffset + 30 > cdOffset) {
       throw new ZipReadError(`local header for ${name} past file end`);
     }
     if (buffer.readUInt32LE(localHeaderOffset) !== LFH_SIG) {
       throw new ZipReadError(`bad local file header signature for ${name}`);
     }
+    const localFlags = buffer.readUInt16LE(localHeaderOffset + 6);
+    const localMethod = buffer.readUInt16LE(localHeaderOffset + 8);
+    if (localFlags !== flags || localMethod !== method) {
+      throw new ZipReadError(`local/central header mismatch for ${name}`);
+    }
     const lfhNameLen = buffer.readUInt16LE(localHeaderOffset + 26);
     const lfhExtraLen = buffer.readUInt16LE(localHeaderOffset + 28);
+    if (
+      localHeaderOffset + 30 + lfhNameLen + lfhExtraLen > buffer.length
+    ) {
+      throw new ZipReadError(`local header for ${name} is truncated`);
+    }
+    let localName: string;
+    try {
+      localName = UTF8_DECODER.decode(
+        buffer.subarray(
+          localHeaderOffset + 30,
+          localHeaderOffset + 30 + lfhNameLen,
+        ),
+      );
+    } catch {
+      throw new ZipReadError(`local header name for ${name} is not valid UTF-8`);
+    }
+    if (localName !== name) {
+      throw new ZipReadError(`local/central filename mismatch for ${name}`);
+    }
     const dataStart = localHeaderOffset + 30 + lfhNameLen + lfhExtraLen;
-    if (dataStart + compressedSize > buffer.length) {
+    if (dataStart > cdOffset || compressedSize > cdOffset - dataStart) {
       throw new ZipReadError(`data for ${name} past file end`);
     }
     const rawData = buffer.subarray(dataStart, dataStart + compressedSize);
@@ -211,16 +348,39 @@ export function readZip(buffer: Buffer): ZipEntry[] {
       }
     } else {
       // method 8 — DEFLATE
-      data = zlib.inflateRawSync(rawData);
+      try {
+        data = zlib.inflateRawSync(rawData, {
+          maxOutputLength: uncompressedSize,
+        });
+      } catch (err) {
+        throw new ZipReadError(
+          `DEFLATE entry ${name} cannot be decompressed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
       if (data.length !== uncompressedSize) {
         throw new ZipReadError(
           `DEFLATE entry ${name} size mismatch: ${data.length} vs ${uncompressedSize}`,
         );
       }
     }
+    if (computeCrc32(data) !== expectedCrc) {
+      throw new ZipReadError(`CRC-32 mismatch for ${name}`);
+    }
     entries.push({ name, data });
   }
+  if (p !== cdOffset + cdSize) {
+    throw new ZipReadError('central directory size/count mismatch');
+  }
   return entries;
+}
+
+function safeZip64Number(value: bigint, field: string): number {
+  if (value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ZipReadError(`ZIP64 ${field} exceeds safe integer range`);
+  }
+  return Number(value);
 }
 
 /**
@@ -231,7 +391,10 @@ export function readZip(buffer: Buffer): ZipEntry[] {
 function findEocd(buffer: Buffer): number {
   const minStart = Math.max(0, buffer.length - 0xffff - 22);
   for (let i = buffer.length - 22; i >= minStart; i--) {
-    if (buffer.readUInt32LE(i) === EOCD_SIG) {
+    if (
+      buffer.readUInt32LE(i) === EOCD_SIG &&
+      i + 22 + buffer.readUInt16LE(i + 20) === buffer.length
+    ) {
       return i;
     }
   }
@@ -257,15 +420,15 @@ function findZip64Extra(
     const id = buffer.readUInt16LE(p);
     const size = buffer.readUInt16LE(p + 2);
     if (p + 4 + size > end) {
-      // Truncated extra field — treat as absent rather than throwing,
-      // matching reference-reader tolerance for slightly malformed
-      // archives written by older tools.
-      return null;
+      throw new ZipReadError('truncated zip extra field');
     }
     if (id === ZIP64_EXTRA_ID) {
       return { dataStart: p + 4, dataSize: size };
     }
     p += 4 + size;
+  }
+  if (p !== end) {
+    throw new ZipReadError('truncated zip extra field header');
   }
   return null;
 }
@@ -499,6 +662,20 @@ export function gzipDeterministic(data: Buffer): Buffer {
 }
 
 /** Gunzip a buffer (verifier reads `*.gz` entries). */
-export function gunzip(data: Buffer): Buffer {
-  return zlib.gunzipSync(data);
+export function gunzip(
+  data: Buffer,
+  maxOutputLength = DEFAULT_MAX_GUNZIP_BYTES,
+): Buffer {
+  if (!Number.isSafeInteger(maxOutputLength) || maxOutputLength <= 0) {
+    throw new ZipReadError('invalid gzip output limit');
+  }
+  try {
+    return zlib.gunzipSync(data, { maxOutputLength });
+  } catch (err) {
+    throw new ZipReadError(
+      `gzip entry cannot be decompressed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 }

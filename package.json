@@ -22,7 +22,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc",
@@ -32,9 +32,9 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "@types/node": "^20.0.0"
+    "typescript": "5.9.3",
+    "vitest": "2.1.9",
+    "@types/node": "20.19.43"
   },
   "keywords": [
     "praesidia",

@@ -28,6 +28,7 @@ import {
   isLowSP256,
   verifyEcdsaP256,
   verifySignature,
+  decodeBase64Strict,
 } from '../crypto.js';
 
 // P-256 group order — same constant the verifier enforces.
@@ -193,6 +194,24 @@ describe('audit-verifier ECDSA-P256 low-s gate (AUDIT-2026-05/21)', () => {
         spki,
       ),
     ).toBe(false);
+  });
+
+  it('rejects non-canonical base64 instead of ignoring junk', () => {
+    const canonical = Buffer.from('strict byte').toString('base64');
+    expect(decodeBase64Strict(canonical)?.toString()).toBe('strict byte');
+    expect(decodeBase64Strict(`${canonical}!!`)).toBeNull();
+    expect(decodeBase64Strict(canonical.replace(/=$/, ''))).toBeNull();
+  });
+
+  it('rejects non-canonical DER encodings and trailing bytes', () => {
+    const canonical = Buffer.from('3006020101020101', 'hex');
+    expect(extractEcdsaSFromSignature(canonical)).toBe(1n);
+    expect(
+      extractEcdsaSFromSignature(Buffer.concat([canonical, Buffer.from([0])])),
+    ).toBeNull();
+    expect(
+      extractEcdsaSFromSignature(Buffer.from('300702020001020101', 'hex')),
+    ).toBeNull();
   });
 
   it('isLowSP256 honors the s == n/2 boundary', () => {

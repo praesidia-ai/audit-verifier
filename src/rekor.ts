@@ -21,13 +21,9 @@
  * hostile intermediary cannot swap it; sovereign/private Rekor instances
  * (or tests) supply their own key via `VerifyOptions.rekorPublicKeyPem`.
  *
- * NOTE — like be-core's on-line anchor path, this verifies the receipt is
- * a genuine, SET-signed, log-included Rekor entry. Binding the entry
- * BODY to this specific bundle's `root.rootHash` (so a genuine-but-
- * unrelated receipt can't be reattached) is a deeper, format-specific
- * (hashedrekord) check tracked as a coordinated follow-up; the tenant row
- * / Merkle-root / platform-attestation signatures already bind the audit
- * CONTENT to the tenant key.
+ *   3. Decode the hashedrekord body and bind its digest and signature to
+ *      the exact Merkle root being verified. A genuine unrelated Rekor
+ *      receipt therefore cannot be reattached to another bundle root.
  */
 
 import * as crypto from 'node:crypto';
@@ -111,6 +107,23 @@ interface NormalizedEntry {
 
 export type RekorVerifyResult = { ok: boolean; reason?: string };
 
+export interface ExpectedRekorRoot {
+  rootHashB64: string;
+  signatureB64: string;
+}
+
+function decodeCanonicalBase64(value: string): Buffer | null {
+  if (
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value,
+    )
+  ) return null;
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.toString('base64') === value ? decoded : null;
+}
+
 // ── Canonical SET payload (matches be-core buildRekorSetPayload) ──────────
 
 function buildRekorSetPayload(entry: {
@@ -154,7 +167,8 @@ function verifySet(
     logID: entry.logID,
     logIndex: entry.logIndex,
   });
-  const sigBytes = Buffer.from(entry.signedEntryTimestamp, 'base64');
+  const sigBytes = decodeCanonicalBase64(entry.signedEntryTimestamp);
+  if (sigBytes === null) return { ok: false, reason: 'set_signature_malformed' };
   let ok: boolean;
   try {
     ok = crypto.verify('sha256', payload, pubKey, sigBytes);
@@ -185,8 +199,8 @@ function verifyInclusion(
   body: string,
 ): RekorVerifyResult {
   if (
-    typeof proof.logIndex !== 'number' ||
-    typeof proof.treeSize !== 'number' ||
+    !Number.isSafeInteger(proof.logIndex) ||
+    !Number.isSafeInteger(proof.treeSize) ||
     typeof proof.rootHash !== 'string' ||
     !Array.isArray(proof.hashes)
   ) {
@@ -195,21 +209,17 @@ function verifyInclusion(
   if (proof.logIndex < 0 || proof.logIndex >= proof.treeSize) {
     return { ok: false, reason: 'inclusion_index_out_of_range' };
   }
-  if (!/^[0-9a-f]+$/i.test(proof.rootHash)) {
+  if (!/^[0-9a-f]{64}$/i.test(proof.rootHash)) {
     return { ok: false, reason: 'inclusion_malformed' };
   }
   for (const h of proof.hashes) {
-    if (typeof h !== 'string' || !/^[0-9a-f]+$/i.test(h)) {
+    if (typeof h !== 'string' || !/^[0-9a-f]{64}$/i.test(h)) {
       return { ok: false, reason: 'inclusion_malformed' };
     }
   }
 
-  let bodyBytes: Buffer;
-  try {
-    bodyBytes = Buffer.from(body, 'base64');
-  } catch {
-    return { ok: false, reason: 'inclusion_malformed' };
-  }
+  const bodyBytes = decodeCanonicalBase64(body);
+  if (bodyBytes === null) return { ok: false, reason: 'inclusion_malformed' };
   let computed = sha256(LEAF_PREFIX, bodyBytes);
 
   // Canonical RFC 6962 audit-path walk carrying (index, size); the
@@ -286,8 +296,11 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
   if (
     typeof obj.body !== 'string' ||
     typeof obj.integratedTime !== 'number' ||
+    !Number.isSafeInteger(obj.integratedTime) ||
     typeof logID !== 'string' ||
+    !/^[0-9a-f]{64}$/i.test(logID) ||
     typeof obj.logIndex !== 'number' ||
+    !Number.isSafeInteger(obj.logIndex) ||
     typeof signedEntryTimestamp !== 'string' ||
     signedEntryTimestamp.length === 0 ||
     inclusionProofRaw == null ||
@@ -298,9 +311,16 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
   const p = inclusionProofRaw as Record<string, unknown>;
   if (
     typeof p.logIndex !== 'number' ||
+    !Number.isSafeInteger(p.logIndex) ||
     typeof p.treeSize !== 'number' ||
+    !Number.isSafeInteger(p.treeSize) ||
     typeof p.rootHash !== 'string' ||
-    !Array.isArray(p.hashes)
+    !Array.isArray(p.hashes) ||
+    !p.hashes.every((hash) => typeof hash === 'string') ||
+    obj.integratedTime < 0 ||
+    obj.logIndex < 0 ||
+    p.treeSize < 1 ||
+    p.logIndex !== obj.logIndex
   ) {
     return null;
   }
@@ -314,9 +334,52 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
       logIndex: p.logIndex,
       treeSize: p.treeSize,
       rootHash: p.rootHash,
-      hashes: p.hashes.filter((h): h is string => typeof h === 'string'),
+      hashes: p.hashes as string[],
     },
   };
+}
+
+function verifyBodyBinding(
+  bodyB64: string,
+  expected: ExpectedRekorRoot,
+): RekorVerifyResult {
+  const bodyBytes = decodeCanonicalBase64(bodyB64);
+  const rootHash = decodeCanonicalBase64(expected.rootHashB64);
+  if (bodyBytes === null) return { ok: false, reason: 'body_unparseable' };
+  if (rootHash === null || rootHash.length !== 32) {
+    return { ok: false, reason: 'expected_root_malformed' };
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(bodyBytes.toString('utf8'));
+  } catch {
+    return { ok: false, reason: 'body_unparseable' };
+  }
+  if (decoded === null || typeof decoded !== 'object') {
+    return { ok: false, reason: 'body_unparseable' };
+  }
+  const obj = decoded as Record<string, unknown>;
+  if (obj.kind !== 'hashedrekord') {
+    return { ok: false, reason: 'body_not_hashedrekord' };
+  }
+  const spec = obj.spec as Record<string, unknown> | undefined;
+  const data = spec?.data as Record<string, unknown> | undefined;
+  const hash = data?.hash as Record<string, unknown> | undefined;
+  const signature = spec?.signature as Record<string, unknown> | undefined;
+  if (
+    hash?.algorithm !== 'sha256' ||
+    typeof hash.value !== 'string' ||
+    typeof signature?.content !== 'string'
+  ) {
+    return { ok: false, reason: 'body_binding_malformed' };
+  }
+  if (
+    hash.value.toLowerCase() !== rootHash.toString('hex') ||
+    signature.content !== expected.signatureB64
+  ) {
+    return { ok: false, reason: 'body_root_mismatch' };
+  }
+  return { ok: true };
 }
 
 // ── Public entry point ─────────────────────────────────────────────────────
@@ -336,6 +399,7 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
 export function verifyRekorReceipt(
   receiptJson: string,
   overridePem?: string,
+  expectedRoot?: ExpectedRekorRoot,
 ): RekorVerifyResult {
   let parsed: unknown;
   try {
@@ -358,12 +422,31 @@ export function verifyRekorReceipt(
   if (!pem) {
     return { ok: false, reason: 'set_logid_unpinned' };
   }
+  let pinnedLogId: string;
+  try {
+    pinnedLogId = computeRekorLogIdHex(pem);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `set_pubkey_load_failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+  if (entry.logID.toLowerCase() !== pinnedLogId.toLowerCase()) {
+    return { ok: false, reason: 'set_logid_key_mismatch' };
+  }
 
   const setResult = verifySet(entry, pem);
   if (!setResult.ok) return setResult;
 
   const inclusionResult = verifyInclusion(entry.inclusionProof, entry.body);
   if (!inclusionResult.ok) return inclusionResult;
+
+  if (expectedRoot) {
+    const bindingResult = verifyBodyBinding(entry.body, expectedRoot);
+    if (!bindingResult.ok) return bindingResult;
+  }
 
   return { ok: true };
 }

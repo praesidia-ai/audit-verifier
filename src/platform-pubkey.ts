@@ -28,23 +28,15 @@
  *      the CLI before verifying bundles emitted under the new key.
  *
  * TODO(AUDIT-2026-05-30 follow-up): replace the placeholder values
- * below with the production platform pubkey before any external
- * auditor consumes a v3+ bundle. While the placeholder is in place,
- * the verifier:
- *   - emits a `placeholder_platform_key` reason on the
- *     `platformAttestation` component; AND
- *   - treats the attestation as `warn-but-proceed` (does NOT mark
- *     the bundle overall failure), so dev / CI bundles built with
- *     ephemeral platform keys still verify.
- *
- * Once the real key is pinned the verifier flips to strict mode
- * automatically (see `verifyPlatformAttestation` in `verify.ts`).
+ * below with the production platform pubkey before distribution. The
+ * verifier fails closed while the embedded pin is empty; operators can
+ * provide a trusted key explicitly with CLI `--platform-key` or library
+ * option `platformPublicKeyDerB64`.
  */
 
 /**
  * Base64-encoded SPKI DER of the pinned platform public key. The
- * empty-string sentinel triggers placeholder mode — see the file
- * header for the release procedure that replaces it with real bytes.
+ * empty-string sentinel means there is no embedded trust anchor.
  */
 export const PLATFORM_PUBLIC_KEY_DER_B64: string = '';
 
@@ -55,11 +47,7 @@ export const PLATFORM_PUBLIC_KEY_DER_B64: string = '';
 export const PLATFORM_PUBLIC_KEY_FINGERPRINT: string = '';
 
 /**
- * True iff the verifier should treat the platform attestation as a
- * mandatory check. Placeholder mode (both pin values empty) returns
- * `false` so dev / CI bundles built before the production pin is
- * available still verify end-to-end (the attestation entry itself is
- * still surfaced in the report as `warn`).
+ * True iff an internally consistent platform trust anchor is embedded.
  */
 export function isPlatformPubkeyPinned(): boolean {
   return (

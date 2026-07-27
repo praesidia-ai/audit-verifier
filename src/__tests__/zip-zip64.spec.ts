@@ -174,4 +174,41 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     expect(entries[0]!.name).toBe('x.txt');
     expect(entries[0]!.data.toString('utf8')).toBe('payload');
   });
+
+  it('rejects duplicate entry names', () => {
+    const zip = writeZip([
+      { name: 'manifest.json', data: Buffer.from('first') },
+      { name: 'manifest.json', data: Buffer.from('second') },
+    ]);
+    expect(() => readZip(zip)).toThrow(/duplicate zip entry name/);
+  });
+
+  it('rejects a CRC mismatch even when sizes remain valid', () => {
+    const zip = writeZip([{ name: 'a.txt', data: Buffer.from('hello') }]);
+    const corrupted = Buffer.from(zip);
+    const nameLength = corrupted.readUInt16LE(26);
+    corrupted[30 + nameLength] = corrupted[30 + nameLength]! ^ 0xff;
+    expect(() => readZip(corrupted)).toThrow(/CRC-32 mismatch/);
+  });
+
+  it('rejects a local/central filename mismatch', () => {
+    const zip = writeZip([{ name: 'a.txt', data: Buffer.from('hello') }]);
+    const corrupted = Buffer.from(zip);
+    corrupted[30] = 'b'.charCodeAt(0);
+    expect(() => readZip(corrupted)).toThrow(/filename mismatch/);
+  });
+
+  it('enforces configurable entry and output-size limits', () => {
+    const zip = writeZip([
+      { name: 'a', data: Buffer.alloc(8) },
+      { name: 'b', data: Buffer.alloc(8) },
+    ]);
+    expect(() => readZip(zip, { maxEntries: 1 })).toThrow(/entry count/);
+    expect(() =>
+      readZip(zip, { maxEntryUncompressedBytes: 4 }),
+    ).toThrow(/uncompressed size/);
+    expect(() =>
+      readZip(zip, { maxTotalUncompressedBytes: 12 }),
+    ).toThrow(/total uncompressed size/);
+  });
 });

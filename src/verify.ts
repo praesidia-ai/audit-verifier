@@ -12,7 +12,8 @@
  *    bytes in `public-keys.json` keyed by `keyVersion`.
  *  - We NEVER log row payloads. Only counts, names, and the id of the
  *    FIRST offending row in each phase.
- *  - The Rekor fetch (when not skipped) is the ONLY network call.
+ *  - Verification is fully offline; provider-specific online checks are
+ *    available only through explicit caller-supplied hooks.
  *
  * INVARIANTS the verifier checks:
  *  1. Manifest signature        — Ed25519 over canonical-JSON of the
@@ -35,9 +36,9 @@
  *  5. Inclusion proofs          — `merkleVerify(leaf, proof, rootHash)`
  *                                 where `leaf = canonical(row) || sigBytes`
  *                                 (AGV-033 leaf preimage). Proof rows
- *                                 with `status` markers (e.g.
- *                                 `not_yet_rooted`) are SKIPPED — they
- *                                 are not failures.
+ *                                 and exactly one valid proof is required
+ *                                 for every exported row. Status markers
+ *                                 are diagnostic failures, not proofs.
  *  6. Rekor receipt (optional)  — when not skipped, REAL offline
  *                                 verification (BUGHUNT-SDK-05): the
  *                                 receipt's Signed Entry Timestamp (SET)
@@ -54,6 +55,7 @@ import * as crypto from 'node:crypto';
 
 import {
   canonicalJson,
+  decodeBase64Strict,
   sha256,
   verifySignature,
   type BundleSignatureAlgorithm,
@@ -223,16 +225,9 @@ export interface VerifyReport {
    * into this CLI (`platform-pubkey.ts`) so an auditor knows the
    * platform itself — not just the tenant — vouched for the binding.
    *
-   * Behavior modes:
-   *   - Bundle is missing `platform-attestation.json` (legacy /
-   *     pre-AUDIT-30):       `{ ok: true, reason: 'missing_legacy' }`
-   *     (warn but do not fail the bundle).
-   *   - Pinned platform pubkey is still the placeholder (verifier
-   *     pre-prod release):    `{ ok: true, reason:
-   *     'placeholder_platform_key' }` (warn but do not fail).
-   *   - Otherwise: strict — signature, fingerprint match, and
-   *     per-key fingerprint match against `public-keys.json` all
-   *     enforced.
+   * Missing attestation or a missing platform key fails closed. Legacy
+   * bundles may be accepted only through the explicit
+   * `allowLegacyUnattested` option.
    */
   platformAttestation: ComponentResult;
   /**
@@ -298,11 +293,9 @@ export interface VerifyOptions {
    *
    *   - `'rekor'`   → falls back to `rekorFetcher` when this hook is
    *                   absent (preserves the legacy single-anchor path).
-   *   - `'s3'`      → checks that the receipt parses as an
-   *                   `s3:<bucket>:<key>:<versionId>` triple. The
-   *                   verifier is OFFLINE by contract; we DON'T make a
-   *                   network HEAD call. A caller wanting on-line
-   *                   verification supplies this hook.
+   *   - `'s3'`      → fails closed because an offline shape check cannot
+   *                   prove object existence or immutability. A caller
+   *                   wanting verification supplies this hook.
    *   - other       → reported as
    *                   `{ ok: false, reason: 'unknown_provider' }` and
    *                   counted as a failure in `report.rekor`. The
@@ -322,10 +315,15 @@ export interface VerifyOptions {
    * caller-supplied key without recompiling the package.
    *
    * Accepts base64-encoded SPKI DER of an EC P-256 public key. An
-   * empty / missing override falls back to the bundled pin (and to
-   * placeholder-mode warn-but-proceed when that pin is empty).
+   * empty / missing override falls back to the bundled pin. Verification
+   * fails closed when neither source contains a key.
    */
   platformPublicKeyDerB64?: string;
+  /**
+   * Explicitly accept a pre-attestation legacy bundle. Defaults to false so a
+   * self-signed bundle cannot pass without an external platform trust anchor.
+   */
+  allowLegacyUnattested?: boolean;
 }
 
 const EXPECTED_ENTRIES = [
@@ -364,10 +362,19 @@ export async function verifyBundle(
   const manifest = JSON.parse(
     byName.get('manifest.json')!.data.toString('utf8'),
   ) as BundleManifest;
+  assertManifestStructure(manifest);
 
-  const publicKeysRaw = JSON.parse(
+  const publicKeysParsed: unknown = JSON.parse(
     byName.get('public-keys.json')!.data.toString('utf8'),
-  ) as Record<string, unknown>;
+  );
+  if (
+    publicKeysParsed === null ||
+    typeof publicKeysParsed !== 'object' ||
+    Array.isArray(publicKeysParsed)
+  ) {
+    throw new Error('public-keys.json must contain an object');
+  }
+  const publicKeysRaw = publicKeysParsed as Record<string, unknown>;
   const publicKeys = new Map<number, PublicKeyRecord>();
   for (const [k, v] of Object.entries(publicKeysRaw)) {
     const ver = Number(k);
@@ -385,6 +392,7 @@ export async function verifyBundle(
   // 4) Parse + verify rows.
   const rowsNdjson = gunzip(byName.get('rows.ndjson.gz')!.data);
   const rows = parseNdjson<BundleRow>(rowsNdjson);
+  assertRowsStructure(rows, manifest.orgId);
 
   // NX-TAC-02 — Thread the manifest's signatureAlgorithm into the
   // row + root signature checks. Every signature in a bundle uses
@@ -400,6 +408,7 @@ export async function verifyBundle(
   // 5) Parse + verify roots.
   const rootsNdjson = gunzip(byName.get('roots.ndjson.gz')!.data);
   const roots = parseNdjson<BundleRoot>(rootsNdjson);
+  assertRootsStructure(roots, manifest.orgId);
   const rootSigResult = verifyRootSignatures(
     roots,
     publicKeys,
@@ -409,14 +418,15 @@ export async function verifyBundle(
   // 6) Parse + verify inclusion proofs.
   const proofsNdjson = gunzip(byName.get('proofs.ndjson.gz')!.data);
   const proofs = parseNdjson<BundleProofEntry>(proofsNdjson);
+  assertProofsStructure(proofs);
   const proofResult = verifyInclusionProofs(rows, roots, proofs);
 
   // 7) Optional Rekor fetch.
   const rekorResult = await verifyRekorReceipts(roots, options);
 
   // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
-  // The entry is OPTIONAL on disk so legacy bundles (pre-AUDIT-30)
-  // still load; if missing, the verifier warns-but-proceeds.
+  // The entry remains optional in the ZIP grammar for backwards parsing,
+  // but its absence fails verification unless explicitly allowed.
   const platformResult = verifyPlatformAttestation(
     byName.get('platform-attestation.json') ?? null,
     publicKeysRaw,
@@ -589,9 +599,11 @@ function verifyKeyBinding(
   const signed = new Map<number, Uint8Array>();
   for (const kv of manifest.keyVersions) {
     if (typeof kv.publicKey === 'string') {
+      const decoded = decodeBase64Strict(kv.publicKey);
+      if (decoded === null) continue;
       signed.set(
         kv.keyVersion,
-        new Uint8Array(Buffer.from(kv.publicKey, 'base64')),
+        new Uint8Array(decoded),
       );
     }
   }
@@ -613,7 +625,16 @@ function verifyKeyBinding(
       }
       continue;
     }
-    const usedBytes = new Uint8Array(Buffer.from(usedB64, 'base64'));
+    const decoded = decodeBase64Strict(usedB64);
+    if (decoded === null) {
+      failed += 1;
+      if (firstFailure === undefined) {
+        firstFailure = k;
+        reason = `public-keys.json[${k}] is not canonical base64`;
+      }
+      continue;
+    }
+    const usedBytes = new Uint8Array(decoded);
     const signedBytes = signed.get(ver);
     if (signedBytes === undefined) {
       failed += 1;
@@ -734,7 +755,9 @@ function verifyRowSignatures(
       if (typeof row.prevRowHash !== 'string') {
         throw new Error('prev_row_hash missing');
       }
-      prevRowHashBytes = Buffer.from(row.prevRowHash, 'base64');
+      const decoded = decodeBase64Strict(row.prevRowHash, 32);
+      if (decoded === null) throw new Error('prev_row_hash malformed');
+      prevRowHashBytes = decoded;
     } catch {
       failed += 1;
       if (!firstFailure) {
@@ -890,12 +913,28 @@ function verifyInclusionProofs(
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
+  const seenRowIds = new Set<string>();
 
   for (const entry of proofs) {
-    // Status markers (`not_yet_rooted`, `key_unavailable`, `error`) are
-    // explicit signals from the writer that this row could not be
-    // proven; the verifier MUST NOT treat them as failures.
+    checked += 1;
+    if (seenRowIds.has(entry.rowId)) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = 'duplicate proof entry for row';
+      }
+      continue;
+    }
+    seenRowIds.add(entry.rowId);
+
+    // Status markers are diagnostics, not proofs, and are not signed. Treating
+    // them as success let an attacker replace every proof with a marker.
     if (entry.status && entry.status !== 'ok') {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = `row has no verifiable inclusion proof (status=${entry.status})`;
+      }
       continue;
     }
     const row = rowsById.get(entry.rowId);
@@ -905,7 +944,6 @@ function verifyInclusionProofs(
         firstFailure = entry.rowId;
         reason = 'proof references a row not present in rows.ndjson.gz';
       }
-      checked += 1;
       continue;
     }
     if (!entry.proof || !entry.rootHash || typeof entry.index !== 'number') {
@@ -914,10 +952,17 @@ function verifyInclusionProofs(
         firstFailure = entry.rowId;
         reason = 'proof entry malformed (missing proof/index/rootHash)';
       }
-      checked += 1;
       continue;
     }
-    const rootBytes = Buffer.from(entry.rootHash, 'base64');
+    const rootBytes = decodeBase64Strict(entry.rootHash, 32);
+    if (rootBytes === null) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = 'proof rootHash is not canonical 32-byte base64';
+      }
+      continue;
+    }
     // Sanity: the proof's stated root must match a root in roots.ndjson.gz.
     if (!rootsByHash.has(entry.rootHash)) {
       failed += 1;
@@ -925,14 +970,48 @@ function verifyInclusionProofs(
         firstFailure = entry.rowId;
         reason = 'proof rootHash not found in roots.ndjson.gz';
       }
-      checked += 1;
+      continue;
+    }
+    const root = rootsByHash.get(entry.rootHash)!;
+    const expectedProofDepth =
+      root.rowCount <= 1 ? 0 : Math.ceil(Math.log2(root.rowCount));
+    if (
+      !Number.isSafeInteger(entry.index) ||
+      entry.index < 0 ||
+      !Number.isSafeInteger(root.rowCount) ||
+      root.rowCount <= 0 ||
+      entry.index >= root.rowCount ||
+      entry.proof.length !== expectedProofDepth
+    ) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = 'proof index/depth is inconsistent with root rowCount';
+      }
       continue;
     }
     const leaf = computeLeaf(row);
+    if (leaf === null) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = 'row signature is not canonical base64';
+      }
+      continue;
+    }
+    const decodedSiblings = entry.proof.map((s) =>
+      decodeBase64Strict(s, 32),
+    );
+    if (decodedSiblings.some((s) => s === null)) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = entry.rowId;
+        reason = 'proof sibling is not canonical 32-byte base64';
+      }
+      continue;
+    }
     const merkleProofObj: MerkleProof = {
-      siblings: entry.proof.map(
-        (s) => new Uint8Array(Buffer.from(s, 'base64')),
-      ),
+      siblings: decodedSiblings.map((s) => new Uint8Array(s!)),
       index: entry.index,
     };
     if (!merkleVerify(leaf, merkleProofObj, new Uint8Array(rootBytes))) {
@@ -942,7 +1021,19 @@ function verifyInclusionProofs(
         reason = 'inclusion proof does not verify against root';
       }
     }
-    checked += 1;
+  }
+
+  // The exporter emits exactly one proof record per row. Removing the proofs
+  // file content must not produce a vacuous zero-checked success.
+  for (const row of rows) {
+    if (!seenRowIds.has(row.id)) {
+      checked += 1;
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = row.id;
+        reason = 'row has no entry in proofs.ndjson.gz';
+      }
+    }
   }
 
   return {
@@ -988,12 +1079,20 @@ async function verifyRekorReceipts(
   let reason: string | undefined;
   for (const root of roots) {
     const entries = collectAnchorEntries(root);
-    if (entries.length === 0) continue;
+    if (entries.length === 0) {
+      checked += 1;
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = root.id;
+        reason = 'missing_anchor_receipt';
+      }
+      continue;
+    }
     for (const entry of entries) {
       checked += 1;
       let result: { ok: boolean; reason?: string };
       try {
-        result = await verifyAnchorReceipt(entry, options);
+        result = await verifyAnchorReceipt(root, entry, options);
       } catch (err) {
         result = {
           ok: false,
@@ -1056,11 +1155,12 @@ function collectAnchorEntries(
  * verification of S3 receipts, for example, supply a hook that does
  * a HEAD against the bucket. Without the hook, behaviour per provider:
  *
- *   - `'rekor'` → existing `rekorFetcher` (default: parses JSON).
- *   - `'s3'`    → offline shape check on `s3:<bucket>:<key>:<vid>`.
+ *   - `'rekor'` → cryptographic offline verification bound to this root.
+ *   - `'s3'`    → fail closed unless the caller supplies a verifier.
  *   - other     → `{ ok: false, reason: 'unknown_provider' }`.
  */
 async function verifyAnchorReceipt(
+  root: BundleRoot,
   entry: { provider: string; receipt: string; anchoredAt: string },
   options: VerifyOptions,
 ): Promise<{ ok: boolean; reason?: string }> {
@@ -1079,10 +1179,16 @@ async function verifyAnchorReceipt(
       const ok = await options.rekorFetcher(entry.receipt);
       return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
     }
-    return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem);
+    return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem, {
+      rootHashB64: root.rootHash,
+      signatureB64: root.signature,
+    });
   }
   if (entry.provider === 's3') {
-    return verifyS3ReceiptShape(entry.receipt);
+    const shape = verifyS3ReceiptShape(entry.receipt);
+    return shape.ok
+      ? { ok: false, reason: 'unverifiable_offline' }
+      : shape;
   }
   return { ok: false, reason: 'unknown_provider' };
 }
@@ -1093,9 +1199,8 @@ async function verifyAnchorReceipt(
  * colon-segments and treat everything in between as the key — matches
  * `S3AnchorService.verifyReceipt`'s parser.
  *
- * Returns `{ ok: false, reason: 'malformed' }` on a bad shape. The
- * verifier is offline by contract; live HEAD-against-bucket checks are
- * the responsibility of a caller-supplied `anchorReceiptVerifier`.
+ * Returns `{ ok: false, reason: 'malformed' }` on a bad shape. A valid
+ * shape is still not proof; callers must use `anchorReceiptVerifier`.
  */
 function verifyS3ReceiptShape(receipt: string): {
   ok: boolean;
@@ -1151,10 +1256,9 @@ interface PlatformAttestationEnvelope {
  *   1. Resolve the platform pubkey: caller-supplied
  *      `options.platformPublicKeyDerB64` wins; otherwise fall back
  *      to the bundled pin. If both are empty, return
- *      `placeholder_platform_key` (warn but proceed).
- *   2. If the entry is missing entirely, return `missing_legacy`
- *      (warn but proceed) — pre-AUDIT-30 bundles legitimately did
- *      not carry it.
+ *      `platform_key_not_pinned` (fail closed).
+ *   2. If the entry is missing entirely, fail unless the caller explicitly
+ *      enables `allowLegacyUnattested`.
  *   3. Parse the envelope. Reject malformed JSON / shape with
  *      `malformed`.
  *   4. orgId in attestation MUST match manifest orgId — else
@@ -1174,6 +1278,24 @@ function verifyPlatformAttestation(
   manifestOrgId: string,
   options: VerifyOptions,
 ): ComponentResult {
+  // Missing external trust evidence is a verification failure by default. An
+  // auditor may explicitly opt into legacy self-signed bundle semantics.
+  if (!entry) {
+    return options.allowLegacyUnattested
+      ? {
+          ok: true,
+          checked: 0,
+          failed: 0,
+          reason: 'missing_legacy_explicitly_allowed',
+        }
+      : {
+          ok: false,
+          checked: 1,
+          failed: 1,
+          reason: 'platform_attestation_missing',
+        };
+  }
+
   // Step 1 — resolve the pinned pubkey (caller override > bundled pin).
   const callerOverride = options.platformPublicKeyDerB64;
   const pinnedB64 =
@@ -1183,18 +1305,22 @@ function verifyPlatformAttestation(
         ? PLATFORM_PUBLIC_KEY_DER_B64
         : '';
   if (pinnedB64.length === 0) {
-    // Placeholder mode — warn but proceed. A real CLI release pins
-    // the prod platform pubkey via `platform-pubkey.ts`; until then
-    // dev / CI bundles built with ephemeral platform keys still
-    // verify end-to-end.
     return {
-      ok: true,
-      checked: 0,
-      failed: 0,
-      reason: 'placeholder_platform_key',
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'platform_key_not_pinned',
     };
   }
-  const pinnedDer = Buffer.from(pinnedB64, 'base64');
+  const pinnedDer = decodeBase64Strict(pinnedB64);
+  if (pinnedDer === null) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'platform_key_malformed: expected canonical base64 SPKI DER',
+    };
+  }
   // Compute the expected fingerprint over the same bytes the
   // verifier will use for signature dispatch. Caller override and
   // bundled pin take the same path so a substitution at either
@@ -1204,17 +1330,7 @@ function verifyPlatformAttestation(
       ? crypto.createHash('sha256').update(pinnedDer).digest('hex')
       : PLATFORM_PUBLIC_KEY_FINGERPRINT;
 
-  // Step 2 — missing entry (legacy bundle). Warn but proceed.
-  if (!entry) {
-    return {
-      ok: true,
-      checked: 0,
-      failed: 0,
-      reason: 'missing_legacy',
-    };
-  }
-
-  // Step 3 — parse the envelope.
+  // Parse the envelope.
   let envelope: PlatformAttestationEnvelope;
   try {
     envelope = JSON.parse(
@@ -1248,6 +1364,7 @@ function verifyPlatformAttestation(
     !Array.isArray(body.keyVersions) ||
     typeof body.platformSigningKeyFingerprint !== 'string' ||
     typeof body.issuedAt !== 'string' ||
+    Number.isNaN(Date.parse(body.issuedAt)) ||
     body.signatureAlgorithm !== 'ECDSA_P256_SHA256'
   ) {
     return {
@@ -1303,11 +1420,24 @@ function verifyPlatformAttestation(
     };
   }
 
-  // Step 7 — every keyVersion fingerprint matches `public-keys.json`.
+  // Step 7 — require a one-to-one key set and bind fingerprint + lifecycle
+  // metadata. Omitting a revoked key or relabelling it ACTIVE must not turn a
+  // valid platform attestation into permission to trust that key.
+  const seenVersions = new Set<number>();
   for (const kv of body.keyVersions) {
     if (
-      typeof kv.keyVersion !== 'number' ||
-      typeof kv.fingerprint !== 'string'
+      !Number.isSafeInteger(kv.keyVersion) ||
+      kv.keyVersion < 1 ||
+      typeof kv.fingerprint !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(kv.fingerprint) ||
+      (kv.status !== 'ACTIVE' &&
+        kv.status !== 'ROTATED' &&
+        kv.status !== 'REVOKED') ||
+      typeof kv.issuedAt !== 'string' ||
+      Number.isNaN(Date.parse(kv.issuedAt)) ||
+      (kv.revokedAt !== null &&
+        (typeof kv.revokedAt !== 'string' ||
+          Number.isNaN(Date.parse(kv.revokedAt))))
     ) {
       return {
         ok: false,
@@ -1316,6 +1446,15 @@ function verifyPlatformAttestation(
         reason: 'malformed: keyVersions entry missing keyVersion/fingerprint',
       };
     }
+    if (seenVersions.has(kv.keyVersion)) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `duplicate_keyversion: attestation repeats keyVersion ${kv.keyVersion}`,
+      };
+    }
+    seenVersions.add(kv.keyVersion);
     const pkEntry = publicKeysRaw[String(kv.keyVersion)];
     let pkB64: string | null = null;
     if (typeof pkEntry === 'string') {
@@ -1334,9 +1473,18 @@ function verifyPlatformAttestation(
         reason: `keyversion_not_in_bundle: attestation references keyVersion ${kv.keyVersion} which is missing from public-keys.json`,
       };
     }
+    const pkBytes = decodeBase64Strict(pkB64);
+    if (pkBytes === null) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `keyversion_malformed: keyVersion ${kv.keyVersion} is not canonical base64`,
+      };
+    }
     const actualFingerprint = crypto
       .createHash('sha256')
-      .update(Buffer.from(pkB64, 'base64'))
+      .update(pkBytes)
       .digest('hex');
     if (actualFingerprint !== kv.fingerprint) {
       return {
@@ -1346,6 +1494,35 @@ function verifyPlatformAttestation(
         reason: `keyversion_fingerprint_mismatch: keyVersion ${kv.keyVersion} attests ${kv.fingerprint} but public-keys.json bytes hash to ${actualFingerprint}`,
       };
     }
+    const actualStatus =
+      typeof pkEntry === 'string'
+        ? 'ACTIVE'
+        : (pkEntry as { status?: unknown }).status;
+    const actualRevokedAt =
+      typeof pkEntry === 'string'
+        ? null
+        : ((pkEntry as { revokedAt?: unknown }).revokedAt ?? null);
+    if (actualStatus !== kv.status || actualRevokedAt !== kv.revokedAt) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `keyversion_lifecycle_mismatch: keyVersion ${kv.keyVersion} status/revokedAt differs from platform attestation`,
+      };
+    }
+  }
+  if (
+    seenVersions.size !== Object.keys(publicKeysRaw).length ||
+    Object.keys(publicKeysRaw).some((version) =>
+      !seenVersions.has(Number(version)),
+    )
+  ) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'keyversion_set_mismatch: platform attestation must cover every bundled key exactly once',
+    };
   }
 
   return { ok: true, checked: 1, failed: 0 };
@@ -1354,6 +1531,123 @@ function verifyPlatformAttestation(
 // ════════════════════════════════════════════════════════════════════════
 // Helpers
 // ════════════════════════════════════════════════════════════════════════
+
+function isIsoDate(value: unknown): value is string {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value));
+}
+
+function assertManifestStructure(manifest: BundleManifest): void {
+  if (
+    !manifest ||
+    typeof manifest !== 'object' ||
+    !Number.isSafeInteger(manifest.version) ||
+    manifest.version < 1 ||
+    typeof manifest.orgId !== 'string' ||
+    manifest.orgId.length === 0 ||
+    !isIsoDate(manifest.from) ||
+    !isIsoDate(manifest.to) ||
+    Date.parse(manifest.from) > Date.parse(manifest.to) ||
+    !isIsoDate(manifest.generatedAt) ||
+    !Number.isSafeInteger(manifest.rowCount) ||
+    manifest.rowCount < 0 ||
+    !Number.isSafeInteger(manifest.rootCount) ||
+    manifest.rootCount < 0 ||
+    !Array.isArray(manifest.keyVersions) ||
+    typeof manifest.signature !== 'string' ||
+    !Number.isSafeInteger(manifest.signatureKeyVersion) ||
+    (manifest.signatureAlgorithm !== 'Ed25519' &&
+      manifest.signatureAlgorithm !== 'ECDSA_P256_SHA256')
+  ) {
+    throw new Error('manifest.json has an invalid structure');
+  }
+  const versions = new Set<number>();
+  for (const key of manifest.keyVersions) {
+    if (
+      !key ||
+      typeof key !== 'object' ||
+      !Number.isSafeInteger(key.keyVersion) ||
+      key.keyVersion < 1 ||
+      typeof key.publicKey !== 'string' ||
+      versions.has(key.keyVersion)
+    ) {
+      throw new Error('manifest.json contains an invalid/duplicate keyVersion');
+    }
+    versions.add(key.keyVersion);
+  }
+}
+
+function assertRowsStructure(rows: BundleRow[], orgId: string): void {
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (
+      !row ||
+      typeof row !== 'object' ||
+      typeof row.id !== 'string' ||
+      row.id.length === 0 ||
+      ids.has(row.id) ||
+      row.organizationId !== orgId ||
+      typeof row.action !== 'string' ||
+      typeof row.actorType !== 'string' ||
+      !isIsoDate(row.createdAt) ||
+      typeof row.signature !== 'string' ||
+      !Number.isSafeInteger(row.keyVersion) ||
+      row.keyVersion < 1
+    ) {
+      throw new Error(`rows.ndjson.gz has an invalid/duplicate row: ${String(row?.id)}`);
+    }
+    ids.add(row.id);
+  }
+}
+
+function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
+  const ids = new Set<string>();
+  const hashes = new Set<string>();
+  for (const root of roots) {
+    if (
+      !root ||
+      typeof root !== 'object' ||
+      typeof root.id !== 'string' ||
+      root.id.length === 0 ||
+      ids.has(root.id) ||
+      root.organizationId !== orgId ||
+      !isIsoDate(root.periodStart) ||
+      !isIsoDate(root.periodEnd) ||
+      Date.parse(root.periodStart) >= Date.parse(root.periodEnd) ||
+      !Number.isSafeInteger(root.rowCount) ||
+      root.rowCount < 1 ||
+      typeof root.rootHash !== 'string' ||
+      hashes.has(root.rootHash) ||
+      typeof root.signature !== 'string' ||
+      !Number.isSafeInteger(root.keyVersion) ||
+      root.keyVersion < 1 ||
+      !isIsoDate(root.signedAt) ||
+      (root.anchoredAt !== null && !isIsoDate(root.anchoredAt)) ||
+      (root.anchorReceipt !== null && typeof root.anchorReceipt !== 'string') ||
+      (root.anchorReceipts !== undefined && !Array.isArray(root.anchorReceipts))
+    ) {
+      throw new Error(`roots.ndjson.gz has an invalid/duplicate root: ${String(root?.id)}`);
+    }
+    ids.add(root.id);
+    hashes.add(root.rootHash);
+  }
+}
+
+function assertProofsStructure(proofs: BundleProofEntry[]): void {
+  for (const proof of proofs) {
+    if (
+      !proof ||
+      typeof proof !== 'object' ||
+      typeof proof.rowId !== 'string' ||
+      proof.rowId.length === 0 ||
+      (proof.status !== undefined && typeof proof.status !== 'string') ||
+      (proof.proof !== undefined &&
+        (!Array.isArray(proof.proof) ||
+          !proof.proof.every((sibling) => typeof sibling === 'string')))
+    ) {
+      throw new Error('proofs.ndjson.gz has an invalid proof entry');
+    }
+  }
+}
 
 /** Pull the 11 signable fields out of a bundle row (mirrors AGV-030). */
 function signableRow(row: BundleRow): Record<string, unknown> {
@@ -1378,9 +1672,10 @@ function signableRow(row: BundleRow): Record<string, unknown> {
  * The Merkle tree's `merkleVerify` adds the RFC 6962 0x00 leaf prefix
  * before hashing — see `merkleVerify` / `merkleBuild`.
  */
-function computeLeaf(row: BundleRow): Uint8Array {
+function computeLeaf(row: BundleRow): Uint8Array | null {
   const canonical = canonicalJson(signableRow(row));
-  const sigBytes = Buffer.from(row.signature, 'base64');
+  const sigBytes = decodeBase64Strict(row.signature);
+  if (sigBytes === null) return null;
   return new Uint8Array(Buffer.concat([canonical, sigBytes]));
 }
 
@@ -1389,9 +1684,10 @@ function computeLeaf(row: BundleRow): Uint8Array {
  * `prev_row_hash`:
  *   sha256(canonical(prev) || prev.sig_bytes)  (base64)
  */
-function computeChainLink(prev: BundleRow): string {
+function computeChainLink(prev: BundleRow): string | null {
   const canonical = canonicalJson(signableRow(prev));
-  const sigBytes = Buffer.from(prev.signature, 'base64');
+  const sigBytes = decodeBase64Strict(prev.signature);
+  if (sigBytes === null) return null;
   return sha256(Buffer.concat([canonical, sigBytes])).toString('base64');
 }
 
@@ -1422,8 +1718,14 @@ function parsePublicKeyEntry(
   versionKey: string,
 ): PublicKeyRecord {
   if (typeof raw === 'string') {
+    const publicKey = decodeBase64Strict(raw);
+    if (publicKey === null || publicKey.length === 0) {
+      throw new Error(
+        `public-keys.json[${versionKey}] is not canonical base64`,
+      );
+    }
     return {
-      publicKey: new Uint8Array(Buffer.from(raw, 'base64')),
+      publicKey: new Uint8Array(publicKey),
       status: 'ACTIVE',
       revokedAt: null,
     };
@@ -1460,8 +1762,14 @@ function parsePublicKeyEntry(
       }
       revokedAt = parsed;
     }
+    const publicKey = decodeBase64Strict(obj.publicKey);
+    if (publicKey === null || publicKey.length === 0) {
+      throw new Error(
+        `public-keys.json[${versionKey}].publicKey is not canonical base64`,
+      );
+    }
     return {
-      publicKey: new Uint8Array(Buffer.from(obj.publicKey, 'base64')),
+      publicKey: new Uint8Array(publicKey),
       status,
       revokedAt,
     };

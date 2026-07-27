@@ -86,47 +86,59 @@ const P256_HALF_N = P256_N >> 1n;
  */
 export function extractEcdsaSFromSignature(sig: Buffer): bigint | null {
   if (sig.length === 64) {
-    return BigInt('0x' + sig.subarray(32, 64).toString('hex'));
+    const r = BigInt('0x' + sig.subarray(0, 32).toString('hex'));
+    const s = BigInt('0x' + sig.subarray(32, 64).toString('hex'));
+    return r > 0n && r < P256_N && s > 0n && s < P256_N ? s : null;
   }
-  if (sig.length < 8 || sig[0] !== 0x30) {
+  // P-256 DER signatures are at most 72 bytes and use short-form lengths.
+  // Reject alternative encodings before applying the low-s rule.
+  if (
+    sig.length < 8 ||
+    sig.length > 72 ||
+    sig[0] !== 0x30 ||
+    sig[1] !== sig.length - 2
+  ) {
     return null;
   }
   let offset = 2;
-  const firstLen = sig[1];
-  if (typeof firstLen !== 'number') {
-    return null;
-  }
-  if (firstLen & 0x80) {
-    offset += firstLen & 0x7f;
-  }
   if (sig[offset] !== 0x02) {
     return null;
   }
   const rLen = sig[offset + 1];
-  if (typeof rLen !== 'number') {
+  if (rLen === undefined || rLen < 1 || rLen > 33) {
     return null;
   }
-  offset += 2 + rLen;
+  const rStart = offset + 2;
+  const rEnd = rStart + rLen;
+  if (rEnd + 2 > sig.length) return null;
+  const rBytes = canonicalDerIntegerMagnitude(sig.subarray(rStart, rEnd));
+  if (rBytes === null) return null;
+  offset = rEnd;
   if (sig[offset] !== 0x02) {
     return null;
   }
   const sLen = sig[offset + 1];
-  if (typeof sLen !== 'number') {
+  if (sLen === undefined || sLen < 1 || sLen > 33) {
     return null;
   }
   const sStart = offset + 2;
   const sEnd = sStart + sLen;
-  if (sEnd > sig.length) {
-    return null;
+  if (sEnd !== sig.length) return null;
+  const sBytes = canonicalDerIntegerMagnitude(sig.subarray(sStart, sEnd));
+  if (sBytes === null) return null;
+  const r = BigInt('0x' + rBytes.toString('hex'));
+  const s = BigInt('0x' + sBytes.toString('hex'));
+  return r > 0n && r < P256_N && s > 0n && s < P256_N ? s : null;
+}
+
+function canonicalDerIntegerMagnitude(encoded: Buffer): Buffer | null {
+  if (encoded.length === 0 || encoded.length > 33) return null;
+  if ((encoded[0]! & 0x80) !== 0) return null;
+  if (encoded.length > 1 && encoded[0] === 0x00) {
+    if ((encoded[1]! & 0x80) === 0) return null;
+    encoded = encoded.subarray(1);
   }
-  let sBytes = sig.subarray(sStart, sEnd);
-  if (sBytes.length > 32 && sBytes[0] === 0x00) {
-    sBytes = sBytes.subarray(1);
-  }
-  if (sBytes.length === 0) {
-    return null;
-  }
-  return BigInt('0x' + sBytes.toString('hex'));
+  return encoded.length <= 32 ? encoded : null;
 }
 
 /**
@@ -150,6 +162,29 @@ export function isLowSP256(sig: Buffer): boolean {
 /** SHA-256 over a Buffer or Uint8Array. */
 export function sha256(data: Buffer | Uint8Array): Buffer {
   return crypto.createHash('sha256').update(data).digest();
+}
+
+/** Decode canonical padded standard base64, rejecting ignored junk bytes. */
+export function decodeBase64Strict(
+  value: unknown,
+  expectedLength?: number,
+): Buffer | null {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      value,
+    )
+  ) {
+    return null;
+  }
+  const decoded = Buffer.from(value, 'base64');
+  if (decoded.toString('base64') !== value) return null;
+  if (expectedLength !== undefined && decoded.length !== expectedLength) {
+    return null;
+  }
+  return decoded;
 }
 
 function leafHash(data: Uint8Array): Buffer {
@@ -184,10 +219,10 @@ export function verifyEd25519(
     if (typeof signatureB64 !== 'string') {
       return false;
     }
-    const sig = Buffer.from(signatureB64, 'base64');
+    const sig = decodeBase64Strict(signatureB64, 64);
     // Ed25519 signatures are always 64 bytes; reject malformed inputs
     // before handing them to the OpenSSL bindings.
-    if (sig.length !== 64) {
+    if (sig === null) {
       return false;
     }
     const der = Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(publicKey)]);
@@ -261,8 +296,8 @@ export function verifyEcdsaP256(
     if (publicKey.length === 0) {
       return false;
     }
-    const sig = Buffer.from(signatureB64, 'base64');
-    if (sig.length === 0) {
+    const sig = decodeBase64Strict(signatureB64);
+    if (sig === null) {
       return false;
     }
     // AUDIT-2026-05/21 — Reject high-s (non-canonical) ECDSA

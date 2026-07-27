@@ -9,6 +9,8 @@ cryptographic primitives (Ed25519, ECDSA-P256, RFC 6962 Merkle, JCS-style
 canonical JSON, Rekor SET / inclusion-proof verification, PKZIP) are
 vendored in `src/`.
 
+Node.js 22.12 or newer is required.
+
 ## Install
 
 ```bash
@@ -26,6 +28,10 @@ praesidia-verify <bundle.zip> [options]
 
 Options:
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
+  --platform-key <file>
+               Trust this PEM or SPKI-DER platform public key.
+  --allow-legacy-unattested
+               Explicitly accept a pre-attestation legacy bundle.
   --quiet      Print only the final OK/FAIL line.
   --help       Show this help message.
 
@@ -59,15 +65,20 @@ checks every cryptographic invariant the bundle commits to:
    leading truncation is caught by **completeness** (see 7).
 4. **Merkle root signatures** — every root in `roots.ndjson.gz` is
    re-canonicalized and verified.
-5. **Inclusion proofs** — every proof in `proofs.ndjson.gz` is walked
-   against the corresponding root via RFC 6962-style verification (leaf
-   prefix `0x00`, internal prefix `0x01`).
+5. **Inclusion proofs** — exactly one valid proof is required for every
+   exported row. Every proof is walked against the corresponding root via
+   RFC 6962-style verification (leaf prefix `0x00`, internal prefix `0x01`),
+   with index and path depth checked against the signed root row count.
+   Diagnostic status markers are failures, not substitutes for proofs.
 6. **Rekor receipt** — when `--no-rekor` is NOT passed, each root's
    Sigstore Rekor receipt is verified **cryptographically and offline**:
    its Signed Entry Timestamp (SET) is checked against the **pinned**
    Sigstore Rekor public key, and its inclusion proof is walked to the
-   receipt's `rootHash`. A receipt that is not a genuine, SET-signed,
-   log-included entry (e.g. an empty `{}`) now **fails**. The pinned key
+   receipt's `rootHash`. Its `hashedrekord` body must also contain the exact
+   audit root hash and root signature from the bundle, preventing a genuine
+   but unrelated receipt from being reattached. A receipt that is not a
+   genuine, SET-signed, log-included entry (e.g. an empty `{}`) **fails**.
+   The pinned key
    is baked in at build time (never fetched at verify time); a sovereign
    Rekor instance can pass its own key via `verifyBundle`'s
    `rekorPublicKeyPem` option. Skipped only via `--no-rekor`.
@@ -77,12 +88,23 @@ checks every cryptographic invariant the bundle commits to:
    deletes the last N rows (and their proofs): the surviving prefix
    still chains and still proves, but the signed counts no longer match
    what was handed to the verifier.
-8. **Platform key-binding attestation** — the optional
-   `platform-attestation.json` is checked against the CLI's pinned
-   platform key. Independently, every key in `public-keys.json` is
-   cross-checked byte-for-byte against the SIGNED `manifest.keyVersions`
-   set, so verification keys cannot be swapped even when the platform
-   attestation is absent or still the placeholder pin.
+8. **Platform key-binding attestation** — `platform-attestation.json` is
+   checked against a trusted platform key. The current source distribution
+   does not embed a deployment-specific key, so operators must pass the key
+   with `--platform-key` (or `platformPublicKeyDerB64` through the library).
+   Missing attestation or trust key fails closed. Pre-attestation bundles are
+   accepted only with explicit `--allow-legacy-unattested`. The attestation
+   must cover every bundled key exactly once and binds its fingerprint,
+   lifecycle status, and revocation timestamp.
+9. **Archive integrity and resource bounds** — duplicate filenames,
+   local/central-header disagreement, invalid UTF-8 names, CRC mismatches,
+   unsupported encryption, malformed ZIP64, and excessive decompression are
+   rejected before bundle contents are trusted.
+
+S3 anchor receipts cannot be proven offline from their locator string alone.
+The library therefore fails closed for S3 by default; callers can provide an
+`anchorReceiptVerifier` that validates the object/version against their S3
+trust boundary.
 
 ## Architecture
 
@@ -104,35 +126,17 @@ This package is intentionally **decoupled** from `be-core`:
 - No telemetry, no analytics, no payload logging — the verifier prints
   per-component pass/fail counts and the id of the first offending row.
 
-## Cutover plan — physical location
-
-> **Spec deviation.** AGV-040 originally specified a top-level
-> `packages/audit-verifier/` directory at the repo root. Due to a sandbox
-> permission boundary at the time of authoring, the package currently
-> lives under `be-core/packages/audit-verifier/`.
-
-The **architectural** claim of zero-dependency-on-be-core is preserved
-by enforcement at the TypeScript and `package.json` layer:
-
-- `tsconfig.json` has `rootDir: "src"` and an empty `paths` map.
-- All imports inside the package are relative within `src/`.
-- `dependencies` in `package.json` is `{}`.
-- `npm pack` produces a fully standalone tarball.
-
-The cutover ticket — **AGV-040-FOLLOWUP** — will perform:
-
-```bash
-# Once the top-level path is writable in the dev environment:
-git mv be-core/packages/audit-verifier packages/audit-verifier
-# Then update any relative references in CI / scripts.
-```
-
-No code inside the package itself needs to change for the move; the
-package is location-independent by construction.
-
 ## Changelog
 
 ### 0.3.0
+
+- Platform attestation and trust-key absence now fail closed by default;
+  explicit legacy opt-in and `--platform-key` are available for controlled
+  migration.
+- Rekor receipts are bound to the exact root hash and signature, S3 receipts
+  require a real caller-supplied verifier, and proof coverage is complete.
+- ZIP parsing now enforces unique names, CRC/header integrity, strict UTF-8,
+  and decompression/resource limits.
 
 - **Rekor receipts are now verified cryptographically (BUGHUNT-SDK-05).**
   The default Rekor check was previously `JSON.parse(receipt)` — it passed

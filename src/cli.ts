@@ -13,6 +13,7 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport } from './verify.js';
 
 interface CliArgs {
@@ -20,6 +21,8 @@ interface CliArgs {
   noRekor: boolean;
   quiet: boolean;
   help: boolean;
+  platformKeyPath: string | null;
+  allowLegacyUnattested: boolean;
 }
 
 const HELP = `praesidia-verify — offline verifier for Praesidia compliance bundles
@@ -29,6 +32,10 @@ USAGE
 
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
+  --platform-key <file>
+               Trust this PEM or SPKI-DER platform attestation public key.
+  --allow-legacy-unattested
+               Explicitly accept bundles without platform attestation.
   --quiet      Print only the final OK/FAIL summary line.
   --help, -h   Show this help message.
 
@@ -48,11 +55,24 @@ function parseArgs(argv: string[]): CliArgs {
     noRekor: false,
     quiet: false,
     help: false,
+    platformKeyPath: null,
+    allowLegacyUnattested: false,
   };
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
     if (arg === '--no-rekor') out.noRekor = true;
     else if (arg === '--quiet') out.quiet = true;
     else if (arg === '--help' || arg === '-h') out.help = true;
+    else if (arg === '--allow-legacy-unattested') {
+      out.allowLegacyUnattested = true;
+    } else if (arg === '--platform-key') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) {
+        throw new Error('--platform-key requires a file path');
+      }
+      out.platformKeyPath = value;
+      i += 1;
+    }
     else if (arg.startsWith('-')) {
       // Unknown flag — surface as format error (exit 2) so silent
       // typos don't get treated as success.
@@ -145,8 +165,37 @@ async function main(): Promise<number> {
     return 2;
   }
   let report: VerifyReport;
+  let platformPublicKeyDerB64: string | undefined;
+  if (args.platformKeyPath) {
+    try {
+      const keyBytes = await fs.readFile(path.resolve(args.platformKeyPath));
+      let key: crypto.KeyObject;
+      try {
+        key = crypto.createPublicKey(keyBytes.toString('utf8'));
+      } catch {
+        key = crypto.createPublicKey({ key: keyBytes, format: 'der', type: 'spki' });
+      }
+      if (key.asymmetricKeyType !== 'ec') {
+        throw new Error('platform key must be an EC P-256 public key');
+      }
+      const details = key.asymmetricKeyDetails;
+      if (details?.namedCurve !== 'prime256v1') {
+        throw new Error('platform key must use the P-256 curve');
+      }
+      platformPublicKeyDerB64 = Buffer.from(
+        key.export({ type: 'spki', format: 'der' }),
+      ).toString('base64');
+    } catch (err) {
+      process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
+      return 2;
+    }
+  }
   try {
-    report = await verifyBundle(buffer, { noRekor: args.noRekor });
+    report = await verifyBundle(buffer, {
+      noRekor: args.noRekor,
+      allowLegacyUnattested: args.allowLegacyUnattested,
+      ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
+    });
   } catch (err) {
     // verifyBundle throws ONLY on I/O / format errors. Verification
     // failures come through as `report.ok === false`.

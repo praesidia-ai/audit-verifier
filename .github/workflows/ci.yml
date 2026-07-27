@@ -15,15 +15,19 @@ concurrency:
 
 jobs:
   build-test:
-    name: Build + Test (tsc + vitest)
+    name: Node ${{ matrix.node }} — build + test
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install (reproducible)
@@ -37,3 +41,24 @@ jobs:
 
       - name: praesidia-verify --help smoke
         run: node dist/cli.js --help
+
+  image:
+    name: Reproducible image smoke
+    needs: build-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile repeats build + tests and its final stage must execute
+      # the compiled zero-dependency CLI as a non-root user.
+      - name: Build image
+        run: docker build -t praesidia-audit-verifier:ci .
+
+      - name: Smoke image and verify runtime user
+        run: |
+          docker run --rm praesidia-audit-verifier:ci
+          USER_NAME="$(docker image inspect --format '{{.Config.User}}' praesidia-audit-verifier:ci)"
+          case "${USER_NAME}" in
+            ''|0|root) echo "image runs as unsafe user '${USER_NAME}'"; exit 1 ;;
+          esac

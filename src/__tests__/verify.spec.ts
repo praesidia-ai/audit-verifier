@@ -19,7 +19,11 @@ import { describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
 
-import { verifyBundle } from '../verify.js';
+import {
+  verifyBundle as verifyBundleStrict,
+  type VerifyOptions,
+  type VerifyReport,
+} from '../verify.js';
 import {
   canonicalJson,
   signEd25519,
@@ -31,6 +35,19 @@ import {
   GENESIS_PREV_ROW_HASH,
 } from '../crypto.js';
 import { writeZip, gzipDeterministic, readZip } from '../zip.js';
+
+// Most fixtures intentionally model pre-attestation legacy bundles. Their
+// crypto assertions opt in explicitly; dedicated trust-boundary tests below
+// exercise the production default, which fails closed.
+function verifyBundle(
+  bundle: Buffer,
+  options: VerifyOptions = {},
+): Promise<VerifyReport> {
+  return verifyBundleStrict(bundle, {
+    allowLegacyUnattested: true,
+    ...options,
+  });
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // Fixture types — minimal shapes for the bundle wire format.
@@ -425,6 +442,24 @@ function readBundleEntries(zip: Buffer): Map<string, Buffer> {
   return out;
 }
 
+function rebuildWithProofs(proofs: FixtureProof[]): Buffer {
+  const base = buildFixtureBundle();
+  const entries = readBundleEntries(base.zip);
+  const ndjson = Buffer.from(
+    proofs.map((proof) => JSON.stringify(proof)).join('\n') +
+      (proofs.length > 0 ? '\n' : ''),
+    'utf8',
+  );
+  return writeZip([
+    { name: 'manifest.json', data: entries.get('manifest.json')! },
+    { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+    { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+    { name: 'proofs.ndjson.gz', data: gzipDeterministic(ndjson) },
+    { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+    { name: 'README.md', data: entries.get('README.md')! },
+  ]);
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Tests
 // ────────────────────────────────────────────────────────────────────────
@@ -505,6 +540,36 @@ describe('verifyBundle', () => {
     expect(report.inclusionProofs.ok).toBe(false);
     expect(report.inclusionProofs.failed).toBeGreaterThan(0);
     expect(report.inclusionProofs.firstFailure).toBe('row-0');
+  });
+
+  it('rejects a vacuous empty proofs file', async () => {
+    const report = await verifyBundle(rebuildWithProofs([]), {
+      noRekor: true,
+    });
+    expect(report.ok).toBe(false);
+    expect(report.inclusionProofs.failed).toBe(4);
+    expect(report.inclusionProofs.reason).toContain('no entry');
+  });
+
+  it('rejects a diagnostic status marker in place of a proof', async () => {
+    const base = buildFixtureBundle();
+    const proofs = base.proofs.map((proof) => ({ ...proof }));
+    proofs[0] = { rowId: 'row-0', status: 'not_yet_rooted' };
+    const report = await verifyBundle(rebuildWithProofs(proofs), {
+      noRekor: true,
+    });
+    expect(report.ok).toBe(false);
+    expect(report.inclusionProofs.reason).toContain('not_yet_rooted');
+  });
+
+  it('rejects duplicate proof entries for a row', async () => {
+    const base = buildFixtureBundle();
+    const report = await verifyBundle(
+      rebuildWithProofs([...base.proofs, { ...base.proofs[0]! }]),
+      { noRekor: true },
+    );
+    expect(report.ok).toBe(false);
+    expect(report.inclusionProofs.reason).toContain('duplicate proof');
   });
 
   it('detects a tampered manifest signature', async () => {
@@ -1011,7 +1076,7 @@ describe('verifyBundle', () => {
         // exercises multi-anchor DISPATCH + counting, not Rekor crypto
         // (covered by the dedicated suite below), so pass an explicit
         // rekorFetcher seam rather than a full signed Rekor entry.
-        rekorFetcher: async () => true,
+        anchorReceiptVerifier: async () => ({ ok: true }),
       });
       expect(report.ok).toBe(true);
       expect(report.rekor.ok).toBe(true);
@@ -1035,6 +1100,15 @@ describe('verifyBundle', () => {
       expect(report.rekor.ok).toBe(true);
       expect(report.rekor.checked).toBe(1);
       expect(report.rekor.failed).toBe(0);
+    });
+
+    it('fails closed when a root has no anchor receipt', async () => {
+      const zip = rebuildWithReceipts([], null);
+      const report = await verifyBundle(zip);
+      expect(report.ok).toBe(false);
+      expect(report.rekor.checked).toBe(1);
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toBe('missing_anchor_receipt');
     });
 
     it('flags an unknown provider as failed with reason=unknown_provider but still reports per-entry', async () => {
@@ -1080,6 +1154,19 @@ describe('verifyBundle', () => {
       expect(report.rekor.failed).toBe(1);
       expect(report.rekor.reason).toContain('s3');
       expect(report.rekor.reason).toContain('malformed');
+    });
+
+    it('fails closed for a well-formed s3 receipt without an online verifier', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 's3',
+          receipt: 's3:my-bucket:audit-roots/period.json:v123',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+      ]);
+      const report = await verifyBundle(zip);
+      expect(report.ok).toBe(false);
+      expect(report.rekor.reason).toContain('unverifiable_offline');
     });
 
     it('honours a caller-supplied anchorReceiptVerifier for ALL providers (overrides defaults)', async () => {
@@ -1141,6 +1228,7 @@ describe('verifyBundle', () => {
     function buildRekorReceipt(opts?: {
       tamperSet?: boolean;
       tamperProof?: boolean;
+      unrelatedRoot?: boolean;
     }): { receiptJson: string; publicKeyPem: string } {
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
         namedCurve: 'P-256',
@@ -1154,10 +1242,29 @@ describe('verifyBundle', () => {
         format: 'der',
       }) as Buffer;
       const logID = crypto.createHash('sha256').update(spkiDer).digest('hex');
-      const logIndex = 9001;
+      const logIndex = 0;
       const integratedTime = 1748131200;
+      const fixtureRoot = buildFixtureBundle().roots[0]!;
+      const rootHash = opts?.unrelatedRoot
+        ? Buffer.alloc(32, 0xee).toString('base64')
+        : fixtureRoot.rootHash;
       const body = Buffer.from(
-        JSON.stringify({ kind: 'hashedrekord', apiVersion: '0.0.1' }),
+        JSON.stringify({
+          apiVersion: '0.0.1',
+          kind: 'hashedrekord',
+          spec: {
+            data: {
+              hash: {
+                algorithm: 'sha256',
+                value: Buffer.from(rootHash, 'base64').toString('hex'),
+              },
+            },
+            signature: {
+              content: fixtureRoot.signature,
+              publicKey: { content: 'dGVzdC1rZXk=' },
+            },
+          },
+        }),
         'utf8',
       ).toString('base64');
 
@@ -1286,6 +1393,16 @@ describe('verifyBundle', () => {
       const report = await verifyBundle(zip, {});
       expect(report.rekor.ok).toBe(false);
       expect(report.rekor.reason).toContain('set_logid_unpinned');
+    });
+
+    it('FAILS a genuine but unrelated Rekor receipt', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        unrelatedRoot: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, { rekorPublicKeyPem: publicKeyPem });
+      expect(report.ok).toBe(false);
+      expect(report.rekor.reason).toContain('body_root_mismatch');
     });
   });
 
@@ -1606,8 +1723,8 @@ describe('verifyBundle', () => {
    *   - Tampered attestation signature → fails with `signature:` reason.
    *   - Tampered attestation orgId → fails with `org_mismatch`.
    *   - Mismatched per-key fingerprint → fails.
-   *   - Missing attestation entry (pre-AUDIT-30 bundle) → warn but
-   *     proceed (`missing_legacy`); overall bundle.ok stays true.
+   *   - Missing attestation entry fails closed unless legacy semantics are
+   *     explicitly requested.
    */
   describe('AUDIT-2026-05-30 — platform attestation', () => {
     /** Helper — sign with ECDSA-P256 and ensure low-s canonical form. */
@@ -1676,6 +1793,7 @@ describe('verifyBundle', () => {
       tamperSignature?: boolean;
       tamperFingerprint?: boolean;
       omitEntry?: boolean;
+      omitKeyVersion?: boolean;
     }): { zip: Buffer; platformPublicKeyDerB64: string } {
       const base = buildFixtureBundle();
       const entries = readBundleEntries(base.zip);
@@ -1710,6 +1828,7 @@ describe('verifyBundle', () => {
           revokedAt: null as string | null,
           issuedAt: '2026-05-01T00:00:00.000Z',
         }))
+        .filter(() => !opts.omitKeyVersion)
         .sort((a, b) => a.keyVersion - b.keyVersion);
 
       const attestation = {
@@ -1812,33 +1931,43 @@ describe('verifyBundle', () => {
       );
     });
 
-    it('treats a missing platform-attestation.json as legacy → warn but proceed', async () => {
+    it('rejects an attestation that omits a bundled key version', async () => {
       const { zip, platformPublicKeyDerB64 } =
-        buildBundleWithPlatformAttestation({ omitEntry: true });
-      const report = await verifyBundle(zip, {
+        buildBundleWithPlatformAttestation({ omitKeyVersion: true });
+      const report = await verifyBundleStrict(zip, {
         noRekor: true,
         platformPublicKeyDerB64,
       });
-      // Overall bundle still verifies (legacy bundles predate AUDIT-30).
-      expect(report.ok).toBe(true);
-      expect(report.platformAttestation.ok).toBe(true);
-      expect(report.platformAttestation.checked).toBe(0);
-      expect(report.platformAttestation.reason).toBe('missing_legacy');
+      expect(report.ok).toBe(false);
+      expect(report.platformAttestation.reason).toContain(
+        'keyversion_set_mismatch',
+      );
     });
 
-    it('treats an unpinned platform pubkey (placeholder mode) as warn-but-proceed', async () => {
-      // No `platformPublicKeyDerB64` override AND the bundled pin is
-      // still the empty placeholder — the verifier reports
-      // `placeholder_platform_key` and does NOT fail the bundle.
-      // We use the pristine fixture (no attestation entry) so the
-      // verifier short-circuits in placeholder mode before parsing
-      // anything.
+    it('fails closed when platform-attestation.json is missing', async () => {
+      const { zip, platformPublicKeyDerB64 } =
+        buildBundleWithPlatformAttestation({ omitEntry: true });
+      const report = await verifyBundleStrict(zip, {
+        noRekor: true,
+        platformPublicKeyDerB64,
+      });
+      expect(report.ok).toBe(false);
+      expect(report.platformAttestation.ok).toBe(false);
+      expect(report.platformAttestation.reason).toBe(
+        'platform_attestation_missing',
+      );
+    });
+
+    it('accepts a missing attestation only with explicit legacy opt-in', async () => {
       const { zip } = buildBundleWithTamper({});
-      const report = await verifyBundle(zip, { noRekor: true });
+      const report = await verifyBundleStrict(zip, {
+        noRekor: true,
+        allowLegacyUnattested: true,
+      });
       expect(report.ok).toBe(true);
       expect(report.platformAttestation.ok).toBe(true);
       expect(report.platformAttestation.reason).toBe(
-        'placeholder_platform_key',
+        'missing_legacy_explicitly_allowed',
       );
     });
   });
