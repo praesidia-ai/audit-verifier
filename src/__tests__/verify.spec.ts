@@ -1093,6 +1093,233 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * RA-05 (PROD15 adversarial re-attack) — residual HIGH found in
+   * `verifyManifest` and `verifyKeyBinding` after the PROD15 lifecycle-
+   * binding fix above.
+   *
+   * Gap 1: `verifyManifest` never checked the signing key's revocation
+   * status at all, unlike its `verifyRowSignatures` / `verifyRootSignatures`
+   * siblings. A holder of a compromised (honestly-revoked) key could sign a
+   * brand-new manifest — asserting any `orgId`/`from`/`to`/`rowCount`/
+   * `rootCount`/`keyVersions` they like — while leaving `public-keys.json`
+   * completely honest, and it would verify.
+   *
+   * Gap 2: the PROD15 lifecycle cross-check itself only ran
+   * `if (signedEntry.status !== undefined)`. A v2 manifest can legally omit
+   * `status` on one entry (the parser does not require it), which silently
+   * fell back to trusting the UNSIGNED `public-keys.json` alone for that
+   * entry — exactly the case PROD15 exists to close.
+   */
+  describe('RA-05 — verifyManifest must fail closed on a REVOKED signing key', () => {
+    function buildGap1ForgedBundle(): Buffer {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const activeKeyB64 = Buffer.from(base.manifestPublicKey).toString(
+        'base64',
+      );
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+
+      // A SEPARATE key the attacker holds, honestly REVOKED in both files.
+      const revokedKeypair = keypairFromSeed(Buffer.alloc(32, 42));
+      const revokedKeyB64 = Buffer.from(revokedKeypair.publicKey).toString(
+        'base64',
+      );
+
+      // Relabel the fixture's rows/roots onto keyVersion 2 (the ACTIVE key)
+      // — buildFixtureBundle hardcodes keyVersion 1, so free it up for the
+      // attacker's revoked key.
+      const rows = zlib
+        .gunzipSync(entries.get('rows.ndjson.gz')!)
+        .toString('utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      rows.forEach((r) => {
+        r.keyVersion = 2;
+      });
+      const roots = zlib
+        .gunzipSync(entries.get('roots.ndjson.gz')!)
+        .toString('utf8')
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      roots.forEach((r) => {
+        r.keyVersion = 2;
+      });
+
+      // Forge a fresh manifest signed under the REVOKED key (v1), while
+      // BOTH the signed manifest AND public-keys.json honestly agree v1 is
+      // REVOKED and v2 is ACTIVE — so `verifyKeyBinding`'s cross-check has
+      // nothing to catch. Only a direct revocation check on the manifest's
+      // OWN signing key can reject this.
+      const manifestSans = {
+        version: 2,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [
+          {
+            keyVersion: 1,
+            publicKey: revokedKeyB64,
+            status: 'REVOKED',
+            revokedAt: '2026-01-01T00:00:00.000Z',
+          },
+          {
+            keyVersion: 2,
+            publicKey: activeKeyB64,
+            status: 'ACTIVE',
+            revokedAt: null,
+          },
+        ],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: 'Ed25519' as const,
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(
+        manifestBytes,
+        revokedKeypair.privateKey,
+      );
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      const publicKeys = {
+        '1': {
+          publicKey: revokedKeyB64,
+          status: 'REVOKED',
+          revokedAt: '2026-01-01T00:00:00.000Z',
+        },
+        '2': { publicKey: activeKeyB64, status: 'ACTIVE', revokedAt: null },
+      };
+
+      const rowsNdjson = Buffer.from(
+        rows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const rootsNdjson = Buffer.from(
+        roots.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+
+      return writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+    }
+
+    it('closes RA-05 Gap 1: rejects a manifest signed by a REVOKED key even though rows/roots + keyBinding are all otherwise honest', async () => {
+      const zip = buildGap1ForgedBundle();
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        allowLegacyUnattested: true,
+      });
+
+      // Everything else about this forged bundle is genuinely consistent —
+      // proving the ONLY thing that can catch it is a direct revocation
+      // check on the manifest's own signing key.
+      expect(report.keyBinding.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.rootSignatures.ok).toBe(true);
+      // The manifest itself was signed under a REVOKED key → must fail.
+      expect(report.manifest.ok).toBe(false);
+      expect(report.manifest.reason).toBe('key_revoked');
+      expect(report.ok).toBe(false);
+    });
+
+    it('closes RA-05 Gap 2: a v2 manifest cannot skip the lifecycle cross-check by omitting `status` on an entry', async () => {
+      const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+
+      // A v2 manifest whose sole keyVersions entry OMITS `status` entirely.
+      // Structurally legal (`assertManifestStructure` does not require the
+      // field) but never genuinely produced — a real v2 exporter always
+      // stamps `status` on every entry in the same change that bumped the
+      // version to 2.
+      const manifestSans = {
+        version: 2,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [{ keyVersion: 1, publicKey: publicKeyB64 }],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      // public-keys.json says ACTIVE — before this fix, an omitted signed
+      // `status` trusted this file alone, so ANY value here would pass.
+      const publicKeys = {
+        '1': { publicKey: publicKeyB64, status: 'ACTIVE', revokedAt: null },
+      };
+
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        allowLegacyUnattested: true,
+      });
+      expect(report.keyBinding.ok).toBe(false);
+      expect(report.keyBinding.reason).toMatch(/key_status_mismatch/);
+      expect(report.ok).toBe(false);
+    });
+
+    it('preserves the v1 fallback for a TRUE legacy manifest (version: 1, no status anywhere)', async () => {
+      // Sanity/regression guard: `buildFixtureBundle()` produces a genuine
+      // v1 manifest (no status field on its sole keyVersions entry) with a
+      // bare-string `public-keys.json`. Neither Gap-1 nor Gap-2 hardening
+      // should touch this — it must keep verifying exactly as before.
+      const { zip } = buildFixtureBundle();
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(true);
+      expect(report.keyBinding.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+  });
+
+  /**
    * AUDIT-2026-05-09 — Multi-anchor receipt verification.
    *
    * The exporter now emits `anchorReceipts: [{provider, receipt,

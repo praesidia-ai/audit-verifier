@@ -496,6 +496,36 @@ function verifyManifest(
       reason: `manifest signing key version ${manifest.signatureKeyVersion} not in public-keys.json`,
     };
   }
+  // RA-05 (PROD15 re-attack) — Fail CLOSED on a manifest signed under a
+  // REVOKED key, mirroring `verifyRowSignatures` / `verifyRootSignatures`.
+  //
+  // The manifest is itself the signed document carrying `orgId`, `from`,
+  // `to`, `rowCount`, `rootCount` and the whole `keyVersions` set — including
+  // the very `status`/`revokedAt` fields the PROD15 `verifyKeyBinding` cross
+  // -check relies on. A holder of a compromised (revoked) key can mint a
+  // brand-new, validly-signed manifest asserting anything they like,
+  // including a `keyVersions[]` set that dishonestly re-labels their own
+  // key ACTIVE. Without this check, `verifyKeyBinding` would faithfully
+  // confirm `public-keys.json` matches that dishonest-but-signed manifest
+  // and the forgery would verify.
+  //
+  // Same reasoning as the row/root siblings applies to why there is no
+  // signed-before-revocation grace period here: although `generatedAt` IS
+  // part of the manifest's signed preimage (unlike a row's `signedAt`),
+  // that does not help — a key holder can sign a FRESH manifest with any
+  // `generatedAt` they choose, so a backdated timestamp is exactly as
+  // forgeable as an unsigned one. There is no self-contained way to tell a
+  // genuine pre-revocation manifest from a backdated forgery, so the
+  // conservative choice is to reject every REVOKED-key manifest signature
+  // unconditionally, exactly like `verifyRowSignatures` / `verifyRootSignatures`.
+  if (entry.status === 'REVOKED') {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: 'key_revoked',
+    };
+  }
   // Reconstruct the manifest-sans-signature envelope and canonicalize
   // it the same way the writer did.
   const signable = {
@@ -604,6 +634,30 @@ function verifyCompleteness(
  * now also require `status`/`revokedAt` to match; when it does not
  * (true v1 bundles), we fall back to trusting `public-keys.json` alone
  * so those bundles keep verifying.
+ *
+ * RA-05 (PROD15 re-attack) Gap 2 — the per-entry `status !== undefined`
+ * gate above was itself attacker-selectable: the exporter (AUDIT-2026-05-14,
+ * `bundle-exporter.service.ts`) bumps `manifest.version` to 2 in the SAME
+ * change that starts stamping `status`/`revokedAt` on every
+ * `keyVersions[]` entry, so a genuine v2 manifest ALWAYS carries a status
+ * for every key. A holder of a compromised key re-signing a fresh v2-shaped
+ * manifest could omit `status` on just that one entry (structurally legal —
+ * `assertManifestStructure` does not require it) to fall through to the
+ * lenient "trust public-keys.json alone" branch while still claiming
+ * `version: 2`. We now also require the lifecycle cross-check whenever
+ * `manifest.version >= 2`, regardless of whether the signed entry bothered
+ * to carry a `status`: an absent signed `status` on a v2 manifest can never
+ * equal `usedRecord.status` (which is always a defined enum), so it fails
+ * closed as `key_status_mismatch` rather than silently falling back. A
+ * TRUE v1 bundle (`manifest.version === 1`) that never carried the field at
+ * all is unaffected and keeps verifying under the original fallback — this
+ * does not (and structurally cannot) close an attacker who forges the
+ * ENTIRE bundle, including `manifest.version: 1` and a v1-shaped
+ * `public-keys.json`; that residual is the same trust limit `--allow-legacy
+ * -unattested` already accepts for genuinely old, pre-AUDIT-14 archives
+ * (see the package README / RA-05 Gap 2 discussion) and requires mandatory
+ * platform attestation to close, which is a documented, deliberate escape
+ * hatch this fix does not touch.
  */
 function verifyKeyBinding(
   manifest: BundleManifest,
@@ -682,7 +736,16 @@ function verifyKeyBinding(
     // to relabel a REVOKED key as ACTIVE (or clear revokedAt) must not
     // be able to resurrect that key's signatures merely because platform
     // attestation was skipped.
-    if (signedEntry.status !== undefined) {
+    //
+    // RA-05 Gap 2 — a v2 manifest (`manifest.version >= 2`) is REQUIRED to
+    // carry a status on every entry (the exporter change that introduced
+    // `status`/`revokedAt` is the same change that bumped the version), so
+    // an omitted `status` on a v2-labelled manifest is never legitimate.
+    // Force the cross-check to run in that case too — `usedRecord.status`
+    // is always a defined enum, so it can never equal an omitted `undefined`
+    // signed status, and the entry fails closed as `key_status_mismatch`
+    // instead of silently taking the true-v1 fallback.
+    if (manifest.version >= 2 || signedEntry.status !== undefined) {
       const usedRecord = publicKeys.get(ver);
       if (usedRecord === undefined || usedRecord.status !== signedEntry.status) {
         failed += 1;
