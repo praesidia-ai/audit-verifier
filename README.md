@@ -54,15 +54,27 @@ checks every cryptographic invariant the bundle commits to:
    `canonical_bytes || base64-decode(prev_row_hash)` — the row signature
    binds the row's chain position, byte-for-byte as the backend writer
    produces it. A row whose `prev_row_hash` is missing/malformed fails
-   closed.
-3. **Chain integrity** — `prev_row_hash` is recomputed from the previous
-   row's `(canonical_bytes || signature_bytes)` digest and matched
-   against the stored value. Bundles are **date-ranged** (hard-capped at
-   90 days), so the FIRST row's `prev_row_hash` is an opaque anchor into
-   the org's pre-range history — it is accepted, not required to be the
-   all-zero genesis. Internal linkage is enforced for every subsequent
-   row, so reorder/insert/mutate of a non-leading row still breaks a link;
-   leading truncation is caught by **completeness** (see 7).
+   closed. `ipAddress` is included in the canonical preimage IFF the wire
+   row object carries that key at all (present-with-`null` still counts as
+   present) — this mirrors `be-core`'s own conditional signing of
+   `ipAddress` only for rows produced at/after its
+   `IP_ADDRESS_SIGNABLE_CUTOVER_AT` activation, with no cutover-date
+   knowledge required in this verifier.
+3. **Chain integrity** — the true chain order is reconstructed from the
+   cryptographic links themselves (each row's forward link vs. the next
+   row's declared `prev_row_hash`), **not** from the bundle's on-disk row
+   order. `rows.ndjson.gz` is exported ordered by `(signedAt, id)`, which
+   does not always match the actual signing order when two rows in the
+   same org share a `signedAt` millisecond (a same-transaction signing
+   burst is the realistic case, not an edge case) — trusting file order in
+   that case would report a false chain break on an honest bundle. Bundles
+   are **date-ranged** (hard-capped at 90 days), so the ONE row with no
+   in-bundle predecessor is accepted as an opaque anchor into the org's
+   pre-range history, not required to be the all-zero genesis. Any other
+   row missing an in-bundle predecessor, or two rows claiming the same
+   predecessor (a fork), fails closed; leading truncation is caught by
+   **completeness** (see 7) and per-period trailing truncation is caught
+   by **root coverage** (see 10).
 4. **Merkle root signatures** — every root in `roots.ndjson.gz` is
    re-canonicalized and verified.
 5. **Inclusion proofs** — exactly one valid proof is required for every
@@ -81,13 +93,30 @@ checks every cryptographic invariant the bundle commits to:
    The pinned key
    is baked in at build time (never fetched at verify time); a sovereign
    Rekor instance can pass its own key via `verifyBundle`'s
-   `rekorPublicKeyPem` option. Skipped only via `--no-rekor`.
+   `rekorPublicKeyPem` option.
+   - **A root with no anchor receipt at all still fails closed** — an
+     unwitnessed root does not get the benefit of the doubt. The `reason`
+     distinguishes two different situations rather than reporting them
+     identically: `no_external_witness` means every root in the bundle is
+     unanchored (consistent with a deployment that has never enabled
+     Rekor/S3 anchoring); `anchor_missing_for_partially_anchored_bundle`
+     means only SOME roots lack a receipt while others have one — a much
+     narrower, more concerning gap (e.g. an anchoring outage or a deleted
+     receipt). These are different findings; do not treat them the same.
+   - `--no-rekor` skips the check entirely (`reason:
+     'rekor_check_skipped_by_caller: ...'`) — this is a CALLER opt-out, not
+     a verdict about whether anchoring exists. `praesidia-verify`'s output
+     prints an explicit `NOTE:` line whenever this flag was used, so a
+     skimmed `RESULT: OK` cannot be mistaken for "anchoring was verified".
 7. **Completeness** — the number of rows / roots actually present must
    equal the SIGNED `manifest.rowCount` / `manifest.rootCount`. This
-   fails closed on a trailing-truncation attack, where an attacker
-   deletes the last N rows (and their proofs): the surviving prefix
-   still chains and still proves, but the signed counts no longer match
-   what was handed to the verifier.
+   fails closed on a whole-bundle trailing-truncation attack, where an
+   attacker deletes the last N rows (and their proofs) and the manifest
+   is NOT re-signed to match: the surviving prefix still chains and still
+   proves, but the aggregate signed counts no longer match what was
+   handed to the verifier. This does **not**, by itself, catch a
+   suffix deleted before a HONEST re-export recomputes a smaller count —
+   see **root coverage** (10).
 8. **Platform key-binding attestation** — `platform-attestation.json` is
    checked against a trusted platform key. The current source distribution
    does not embed a deployment-specific key, so operators must pass the key
@@ -100,11 +129,99 @@ checks every cryptographic invariant the bundle commits to:
    local/central-header disagreement, invalid UTF-8 names, CRC mismatches,
    unsupported encryption, malformed ZIP64, and excessive decompression are
    rejected before bundle contents are trusted.
+10. **Root coverage** — for every Merkle root whose full period lies
+    inside the bundle's declared `[from, to)` date range, the number of
+    bundle rows whose `signedAt` falls in that period, AND the number of
+    proof entries pointing at that root, must both equal the root's own
+    SIGNED `rowCount`. A Merkle root is signed and Rekor-anchored
+    independently of the manifest, at anchor time — if rows are deleted
+    from the underlying table AFTER a period's root was anchored but
+    BEFORE the bundle is (re-)exported, the exporter's manifest honestly
+    reflects the new (smaller) total and **completeness alone would
+    pass**, while the untouched, already-anchored root still commits to
+    the original, larger count. This component is what actually catches
+    that class of deletion; a boundary root that only partially overlaps
+    the bundle's date range is exempted (a genuine ranged export
+    legitimately ships fewer rows for it, since rows outside `[from, to)`
+    are never exported).
 
 S3 anchor receipts cannot be proven offline from their locator string alone.
 The library therefore fails closed for S3 by default; callers can provide an
 `anchorReceiptVerifier` that validates the object/version against their S3
 trust boundary.
+
+`manifest.version` is checked against an explicit ceiling
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 2) — a bundle declaring a newer
+version than this build implements is rejected as a bundle-format error
+(exit code 2) rather than silently verified under the wrong (older) rules.
+Never bump the ceiling without landing real support for the new version's
+fields in the same change.
+
+## What this verifier does — and does NOT — prove
+
+**Does prove**, when it reports `ok: true` for a given bundle:
+
+- Every row, root, and the manifest are validly signed by a key present in
+  the bundle's own signed key set, and that key was not marked `REVOKED` at
+  verification time.
+- The rows form a single, internally consistent hash chain (order-independent
+  reconstruction — see invariant 3) with no fork, no orphan, and no broken
+  link, up to one accepted opaque anchor for a date-ranged export.
+- No row or Merkle root has been added, removed from the middle, or had its
+  content altered since it was signed.
+- For every Merkle-root period fully inside the bundle's declared date
+  range, the number of rows and proofs present matches what that root's own
+  signature committed to at anchor time (invariant 10) — this is what lets
+  the verifier catch a deleted trailing suffix, not just a truncated
+  archive.
+- If Rekor/S3 anchoring is present and not skipped via `--no-rekor`, that
+  the anchor receipt is a genuine, cryptographically valid transparency-log
+  entry bound to the exact root hash in the bundle.
+- If `platform-attestation.json` is present (or `--allow-legacy-unattested`
+  is NOT passed), that Praesidia's platform — not just the tenant — vouched
+  for the key-to-org binding.
+
+**Does NOT prove**, even on `ok: true`:
+
+- **That every action was captured in the first place.** A signing outage
+  (governance mode `off`, or a failed sign under `observe`) can produce an
+  invisible hole: an unsigned row is invisible to the chain, the Merkle
+  roots, and the exported bundle alike, with no marker in the artifact. Two
+  hours of signing downtime and two hours of deleted rows currently look
+  identical to this verifier.
+- **That a not-yet-anchored (or boundary/partially-anchored) period wasn't
+  truncated.** Root coverage (10) only binds a root's committed count once
+  that root exists and its FULL period is inside the bundle's range. The
+  newest, not-yet-rooted tail of an org's history, and a boundary root that
+  only partially overlaps the requested range, have no independent size
+  commitment yet — closing that residual window requires the producer to
+  anchor a periodic cumulative checkpoint, which this verifier does not
+  receive today.
+- **That Rekor/S3 anchoring exists at all**, unless you read the `rekor`
+  component specifically. A bundle can report overall `ok: true` while
+  `rekor.reason` says `no_external_witness` (this deployment has anchoring
+  off) — that is a materially weaker guarantee than an anchored bundle, and
+  `--no-rekor` weakens it further by not checking at all. Read the `rekor`
+  component, not just the top-level `ok`, before treating a bundle as
+  Rekor-witnessed.
+- **That a REVOKED key's pre-revocation signatures are trustworthy.** This
+  verifier rejects EVERY signature made under a revoked key, including ones
+  that were genuinely signed before revocation — because `signedAt` is not
+  itself part of the signed bytes, a backdated forgery and a genuine
+  pre-revocation signature are indistinguishable without an external
+  timestamp proof, which this verifier does not currently cross-check
+  against Rekor's own inclusion timestamp. The practical effect: revoking a
+  tenant signing key after a suspected compromise makes that key's entire
+  history unverifiable going forward, including the legitimate part.
+- **That privileged, non-audit-logged actions didn't happen.** This
+  verifier can only attest to what is IN the bundle. Whether every
+  security-relevant mutation in the product is actually written to
+  `audit_logs` in the first place is a `be`-side coverage question, not
+  something an offline bundle verifier can detect.
+- **Anything about network reachability, uptime, or `be`'s live behavior.**
+  This is a static, offline artifact check. It says nothing about whether
+  the platform is currently signing correctly, whether retention jobs are
+  about to destroy signed data, or any other live operational property.
 
 ## Architecture
 
@@ -127,6 +244,33 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.4.0 (PROD16)
+
+- **New `rootCoverage` component** closes the suffix-deletion gap: a
+  Merkle root's signed `rowCount` is now bound to the rows/proofs actually
+  present in the bundle for every fully-contained period. Before this, a
+  root anchored before rows were deleted (and never recomputed) would
+  verify `ok:true` even though the rows it committed to no longer existed.
+- **Chain verification (`chain`) no longer depends on the bundle's on-disk
+  row order.** The true chain is now reconstructed from the cryptographic
+  links themselves, closing a false-positive "chain break" that could fire
+  on an honest bundle whenever two rows in the same org share a `signedAt`
+  millisecond (the exporter orders by `(signedAt, id)`, not by the actual
+  signing/chain order).
+- **`manifest.version` now has an explicit ceiling.** A manifest declaring
+  a version newer than this build implements is rejected as a bundle-format
+  error instead of being silently verified under the wrong (older) rules.
+- **`ipAddress` is now a recognized (optional) signable row field.** Rows
+  produced under `be-core`'s `IP_ADDRESS_SIGNABLE_CUTOVER_AT` activation
+  now verify correctly; rows without the field are unaffected.
+- **Rekor "no receipt" messaging is now specific.** `no_external_witness`
+  (no root in the bundle is anchored) and
+  `anchor_missing_for_partially_anchored_bundle` (some roots are anchored,
+  this one isn't) are now distinct reason codes instead of one generic
+  `missing_anchor_receipt`. `--no-rekor` now prints an explicit CLI `NOTE:`
+  line so a skimmed `RESULT: OK` cannot be mistaken for a verified anchor.
+- New `VerifyReport.rootCoverage` field (additive).
 
 ### 0.3.0
 

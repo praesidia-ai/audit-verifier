@@ -36,6 +36,9 @@ jobs:
       - name: Build (tsc)
         run: npm run build
 
+      - name: Trust-anchor CI regression check (PROD16 FINDING 5)
+        run: node scripts/check-trust-anchor-ci.mjs
+
       - name: Test (vitest)
         run: npx vitest run
 

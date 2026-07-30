@@ -1,6 +1,6 @@
 {
   "name": "@praesidia/audit-verifier",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Offline verifier CLI for Praesidia compliance bundles. Zero runtime dependencies.",
   "license": "Apache-2.0",
   "type": "module",
@@ -27,6 +27,7 @@
   "scripts": {
     "build": "tsc",
     "prepack": "npm run build && node scripts/assert-release-trust-anchor.mjs",
+    "check:trust-anchor-ci": "node scripts/check-trust-anchor-ci.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
