@@ -24,12 +24,21 @@
  *                                 verified with `publicKeys[row.keyVersion]`.
  *  3. Chain integrity           — each row's `prevRowHash` matches
  *                                 `sha256(prev.canonical || prev.sigBytes)`
- *                                 of its in-bundle predecessor. The FIRST
- *                                 row's `prevRowHash` is an opaque anchor
- *                                 into the org's pre-range history (bundles
- *                                 are date-ranged, not genesis-rooted), so
- *                                 it is accepted, not required to be the
- *                                 all-zero genesis (BUGHUNT-SDK-02).
+ *                                 of its TRUE in-bundle predecessor, found
+ *                                 by following the cryptographic links
+ *                                 themselves (PROD16 F10) rather than by
+ *                                 trusting the bundle's on-disk row order —
+ *                                 be-core's exporter orders rows by
+ *                                 `(signedAt, id)`, which does not always
+ *                                 match the actual `chainSeq` order, so
+ *                                 file-order trust produced false chain-break
+ *                                 verdicts on honest bundles. The ONE row
+ *                                 with no in-bundle predecessor is an opaque
+ *                                 anchor into the org's pre-range history
+ *                                 (bundles are date-ranged, not
+ *                                 genesis-rooted), so it is accepted, not
+ *                                 required to be the all-zero genesis
+ *                                 (BUGHUNT-SDK-02).
  *  4. Merkle root signatures    — canonical-JSON over
  *                                 `{rootHash, periodStart, periodEnd, rowCount}`
  *                                 verified with `publicKeys[root.keyVersion]`.
@@ -135,6 +144,16 @@ interface BundleRow {
   keyVersion: number;
   signedAt: string | null;
   prevRowHash: string;
+  /**
+   * PROD16 F6 (be-compliance) — Signed only for rows produced at/after the
+   * be-side `IP_ADDRESS_SIGNABLE_CUTOVER_AT` activation. Optional/absent
+   * on the wire for every row signed before that cutover (and for all
+   * pre-AUDIT-14 bundles). See {@link signableRow} — the verifier includes
+   * this key in the canonical preimage IFF the wire row actually carries
+   * it, mirroring `audit-canonical.helper.ts`'s own conditional shape
+   * without needing to know the cutover instant.
+   */
+  ipAddress?: string | null;
   /**
    * AUDIT-2026-05-01 — Per-row signature algorithm tag. Optional so
    * pre-AUDIT-01 bundles (which only carried `manifest.signatureAlgorithm`)
@@ -253,6 +272,26 @@ export interface VerifyReport {
    * attestation (which stays warn-but-proceed when absent / placeholder).
    */
   keyBinding: ComponentResult;
+  /**
+   * PROD16 (be-compliance F5 / audit-verifier's half of the same finding).
+   *
+   * `verifyChain` only asserts links between rows that are PRESENT in the
+   * bundle — a back-linked chain has no forward pointer, so deleting a
+   * TRAILING suffix of an org's rows (with no successor left in the
+   * bundle to notice a broken link) is invisible to it. `verifyInclusionProofs`
+   * only proves that every row it IS given proves into its root — Merkle
+   * proofs are existence proofs, not absence proofs. Neither catches "a
+   * root's SIGNED `rowCount` says N rows existed in this period, and the
+   * bundle now contains fewer than N of them."
+   *
+   * This component binds each root's signed `rowCount` to how many of the
+   * bundle's own rows/proof-entries actually fall inside that root's
+   * period, for every period fully contained in the bundle's declared
+   * `[from, to)` range (boundary periods that only partially overlap the
+   * range are exempted — a genuine ranged export legitimately ships fewer
+   * rows for those, since rows outside `[from, to)` are never exported).
+   */
+  rootCoverage: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -325,6 +364,25 @@ export interface VerifyOptions {
    */
   allowLegacyUnattested?: boolean;
 }
+
+/**
+ * PROD16 F6 (be-compliance) — Explicit version negotiation.
+ *
+ * `manifest.version` was previously accepted with a floor (`>= 1`) but no
+ * ceiling — any future schema version parsed and verified positionally
+ * against TODAY's field set, silently. That is exactly how the
+ * `IP_ADDRESS_SIGNABLE_CUTOVER_AT` skew was reachable: a be-side signable
+ * shape change with no matching verifier release would not even be
+ * detectable as "a shape this verifier doesn't understand" — it would
+ * just verify wrong (or, worse, appear to verify while silently omitting a
+ * signed field this build has never heard of). A manifest version beyond
+ * what this build implements now fails LOUDLY, as a bundle-format error,
+ * instead of being interpreted under the wrong rules.
+ *
+ * Bump this alongside adding real support for the new version's fields —
+ * never bump it "ahead of" support just to silence this check.
+ */
+const MAX_SUPPORTED_MANIFEST_VERSION = 2;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -444,6 +502,12 @@ export async function verifyBundle(
   // the SIGNED `manifest.keyVersions` set.
   const keyBindingResult = verifyKeyBinding(manifest, publicKeysRaw, publicKeys);
 
+  // 11) PROD16 — Root row-coverage: bind each fully-contained root's
+  // SIGNED rowCount to the bundle's own row/proof counts for that period,
+  // closing the trailing-suffix-deletion gap `completeness` cannot see
+  // (see the `rootCoverage` field doc comment above).
+  const rootCoverageResult = verifyRootCoverage(manifest, rows, roots, proofs);
+
   const ok =
     manifestResult.ok &&
     rowSigResult.ok &&
@@ -453,7 +517,8 @@ export async function verifyBundle(
     rekorResult.ok &&
     platformResult.ok &&
     completenessResult.ok &&
-    keyBindingResult.ok;
+    keyBindingResult.ok &&
+    rootCoverageResult.ok;
 
   return {
     ok,
@@ -466,6 +531,7 @@ export async function verifyBundle(
     platformAttestation: platformResult,
     completeness: completenessResult,
     keyBinding: keyBindingResult,
+    rootCoverage: rootCoverageResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -801,6 +867,98 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0;
 }
 
+/** First index in a sorted ascending array with value >= target. */
+function lowerBound(sorted: number[], target: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (sorted[mid]! < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * PROD16 (be-compliance F5(a) / audit-verifier's half of the same finding).
+ * See the `rootCoverage` field doc comment on {@link VerifyReport} for the
+ * full rationale. Uses independent binary-search counts per root (not a
+ * shared advancing pointer) so the result is correct even if a forged
+ * bundle declares overlapping root periods.
+ */
+function verifyRootCoverage(
+  manifest: BundleManifest,
+  rows: BundleRow[],
+  roots: BundleRoot[],
+  proofs: BundleProofEntry[],
+): ComponentResult {
+  const fromMs = Date.parse(manifest.from);
+  const toMs = Date.parse(manifest.to);
+
+  const proofCountByRootHash = new Map<string, number>();
+  for (const proof of proofs) {
+    if (typeof proof.rootHash === 'string') {
+      proofCountByRootHash.set(
+        proof.rootHash,
+        (proofCountByRootHash.get(proof.rootHash) ?? 0) + 1,
+      );
+    }
+  }
+
+  const rowTimes: number[] = [];
+  for (const row of rows) {
+    if (typeof row.signedAt === 'string') {
+      const t = Date.parse(row.signedAt);
+      if (!Number.isNaN(t)) rowTimes.push(t);
+    }
+  }
+  rowTimes.sort((a, b) => a - b);
+
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+
+  for (const root of roots) {
+    const periodStartMs = Date.parse(root.periodStart);
+    const periodEndMs = Date.parse(root.periodEnd);
+    // Only assert full coverage for periods entirely inside the bundle's
+    // declared range — a boundary period legitimately ships fewer rows
+    // than its full rowCount, since rows outside [from, to) are never
+    // exported (see bundle-exporter.service.ts's root-selection query).
+    if (!(periodStartMs >= fromMs && periodEndMs <= toMs)) {
+      continue;
+    }
+    checked += 1;
+    const rowsInPeriod =
+      lowerBound(rowTimes, periodEndMs) - lowerBound(rowTimes, periodStartMs);
+    if (rowsInPeriod !== root.rowCount) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = root.id;
+        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${rowsInPeriod} rows with signedAt inside its period — a fully-anchored period must not lose rows`;
+      }
+      continue;
+    }
+    const proofsForRoot = proofCountByRootHash.get(root.rootHash) ?? 0;
+    if (proofsForRoot !== root.rowCount) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = root.id;
+        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${proofsForRoot} proof entries referencing it`;
+      }
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
 function verifyRowSignatures(
   rows: BundleRow[],
   publicKeys: Map<number, PublicKeyRecord>,
@@ -907,53 +1065,129 @@ function verifyRowSignatures(
   };
 }
 
+/**
+ * PROD16 F10 (be-compliance) — reconstruct the true chain order from the
+ * cryptographic links themselves, NOT from the bundle's on-disk row order.
+ *
+ * Before this fix, `verifyChain` trusted `rows.ndjson.gz`'s file order and
+ * compared each row's `prevRowHash` to `computeChainLink(previousArrayEntry)`.
+ * The producer orders rows by `(signedAt, id)` while the chain is actually
+ * built in `chainSeq` order (a DB sequence). Two rows in the same org
+ * sharing a `signedAt` millisecond — the expected case for
+ * `PendingSignatureDrainService`'s same-transaction signing bursts, not an
+ * edge case — are then ordered by random UUID `id`, so an HONEST bundle has
+ * roughly even odds of being emitted in reverse chain order and reporting a
+ * false `prev_row_hash does not chain to previous row`. A verifier that
+ * cries tamper on good evidence is nearly as damaging as one that misses
+ * real tampering.
+ *
+ * The fix removes the file-order dependency entirely: every row's forward
+ * chain-link (`computeChainLink`, the value ITS successor must declare as
+ * `prevRowHash`) is computed once and indexed. The true predecessor of any
+ * row is then found by that value, regardless of where either row sits in
+ * the array. This is strictly MORE attack-resistant than the old
+ * position-based check (an attacker gains nothing from reordering the
+ * ndjson lines) and does not need `be` to emit `chainSeq` on the wire.
+ *
+ * A well-formed bundle's rows form exactly one linked chain: exactly one
+ * row has no in-bundle predecessor (BUGHUNT-SDK-02's opaque range anchor),
+ * and following successor links from it visits every row exactly once.
+ * Two rows ever declaring the identical `prevRowHash` (a fork — two rows
+ * both claiming to succeed the same predecessor) fails closed immediately.
+ */
 function verifyChain(rows: BundleRow[]): ComponentResult {
-  let failed = 0;
-  let checked = 0;
-  let firstFailure: string | undefined;
-  let reason: string | undefined;
-  let prev: BundleRow | null = null;
-  for (const row of rows) {
-    // BUGHUNT-SDK-02 — the FIRST bundle row's `prevRowHash` is an OPAQUE
-    // ANCHOR into the org's pre-range history, NOT necessarily the genesis
-    // hash. Bundles are date-ranged and hard-capped at 90 days
-    // (`MAX_RANGE_DAYS`), so a bundle for any org older than 90 days
-    // CANNOT begin at the org's genesis row — its first row's `prevRowHash`
-    // is `sha256(canonical(predecessor) || predecessor.sig)` for a
-    // predecessor whose `signedAt < from` and is therefore absent from the
-    // bundle. Requiring the first row to chain to `GENESIS_PREV_ROW_HASH`
-    // falsely FAILED essentially every real ranged export.
-    //
-    // We now enforce internal linkage ONLY for rows [1..] — reorder,
-    // insert, or mutation of any non-leading row still breaks a link.
-    // Tamper resistance for the range is preserved elsewhere:
-    //   - Leading truncation (dropping the first K rows) is caught by
-    //     `completeness` (rowsSeen < signed manifest.rowCount).
-    //   - A forged first row needs a valid row signature, which binds
-    //     `prevRowHash` into the signed preimage (AUDIT-SDK-01), so the
-    //     anchor cannot be swapped freely.
-    if (prev) {
-      const expected = computeChainLink(prev);
-      checked += 1;
-      if (row.prevRowHash !== expected) {
-        failed += 1;
-        if (!firstFailure) {
-          firstFailure = row.id;
-          reason = 'prev_row_hash does not chain to previous row';
-        }
-      }
-    }
-    prev = row;
+  if (rows.length === 0) {
+    return { ok: true, checked: 0, failed: 0 };
   }
+
+  // Every row's OWN forward chain-link — the value its true successor (if
+  // any, and if present in this bundle) must declare as `prevRowHash`.
+  const chainLinkToRow = new Map<string, BundleRow>();
+  for (const row of rows) {
+    const link = computeChainLink(row);
+    if (link !== null && !chainLinkToRow.has(link)) {
+      chainLinkToRow.set(link, row);
+    }
+  }
+
+  // Group rows by their OWN declared `prevRowHash`. Used both to find each
+  // row's true predecessor (by value, not position) and to detect forks.
+  const byDeclaredPrev = new Map<string, BundleRow[]>();
+  for (const row of rows) {
+    if (typeof row.prevRowHash === 'string') {
+      const arr = byDeclaredPrev.get(row.prevRowHash) ?? [];
+      arr.push(row);
+      byDeclaredPrev.set(row.prevRowHash, arr);
+    }
+  }
+
+  // Fork check: two DIFFERENT rows must never declare the identical
+  // prevRowHash — that would mean two rows both claim to be the immediate
+  // successor of the same predecessor (or both claim to be the bundle's
+  // leading anchor row).
+  for (const claimants of byDeclaredPrev.values()) {
+    if (claimants.length > 1) {
+      return {
+        ok: false,
+        checked: rows.length,
+        failed: claimants.length - 1,
+        firstFailure: claimants[1]!.id,
+        reason: `chain fork: rows ${claimants.map((r) => r.id).join(', ')} all declare the same prevRowHash`,
+      };
+    }
+  }
+
+  // Rows with no in-bundle predecessor. Exactly one is expected (the
+  // leading row's opaque anchor); any other count means the rows do not
+  // form a single connected chain.
+  const headCandidates = rows.filter(
+    (row) =>
+      typeof row.prevRowHash !== 'string' ||
+      !chainLinkToRow.has(row.prevRowHash),
+  );
+  if (headCandidates.length !== 1) {
+    return {
+      ok: false,
+      checked: rows.length,
+      failed: Math.max(1, headCandidates.length),
+      firstFailure: (headCandidates[1] ?? headCandidates[0] ?? rows[0])!.id,
+      reason:
+        headCandidates.length === 0
+          ? 'chain has no identifiable leading row (cycle or corrupted links)'
+          : 'prev_row_hash does not chain to previous row',
+    };
+  }
+
+  // Walk forward from the unique head; a fork or an unreachable row would
+  // otherwise slip past the checks above.
+  let current: BundleRow | undefined = headCandidates[0];
+  const visited = new Set<string>();
+  let steps = 0;
+  while (current) {
+    visited.add(current.id);
+    steps += 1;
+    const link = computeChainLink(current);
+    current = link !== null ? byDeclaredPrev.get(link)?.[0] : undefined;
+  }
+  if (visited.size !== rows.length) {
+    const orphan = rows.find((r) => !visited.has(r.id));
+    return {
+      ok: false,
+      checked: rows.length,
+      failed: rows.length - visited.size,
+      firstFailure: orphan?.id,
+      reason:
+        'row is not reachable from the bundle chain head (broken or forked link)',
+    };
+  }
+
   return {
-    ok: failed === 0,
-    // `checked` counts the inter-row link assertions actually made
-    // (rows.length - 1, or 0 for an empty/single-row bundle); the first
-    // row's anchor is accepted, not asserted.
-    checked,
-    failed,
-    ...(firstFailure !== undefined ? { firstFailure } : {}),
-    ...(reason !== undefined ? { reason } : {}),
+    ok: true,
+    // Number of inter-row link assertions actually made: nodes visited
+    // minus the head (whose anchor is accepted, not asserted) — 0 for a
+    // single-row bundle, matching the pre-fix semantics.
+    checked: Math.max(0, steps - 1),
+    failed: 0,
   };
 }
 
@@ -1191,21 +1425,53 @@ async function verifyRekorReceipts(
       ok: true,
       checked: 0,
       failed: 0,
-      reason: 'skipped via --no-rekor',
+      // PROD16 F8 (be-compliance) — `ok:true` here must NEVER be read as
+      // "anchoring was verified". The caller explicitly chose not to
+      // check the external Sigstore/S3 witness at all; this bundle's
+      // pass/fail rests entirely on the tenant + platform signatures
+      // above, with no independent bound on how long ago the roots could
+      // have been forged. Distinct, on purpose, from `no_external_witness`
+      // below (a PRODUCER configuration fact) — this one is a CALLER
+      // choice.
+      reason:
+        'rekor_check_skipped_by_caller: --no-rekor was passed — the external Sigstore witness was NOT checked. This does not mean anchoring is absent or present; it means this run did not look.',
     };
   }
+  if (roots.length === 0) {
+    return { ok: true, checked: 0, failed: 0 };
+  }
+
+  const perRoot = roots.map((root) => ({
+    root,
+    entries: collectAnchorEntries(root),
+  }));
+  const unanchoredCount = perRoot.filter((r) => r.entries.length === 0).length;
+
   let checked = 0;
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
-  for (const root of roots) {
-    const entries = collectAnchorEntries(root);
+  for (const { root, entries } of perRoot) {
     if (entries.length === 0) {
       checked += 1;
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
-        reason = 'missing_anchor_receipt';
+        // PROD16 F8 — distinguish "no witness was ever configured for
+        // this bundle" (EVERY root is unanchored — consistent with a
+        // deployment shipping `FEATURE_REKOR_ANCHOR=false`, be-core's
+        // current default) from "a gap in an otherwise-anchored
+        // history" (some roots in THIS bundle ARE anchored, this one is
+        // not — a narrower, more concerning anomaly, e.g. an anchoring
+        // outage or a deleted receipt). Both still fail closed — an
+        // unwitnessed root does not get the benefit of the doubt — but
+        // an auditor needs to know which situation they are looking at;
+        // they are not the same finding and should not produce the same
+        // undifferentiated message.
+        reason =
+          unanchoredCount === perRoot.length
+            ? 'no_external_witness: no root in this bundle carries an anchor receipt at all — this looks like external anchoring was never enabled for this org/deployment (or was off for this export), not a gap in existing coverage. Tenant/platform signatures are unaffected, but tamper cannot be bounded against an independent transparency log.'
+            : `anchor_missing_for_partially_anchored_bundle: root ${root.id} has no anchor receipt while ${perRoot.length - unanchoredCount} other root(s) in this bundle do — this looks like a HOLE in an otherwise-anchored history, not a global witness-off configuration.`;
       }
       continue;
     }
@@ -1658,11 +1924,25 @@ function isIsoDate(value: unknown): value is string {
 }
 
 function assertManifestStructure(manifest: BundleManifest): void {
+  if (!manifest || typeof manifest !== 'object') {
+    throw new Error('manifest.json has an invalid structure');
+  }
+  // PROD16 F6 — explicit, non-positional version negotiation: fail loudly
+  // on a manifest version newer than this build understands, rather than
+  // silently verifying it against today's (possibly wrong) field set.
   if (
-    !manifest ||
-    typeof manifest !== 'object' ||
     !Number.isSafeInteger(manifest.version) ||
     manifest.version < 1 ||
+    manifest.version > MAX_SUPPORTED_MANIFEST_VERSION
+  ) {
+    throw new Error(
+      Number.isSafeInteger(manifest.version) &&
+        manifest.version > MAX_SUPPORTED_MANIFEST_VERSION
+        ? `manifest.json declares version ${manifest.version}, which is newer than the ${MAX_SUPPORTED_MANIFEST_VERSION} this @praesidia/audit-verifier build supports — upgrade the verifier before trusting this bundle`
+        : 'manifest.json has an invalid structure',
+    );
+  }
+  if (
     typeof manifest.orgId !== 'string' ||
     manifest.orgId.length === 0 ||
     !isIsoDate(manifest.from) ||
@@ -1770,9 +2050,23 @@ function assertProofsStructure(proofs: BundleProofEntry[]): void {
   }
 }
 
-/** Pull the 11 signable fields out of a bundle row (mirrors AGV-030). */
+/**
+ * Pull the signable fields out of a bundle row (mirrors AGV-030's 11-field
+ * base shape).
+ *
+ * PROD16 F6 (be-compliance) — `ipAddress` is included IFF the wire row
+ * object actually carries the key (`'ipAddress' in row`), NOT merely if
+ * its value is non-null. `canonicalJson` treats an ABSENT key as omitted
+ * from the signed bytes but a key PRESENT with value `null` as
+ * `"ipAddress":null` — so this exactly reproduces be-core's own
+ * conditional signable shape (`audit-canonical.helper.ts` only adds the
+ * key at all once `signedAt >= IP_ADDRESS_SIGNABLE_CUTOVER_AT`) without
+ * the verifier ever needing to know the cutover instant. Rows signed
+ * before the cutover (and every pre-AUDIT-14 row) simply never carry the
+ * key on the wire, so the 11-field preimage is unchanged for them.
+ */
 function signableRow(row: BundleRow): Record<string, unknown> {
-  return {
+  const signable: Record<string, unknown> = {
     organizationId: row.organizationId,
     action: row.action,
     actorId: row.actorId,
@@ -1785,6 +2079,10 @@ function signableRow(row: BundleRow): Record<string, unknown> {
     details: row.details,
     createdAt: row.createdAt,
   };
+  if ('ipAddress' in row) {
+    signable.ipAddress = row.ipAddress ?? null;
+  }
+  return signable;
 }
 
 /**

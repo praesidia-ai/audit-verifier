@@ -1415,7 +1415,59 @@ describe('verifyBundle', () => {
       expect(report.ok).toBe(false);
       expect(report.rekor.checked).toBe(1);
       expect(report.rekor.failed).toBe(1);
-      expect(report.rekor.reason).toBe('missing_anchor_receipt');
+      // PROD16 F8 — every root in this (single-root) bundle is
+      // unanchored, so this is the "no external witness configured at
+      // all" case, distinct from a partial-coverage gap.
+      expect(report.rekor.reason).toContain('no_external_witness');
+    });
+
+    it('PROD16 F8 — distinguishes a partial-coverage gap from "no witness ever configured"', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const anchoredRoot: FixtureRoot = {
+        ...base.roots[0]!,
+        anchorReceipts: [
+          {
+            provider: 'rekor',
+            receipt: '{"logIndex":1}',
+            anchoredAt: '2026-05-01T01:00:00.000Z',
+          },
+        ],
+      };
+      const unanchoredRoot: FixtureRoot = {
+        ...base.roots[0]!,
+        id: 'root-2',
+        rootHash: Buffer.alloc(32, 5).toString('base64'),
+        anchorReceipts: [],
+        anchorReceipt: null,
+      };
+      const rootsNdjson = Buffer.from(
+        [anchoredRoot, unanchoredRoot]
+          .map((r) => JSON.stringify(r))
+          .join('\n') + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      // Only `report.rekor.*` is asserted here — the fabricated second
+      // root is not signed/proved and other components are expected to
+      // disagree; this test isolates the rekor-message distinction only.
+      const report = await verifyBundle(zip, {
+        anchorReceiptVerifier: async () => ({ ok: true }),
+      });
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toContain(
+        'anchor_missing_for_partially_anchored_bundle',
+      );
     });
 
     it('flags an unknown provider as failed with reason=unknown_provider but still reports per-entry', async () => {
@@ -2276,6 +2328,491 @@ describe('verifyBundle', () => {
       expect(report.platformAttestation.reason).toBe(
         'missing_legacy_explicitly_allowed',
       );
+    });
+  });
+
+  /**
+   * PROD16 (be-compliance F5(a) / audit-verifier's half of the same
+   * finding) — `rootCoverage`.
+   *
+   * `completeness` (BUG-AUDIT-01, above) only compares the AGGREGATE
+   * `rows.length` to the SIGNED `manifest.rowCount` — it says nothing
+   * about which PERIOD the surviving rows fall into. A root is signed
+   * and Rekor-anchored independently, at anchor time, over its own
+   * `rowCount`. If rows are deleted from the underlying table AFTER a
+   * period's root was anchored but BEFORE the bundle is (re-)exported,
+   * the exporter honestly recomputes a SMALLER `manifest.rowCount` from
+   * the live (already-truncated) table — `completeness` passes — while
+   * the untouched, already-signed root still claims the ORIGINAL,
+   * larger count. Nothing compared the two before this fix.
+   */
+  describe('rootCoverage — suffix deletion inside an already-anchored period (PROD16)', () => {
+    function reSignManifest(opts: {
+      orgId: string;
+      rowCount: number;
+      rootCount: number;
+      from: string;
+      to: string;
+      publicKeyB64: string;
+      keyVersion: number;
+      privateKey: Uint8Array;
+    }): { manifestJson: Record<string, unknown> } {
+      const manifestSans = {
+        version: 1,
+        orgId: opts.orgId,
+        from: opts.from,
+        to: opts.to,
+        rowCount: opts.rowCount,
+        rootCount: opts.rootCount,
+        keyVersions: [
+          { keyVersion: opts.keyVersion, publicKey: opts.publicKeyB64 },
+        ],
+        generatedAt: opts.to,
+        signatureAlgorithm: 'Ed25519' as const,
+      };
+      const signature = signEd25519(
+        canonicalJson(manifestSans),
+        opts.privateKey,
+      );
+      return {
+        manifestJson: {
+          ...manifestSans,
+          signature,
+          signatureKeyVersion: opts.keyVersion,
+        },
+      };
+    }
+
+    function packBundle(
+      manifestJson: Record<string, unknown>,
+      rows: FixtureRow[],
+      roots: FixtureRoot[],
+      proofs: FixtureProof[],
+      publicKeys: Record<string, string>,
+    ): Buffer {
+      const rowsNdjson = Buffer.from(
+        rows.map((r) => JSON.stringify(r)).join('\n') +
+          (rows.length > 0 ? '\n' : ''),
+        'utf8',
+      );
+      const rootsNdjson = Buffer.from(
+        roots.map((r) => JSON.stringify(r)).join('\n') +
+          (roots.length > 0 ? '\n' : ''),
+        'utf8',
+      );
+      const proofsNdjson = Buffer.from(
+        proofs.map((p) => JSON.stringify(p)).join('\n') +
+          (proofs.length > 0 ? '\n' : ''),
+        'utf8',
+      );
+      return writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifestJson, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(rootsNdjson) },
+        { name: 'proofs.ndjson.gz', data: gzipDeterministic(proofsNdjson) },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+      ]);
+    }
+
+    it('fails closed when a fully-anchored root outlives a deleted trailing row (forgery that completeness alone cannot see)', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, string>;
+
+      // Delete the trailing row (as if it were removed from the DB after
+      // root-1 was already anchored) + its proof. The root — already
+      // signed and anchored — is left byte-identical, still claiming
+      // rowCount=4.
+      const survivingRows = base.rows.slice(0, 3);
+      const survivingProofs = base.proofs.filter((p) => p.rowId !== 'row-3');
+
+      // The exporter honestly recomputes rowCount from the (now
+      // truncated) live table and mints a fresh, validly-signed
+      // manifest — this is NOT a forged signature, it's what a real
+      // re-export produces after the deletion.
+      const { manifestJson } = reSignManifest({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1']!,
+        keyVersion: 1,
+        privateKey,
+      });
+
+      const zip = packBundle(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeys,
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      // Every other component is individually happy — this is exactly
+      // the bypass PROD16 flagged.
+      expect(report.completeness.ok).toBe(true);
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.chain.ok).toBe(true);
+      expect(report.rootSignatures.ok).toBe(true);
+      expect(report.inclusionProofs.ok).toBe(true);
+      // rootCoverage is the only component that catches it.
+      expect(report.rootCoverage.ok).toBe(false);
+      expect(report.rootCoverage.failed).toBeGreaterThan(0);
+      expect(report.rootCoverage.firstFailure).toBe('root-1');
+      expect(report.rootCoverage.reason).toContain('root-1');
+      expect(report.ok).toBe(false);
+    });
+
+    it('passes rootCoverage for a pristine (untruncated) bundle', async () => {
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rootCoverage.ok).toBe(true);
+      expect(report.rootCoverage.checked).toBe(1);
+      expect(report.rootCoverage.failed).toBe(0);
+    });
+
+    it('exempts a boundary root that only partially overlaps the bundle range (legitimate ranged export)', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, string>;
+
+      // A genuine ranged export whose declared `to` cuts off BEFORE the
+      // root's real periodEnd — rows signed at/after the cutoff are
+      // legitimately absent. root-1 (periodEnd = original `to`) now only
+      // PARTIALLY overlaps [from, cutoffTo), so it must be exempted.
+      const cutoffTo = base.rows[2]!.signedAt;
+      const survivingRows = base.rows.filter((r) => r.signedAt < cutoffTo);
+      const survivingRowIds = new Set(survivingRows.map((r) => r.id));
+      const survivingProofs = base.proofs.filter((p) =>
+        survivingRowIds.has(p.rowId),
+      );
+
+      const { manifestJson } = reSignManifest({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: cutoffTo,
+        publicKeyB64: publicKeys['1']!,
+        keyVersion: 1,
+        privateKey,
+      });
+
+      const zip = packBundle(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeys,
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      expect(report.completeness.ok).toBe(true);
+      // Exempted: root-1's periodEnd exceeds the bundle's declared `to`,
+      // so it is a boundary/partial root, not fully contained.
+      expect(report.rootCoverage.ok).toBe(true);
+      expect(report.rootCoverage.checked).toBe(0);
+    });
+  });
+
+  /**
+   * PROD16 F10 (be-compliance) — `verifyChain` must not depend on the
+   * bundle's on-disk row order. `bundle-exporter.service.ts` orders rows
+   * by `(signedAt, id)` while the chain is actually built in `chainSeq`
+   * order; two rows in the same org sharing a `signedAt` millisecond (the
+   * expected shape of `PendingSignatureDrainService`'s same-transaction
+   * signing bursts) can then be emitted in the opposite order from the
+   * real chain. The fixed `verifyChain` reconstructs the true order from
+   * the cryptographic links themselves, so file order is irrelevant.
+   */
+  describe('PROD16 F10 — chain verification does not depend on file order', () => {
+    it('verifies a bundle whose rows.ndjson.gz lines are reversed relative to chain order', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      // Same signatures/links, just written to the wire in the opposite
+      // order — simulating a same-millisecond tie landing on the "wrong"
+      // side of the (signedAt, id) sort.
+      const reorderedRows = [...base.rows].reverse();
+      const rowsNdjson = Buffer.from(
+        reorderedRows.map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf8',
+      );
+      const zip = writeZip([
+        { name: 'manifest.json', data: entries.get('manifest.json')! },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(rowsNdjson) },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      const report = await verifyBundle(zip, { noRekor: true });
+      // Before the fix, this reported a false chain break — file order
+      // WAS the chain-order assumption.
+      expect(report.chain.ok).toBe(true);
+      expect(report.chain.failed).toBe(0);
+      expect(report.chain.checked).toBe(3);
+      expect(report.ok).toBe(true);
+    });
+
+    it('still fails closed on a genuine fork (two rows claim the same predecessor) regardless of file order', async () => {
+      const { zip } = buildBundleWithTamper({
+        postSignPrevRowHash: (rows) => {
+          // row-3 now claims to be an immediate successor of row-1 (the
+          // same predecessor row-2 already legitimately claims) — a
+          // forged sibling, not a legitimate reordering.
+          rows[3]!.prevRowHash = rows[2]!.prevRowHash;
+        },
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.chain.ok).toBe(false);
+      expect(report.chain.reason).toContain('fork');
+    });
+  });
+
+  /**
+   * PROD16 F6 (be-compliance) — `ipAddress` is signed only for rows
+   * produced at/after `be`'s `IP_ADDRESS_SIGNABLE_CUTOVER_AT` activation.
+   * The verifier must include the key in the canonical preimage IFF the
+   * wire row carries it, with no cutover-date knowledge of its own.
+   */
+  describe('PROD16 F6 — ipAddress signable field (exporter/verifier version skew)', () => {
+    function buildIpAddressFixtureBundle(opts: {
+      includeIpAddress?: boolean;
+      ipAddress?: string | null;
+      tamperIpAddressPostSign?: boolean;
+    }): Buffer {
+      const seed = Buffer.alloc(32, 9);
+      const { publicKey, privateKey } = keypairFromSeed(seed);
+      const keyVersion = 1;
+      const orgId = '00000000-0000-0000-0000-000000000002';
+      const createdAt = new Date(Date.UTC(2026, 6, 1, 0, 0, 0)).toISOString();
+
+      const basePartial: Record<string, unknown> = {
+        organizationId: orgId,
+        action: 'agent.created',
+        actorId: null,
+        actorType: 'user',
+        resourceType: 'agent',
+        resourceId: 'agent-0',
+        teamId: null,
+        agentId: 'agent-0',
+        summary: 'Created agent',
+        details: null,
+        createdAt,
+      };
+      if (opts.includeIpAddress) {
+        basePartial.ipAddress = opts.ipAddress ?? null;
+      }
+      const canonical = canonicalJson(basePartial);
+      const prevRowHash = GENESIS_PREV_ROW_HASH;
+      const rowMessage = Buffer.concat([
+        canonical,
+        Buffer.from(prevRowHash, 'base64'),
+      ]);
+      const signatureBase64 = signEd25519(rowMessage, privateKey);
+
+      const row: Record<string, unknown> = {
+        id: 'row-0',
+        ...basePartial,
+        signature: signatureBase64,
+        keyVersion,
+        signedAt: createdAt,
+        prevRowHash,
+      };
+      if (opts.tamperIpAddressPostSign) {
+        // Mutate AFTER signing — the signature must no longer verify.
+        row.ipAddress = '10.0.0.99';
+      }
+
+      const leaf = new Uint8Array(
+        Buffer.concat([canonical, Buffer.from(signatureBase64, 'base64')]),
+      );
+      const tree = merkleBuild([leaf]);
+      const rootHashB64 = Buffer.from(tree.root).toString('base64');
+      const periodStart = createdAt;
+      const periodEnd = new Date(
+        Date.parse(createdAt) + 3600_000,
+      ).toISOString();
+      const rootMessage = canonicalJson({
+        rootHash: rootHashB64,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+      });
+      const rootSignature = signEd25519(rootMessage, privateKey);
+      const rootSignedAt = new Date(
+        Date.parse(periodEnd) + 5000,
+      ).toISOString();
+      const root = {
+        id: 'root-0',
+        organizationId: orgId,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+        rootHash: rootHashB64,
+        signature: rootSignature,
+        keyVersion,
+        signedAt: rootSignedAt,
+        anchoredAt: null,
+        anchorReceipt: null,
+      };
+      const proof = merkleProof([leaf], 0);
+      const proofEntry = {
+        rowId: 'row-0',
+        index: proof.index,
+        proof: proof.siblings.map((s) => Buffer.from(s).toString('base64')),
+        rootHash: rootHashB64,
+      };
+
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+      const generatedAt = new Date(
+        Date.parse(rootSignedAt) + 1000,
+      ).toISOString();
+      const manifestSans = {
+        version: 1,
+        orgId,
+        from: periodStart,
+        to: periodEnd,
+        rowCount: 1,
+        rootCount: 1,
+        keyVersions: [{ keyVersion, publicKey: publicKeyB64 }],
+        generatedAt,
+        signatureAlgorithm: 'Ed25519' as const,
+      };
+      const manifestSignature = signEd25519(
+        canonicalJson(manifestSans),
+        privateKey,
+      );
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: keyVersion,
+      };
+
+      const publicKeys = { [String(keyVersion)]: publicKeyB64 };
+      return writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        {
+          name: 'rows.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(row) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'roots.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(root) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'proofs.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(proofEntry) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+      ]);
+    }
+
+    it('verifies a row signed with ipAddress present (post-cutover shape)', async () => {
+      const zip = buildIpAddressFixtureBundle({
+        includeIpAddress: true,
+        ipAddress: '203.0.113.5',
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.chain.ok).toBe(true);
+      expect(report.inclusionProofs.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('verifies a legacy row that never carries ipAddress (pre-cutover shape unaffected)', async () => {
+      const zip = buildIpAddressFixtureBundle({ includeIpAddress: false });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('rejects a row whose ipAddress is tampered after signing', async () => {
+      const zip = buildIpAddressFixtureBundle({
+        includeIpAddress: true,
+        ipAddress: '203.0.113.5',
+        tamperIpAddressPostSign: true,
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.ok).toBe(false);
+    });
+  });
+
+  /**
+   * PROD16 F6 (be-compliance) — explicit, non-positional manifest version
+   * negotiation: a version this build does not implement must fail loudly
+   * as a bundle-format error rather than being verified under the wrong
+   * (older) field set.
+   */
+  describe('PROD16 F6 — explicit manifest version negotiation', () => {
+    it('rejects a manifest version newer than this build supports', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const manifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      manifest.version = 99;
+      // Deliberately NOT re-signed — an unsupported version must be
+      // rejected before any signature is even inspected.
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      await expect(
+        verifyBundleStrict(zip, { noRekor: true }),
+      ).rejects.toThrow(/newer than/);
+    });
+
+    it('accepts the currently-supported manifest versions unchanged', async () => {
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(true);
     });
   });
 });

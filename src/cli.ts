@@ -114,8 +114,18 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('platform attest.  ', report.platformAttestation));
   lines.push(fmtComponent('completeness      ', report.completeness));
   lines.push(fmtComponent('key binding       ', report.keyBinding));
+  lines.push(fmtComponent('root coverage     ', report.rootCoverage));
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
+  // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
+  // Rekor witness was verified" when the caller explicitly skipped that
+  // check. Repeat the caveat as its own line so it survives a skim.
+  if (report.rekor.reason?.startsWith('rekor_check_skipped_by_caller')) {
+    lines.push(
+      'NOTE: --no-rekor was passed — the external Rekor witness was NOT checked. ' +
+        'This result does not confirm or rule out anchoring.',
+    );
+  }
   process.stdout.write(lines.join('\n') + '\n');
 }
 
