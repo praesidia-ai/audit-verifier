@@ -1013,6 +1013,86 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * PROD15 — `manifest.keyVersions[].status`/`revokedAt` is part of the
+   * SIGNED manifest (see the `ManifestKeyVersionEntry` docblock) but was
+   * never cross-checked against `public-keys.json`. An attacker who edits
+   * only the UNSIGNED `public-keys.json` — downgrading a REVOKED key back
+   * to ACTIVE, leaving `manifest.json` and every row/root signature
+   * untouched — must not be able to resurrect a revoked key's signatures
+   * just because platform attestation (which independently catches this)
+   * is skipped via `allowLegacyUnattested`.
+   */
+  describe('PROD15 — signed keyVersions lifecycle bound to public-keys.json', () => {
+    it('fails when public-keys.json downgrades a signed-REVOKED keyVersion to ACTIVE', async () => {
+      const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+
+      // Re-sign the manifest so it legitimately declares keyVersion 1 as
+      // REVOKED — this is the SIGNED source of truth.
+      const manifestSans = {
+        version: originalManifest.version,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [
+          {
+            keyVersion: 1,
+            publicKey: publicKeyB64,
+            status: 'REVOKED',
+            revokedAt: '2026-05-01T00:10:00.000Z',
+          },
+        ],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      // The UNSIGNED public-keys.json is the only thing tampered: same key
+      // bytes, but status downgraded to ACTIVE and revokedAt cleared.
+      const publicKeys = {
+        '1': { publicKey: publicKeyB64, status: 'ACTIVE', revokedAt: null },
+      };
+
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        allowLegacyUnattested: true,
+      });
+      expect(report.keyBinding.ok).toBe(false);
+      expect(report.keyBinding.reason).toMatch(/key_status_mismatch/);
+      expect(report.ok).toBe(false);
+    });
+  });
+
+  /**
    * AUDIT-2026-05-09 — Multi-anchor receipt verification.
    *
    * The exporter now emits `anchorReceipts: [{provider, receipt,

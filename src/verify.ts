@@ -439,9 +439,10 @@ export async function verifyBundle(
   // slips through (the surviving prefix still chains + proves).
   const completenessResult = verifyCompleteness(manifest, rows, roots);
 
-  // 10) BUG-AUDIT-03 — Bind the (unsigned) `public-keys.json` bytes the
-  // verifier trusts against the SIGNED `manifest.keyVersions` set.
-  const keyBindingResult = verifyKeyBinding(manifest, publicKeysRaw);
+  // 10) BUG-AUDIT-03 / PROD15 — Bind the (unsigned) `public-keys.json`
+  // bytes AND lifecycle (status/revokedAt) the verifier trusts against
+  // the SIGNED `manifest.keyVersions` set.
+  const keyBindingResult = verifyKeyBinding(manifest, publicKeysRaw, publicKeys);
 
   const ok =
     manifestResult.ok &&
@@ -591,20 +592,37 @@ function verifyCompleteness(
  * binding the trusted keys to it means a verification key cannot be
  * swapped without breaking the manifest signature too. `checked` counts
  * one assertion per key version in `public-keys.json`.
+ *
+ * PROD15 — `manifest.keyVersions[]` also carries `status`/`revokedAt`
+ * (AUDIT-2026-05-14, optional for v1 bundles) but nothing previously
+ * compared it to `public-keys.json`. `verifyRowSignatures` /
+ * `verifyRootSignatures` read revocation status only from the UNSIGNED
+ * `public-keys.json`, so — whenever platform attestation is skipped via
+ * `allowLegacyUnattested` — an attacker who edits only that file to
+ * relabel a REVOKED key ACTIVE could resurrect signatures made under a
+ * compromised key. When the signed manifest entry carries a status, we
+ * now also require `status`/`revokedAt` to match; when it does not
+ * (true v1 bundles), we fall back to trusting `public-keys.json` alone
+ * so those bundles keep verifying.
  */
 function verifyKeyBinding(
   manifest: BundleManifest,
   publicKeysRaw: Record<string, unknown>,
+  publicKeys: Map<number, PublicKeyRecord>,
 ): ComponentResult {
-  const signed = new Map<number, Uint8Array>();
+  const signed = new Map<
+    number,
+    { publicKey: Uint8Array; status?: string; revokedAt?: string | null }
+  >();
   for (const kv of manifest.keyVersions) {
     if (typeof kv.publicKey === 'string') {
       const decoded = decodeBase64Strict(kv.publicKey);
       if (decoded === null) continue;
-      signed.set(
-        kv.keyVersion,
-        new Uint8Array(decoded),
-      );
+      signed.set(kv.keyVersion, {
+        publicKey: new Uint8Array(decoded),
+        status: kv.status,
+        revokedAt: kv.revokedAt,
+      });
     }
   }
 
@@ -635,8 +653,8 @@ function verifyKeyBinding(
       continue;
     }
     const usedBytes = new Uint8Array(decoded);
-    const signedBytes = signed.get(ver);
-    if (signedBytes === undefined) {
+    const signedEntry = signed.get(ver);
+    if (signedEntry === undefined) {
       failed += 1;
       if (firstFailure === undefined) {
         firstFailure = k;
@@ -644,11 +662,51 @@ function verifyKeyBinding(
       }
       continue;
     }
-    if (!bytesEqual(usedBytes, signedBytes)) {
+    if (!bytesEqual(usedBytes, signedEntry.publicKey)) {
       failed += 1;
       if (firstFailure === undefined) {
         firstFailure = k;
         reason = `key_bytes_mismatch: public-keys.json[${k}] bytes differ from the signed manifest.keyVersions[${k}]`;
+      }
+      continue;
+    }
+    // PROD15 — Bind lifecycle metadata too, not just key bytes.
+    //
+    // `status`/`revokedAt` on `manifest.keyVersions[]` are optional
+    // (true v1 bundles pre-date AUDIT-14 and never carried them). Only
+    // enforce the cross-check when the SIGNED manifest actually declares
+    // a status for this key version; otherwise fall back to trusting
+    // `public-keys.json` alone, exactly as before, so genuine legacy
+    // bundles keep verifying. When the signed manifest DOES carry a
+    // status, an attacker who edits only the unsigned public-keys.json
+    // to relabel a REVOKED key as ACTIVE (or clear revokedAt) must not
+    // be able to resurrect that key's signatures merely because platform
+    // attestation was skipped.
+    if (signedEntry.status !== undefined) {
+      const usedRecord = publicKeys.get(ver);
+      if (usedRecord === undefined || usedRecord.status !== signedEntry.status) {
+        failed += 1;
+        if (firstFailure === undefined) {
+          firstFailure = k;
+          reason = `key_status_mismatch: public-keys.json[${k}] status differs from the signed manifest.keyVersions[${k}]`;
+        }
+        continue;
+      }
+      const signedRevokedAtTime =
+        signedEntry.revokedAt == null ? null : Date.parse(signedEntry.revokedAt);
+      const usedRevokedAtTime =
+        usedRecord.revokedAt === null ? null : usedRecord.revokedAt.getTime();
+      const signedRevokedAtInvalid =
+        signedEntry.revokedAt != null && Number.isNaN(signedRevokedAtTime);
+      if (
+        signedRevokedAtInvalid ||
+        signedRevokedAtTime !== usedRevokedAtTime
+      ) {
+        failed += 1;
+        if (firstFailure === undefined) {
+          firstFailure = k;
+          reason = `key_revoked_at_mismatch: public-keys.json[${k}] revokedAt differs from the signed manifest.keyVersions[${k}]`;
+        }
       }
     }
   }
