@@ -46,8 +46,19 @@ Exit codes:
 For a bundle produced by `BundleExporterService` (AGV-035) the verifier
 checks every cryptographic invariant the bundle commits to:
 
-1. **Manifest signature** — Ed25519 signature over the canonical-JSON of
-   the manifest fields, signed with the tenant's currently-active key.
+1. **Manifest signature** — Ed25519 (or ECDSA-P256) signature over the
+   canonical-JSON of the manifest fields, signed with the tenant's
+   currently-active key. The signable field set is selected by the
+   manifest's declared `version`, from a closed whitelist — never by
+   inspecting which fields happen to be present on the received object.
+   `version: 1`/`2` sign 9 fields; `version: 3` signs those 9 plus
+   `chainSeqCeiling`/`chainSeqSnapshotAt` (the chainSeq snapshot a bundle
+   export was bounded by). Either direction of mismatch — the two v3
+   fields present on a `version: 1`/`2` manifest, or absent on a
+   `version: 3` one — fails closed with its own distinct reason
+   (`chainseq_fields_present_on_v{1,2}_manifest` /
+   `chainseq_fields_missing_on_v3_manifest`) rather than a generic
+   signature failure, so an auditor can tell version skew from tampering.
 2. **Row signatures** — every row in `rows.ndjson.gz` is re-canonicalized
    from its signable fields and verified against the public key at
    `row.keyVersion` from `public-keys.json`. The signed preimage is
@@ -151,7 +162,7 @@ The library therefore fails closed for S3 by default; callers can provide an
 trust boundary.
 
 `manifest.version` is checked against an explicit ceiling
-(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 2) — a bundle declaring a newer
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 3) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's
@@ -163,7 +174,11 @@ fields in the same change.
 
 - Every row, root, and the manifest are validly signed by a key present in
   the bundle's own signed key set, and that key was not marked `REVOKED` at
-  verification time.
+  verification time. For the manifest, "validly signed" includes the
+  version-keyed signable set matching the manifest's own declared version
+  exactly (invariant 1) — a `chainSeqCeiling`/`chainSeqSnapshotAt` mismatch
+  relative to the declared version fails closed before the signature is
+  even computed.
 - The rows form a single, internally consistent hash chain (order-independent
   reconstruction — see invariant 3) with no fork, no orphan, and no broken
   link, up to one accepted opaque anchor for a date-ranged export.
@@ -244,6 +259,32 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.5.0 (PROD16 §1b)
+
+- **`manifest.version: 3` is now understood.** `be` commit `dc5b8a97` added
+  `chainSeqCeiling`/`chainSeqSnapshotAt` INSIDE the signed manifest preimage
+  and bumps the wire version to 3 for bundles carrying them
+  (`PROD16-CONTRACT-manifest-v3.md`). Every bundle exported by that `be`
+  version previously failed with a generic `manifest signature does not
+  verify` because the verifier's signable whitelist was fixed at 9 fields
+  regardless of declared version. The whitelist is now selected by
+  `manifest.version` (9 fields for v1/v2, 9 + the two new fields for v3),
+  still a closed selection — never reconstructed by stripping `signature`
+  from the received object, which would let an attacker inject
+  unsigned-looking fields into a signed payload.
+- **Two new fail-closed reason codes**, one per direction of version/field
+  mismatch: `chainseq_fields_present_on_v{1,2}_manifest` (the two v3 fields
+  illegitimately present on an older-declared manifest — no genuine v1/v2
+  producer ever emits them) and `chainseq_fields_missing_on_v3_manifest`
+  (a `version: 3` manifest missing one or both — no genuine v3 producer
+  ever omits them). Distinct from the generic signature-failure reason so
+  an auditor can tell version skew from tampering.
+- `MAX_SUPPORTED_MANIFEST_VERSION` raised from 2 to 3.
+- No `VerifyReport` shape change. v1/v2 bundles (everything produced before
+  `dc5b8a97`, and everything produced by `be` deployments that stay on v2)
+  verify exactly as before — confirmed by the full pre-existing suite
+  passing unmodified.
 
 ### 0.4.0 (PROD16)
 

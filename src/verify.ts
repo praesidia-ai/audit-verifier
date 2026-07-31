@@ -110,6 +110,19 @@ interface BundleManifest {
   signatureAlgorithm: BundleSignatureAlgorithm;
   signature: string;
   signatureKeyVersion: number;
+  /**
+   * PROD16 §1b / manifest-v3 contract (`PROD16-CONTRACT-manifest-v3.md`) —
+   * the chainSeq ceiling this bundle's export snapshot was bounded by, and
+   * when that snapshot was taken. Part of the SIGNED preimage: the ceiling
+   * defines the bundle's own claimed scope, so leaving it unsigned would
+   * make that scope forgeable. A genuine producer emits BOTH fields on
+   * every `version: 3` manifest and NEITHER on `version: 1`/`2` — see
+   * `verifyManifest`'s version-keyed signable-set selection. Optional here
+   * only so this interface can represent all three wire versions; presence
+   * is enforced per-version, not left to chance.
+   */
+  chainSeqCeiling?: number | null;
+  chainSeqSnapshotAt?: string | null;
 }
 
 /**
@@ -381,8 +394,18 @@ export interface VerifyOptions {
  *
  * Bump this alongside adding real support for the new version's fields —
  * never bump it "ahead of" support just to silence this check.
+ *
+ * v3 (PROD16 §1b / `PROD16-CONTRACT-manifest-v3.md`) — `be` commit
+ * `dc5b8a97` added `chainSeqCeiling`/`chainSeqSnapshotAt` INSIDE the signed
+ * manifest preimage and bumped the wire version to 3 for bundles carrying
+ * them. `verifyManifest` selects the 9-field (v1/v2) or 11-field (v3)
+ * signable set by this declared version and fail-closed rejects either
+ * direction of mismatch (fields present on v1/v2, or absent on v3) before
+ * ever computing a signature — never by stripping/re-deriving fields from
+ * the received object, which would let an attacker inject unsigned-looking
+ * fields into a signed payload.
  */
-const MAX_SUPPORTED_MANIFEST_VERSION = 2;
+const MAX_SUPPORTED_MANIFEST_VERSION = 3;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -592,9 +615,47 @@ function verifyManifest(
       reason: 'key_revoked',
     };
   }
+  // PROD16 §1b / `PROD16-CONTRACT-manifest-v3.md` — the signable field set
+  // is selected by the manifest's DECLARED version, from a closed
+  // whitelist, never by inspecting which fields happen to be present on
+  // the received object (that would let an attacker bolt unsigned-looking
+  // fields onto a signed payload and have this verifier ignore them
+  // silently). Both directions of version/field mismatch are themselves
+  // evidence of tampering — a genuine `be` producer (bundle-exporter
+  // .service.ts) emits `chainSeqCeiling`/`chainSeqSnapshotAt` on EVERY
+  // v3 manifest and on NEITHER v1 nor v2 manifest — so each direction gets
+  // its own distinct, specific reason rather than falling through to a
+  // generic "manifest signature does not verify", which would read as
+  // ordinary tampering to an auditor instead of the version-skew problem
+  // it actually is. Same principle PROD15-FIXED-av2.md Gap 2 applied to
+  // `keyVersions[].status`: a field a genuine producer always emits at a
+  // version is never legitimately missing there, and one it never emits
+  // at an older version is never legitimately present there.
+  const hasChainSeqCeiling = 'chainSeqCeiling' in manifest;
+  const hasChainSeqSnapshotAt = 'chainSeqSnapshotAt' in manifest;
+  if (manifest.version <= 2 && (hasChainSeqCeiling || hasChainSeqSnapshotAt)) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `chainseq_fields_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries chainSeqCeiling/chainSeqSnapshotAt — no genuine v1/v2 producer ever emits these fields; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
+  if (manifest.version >= 3 && !(hasChainSeqCeiling && hasChainSeqSnapshotAt)) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `chainseq_fields_missing_on_v3_manifest: manifest declares version ${manifest.version} but is missing chainSeqCeiling/chainSeqSnapshotAt — every genuine v3 producer emits both; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
+
   // Reconstruct the manifest-sans-signature envelope and canonicalize
-  // it the same way the writer did.
-  const signable = {
+  // it the same way the writer did. The two chainSeq fields join the
+  // signable set ONLY for version >= 3 — validated above to be exactly
+  // the versions that carry them, so this is a closed selection, not a
+  // strip-and-reconstruct of whatever the wire object happens to hold.
+  const signable: Record<string, unknown> = {
     version: manifest.version,
     orgId: manifest.orgId,
     from: manifest.from,
@@ -605,6 +666,10 @@ function verifyManifest(
     generatedAt: manifest.generatedAt,
     signatureAlgorithm: manifest.signatureAlgorithm,
   };
+  if (manifest.version >= 3) {
+    signable.chainSeqCeiling = manifest.chainSeqCeiling;
+    signable.chainSeqSnapshotAt = manifest.chainSeqSnapshotAt;
+  }
   const bytes = canonicalJson(signable);
   // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
   // A bundle whose `signatureAlgorithm` is ECDSA_P256_SHA256 is now
@@ -1974,6 +2039,24 @@ function assertManifestStructure(manifest: BundleManifest): void {
       throw new Error('manifest.json contains an invalid/duplicate keyVersion');
     }
     versions.add(key.keyVersion);
+  }
+  // PROD16 §1b — basic type sanity for the two v3-only fields, IF present
+  // at all (their presence-vs-absence relative to `manifest.version` is a
+  // signable-set / tampering concern checked in `verifyManifest`, not a
+  // format concern; this only rejects a garbage-typed value).
+  if (
+    'chainSeqCeiling' in manifest &&
+    manifest.chainSeqCeiling !== null &&
+    !Number.isSafeInteger(manifest.chainSeqCeiling)
+  ) {
+    throw new Error('manifest.json has an invalid structure');
+  }
+  if (
+    'chainSeqSnapshotAt' in manifest &&
+    manifest.chainSeqSnapshotAt !== null &&
+    !isIsoDate(manifest.chainSeqSnapshotAt)
+  ) {
+    throw new Error('manifest.json has an invalid structure');
   }
 }
 

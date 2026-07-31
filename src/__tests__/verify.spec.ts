@@ -2815,4 +2815,173 @@ describe('verifyBundle', () => {
       expect(report.ok).toBe(true);
     });
   });
+
+  /**
+   * PROD16 §1b (`PROD16-REATTACK-3.md`, `PROD16-CONTRACT-manifest-v3.md`) —
+   * `be` commit `dc5b8a97` added `chainSeqCeiling`/`chainSeqSnapshotAt`
+   * INSIDE the signed manifest preimage and bumped the wire version to 3
+   * for bundles that carry them. This is the round-trip test the ticket
+   * asked for: a manifest shaped exactly like the real `be` producer's
+   * `manifestSansSignature` object (§1b's quoted literal), verified by the
+   * shipped verifier end to end — not a unit test of either side alone,
+   * which is exactly what let the original skew ship.
+   */
+  describe('PROD16 §1b — v3 manifest signable set (chainSeqCeiling/chainSeqSnapshotAt)', () => {
+    /**
+     * Re-signs the fixture's manifest as a v3 manifest, mirroring
+     * `bundle-exporter.service.ts:410-462`'s `manifestSansSignature` shape
+     * byte-for-byte (same field set, same key order irrelevant since
+     * `canonicalJson` sorts). `chainSeqCeiling`/`chainSeqSnapshotAt` are
+     * included in — or omitted from — the signed object based on the
+     * `omitChainSeqFields` flag, so both a genuine v3 manifest and an
+     * attacker-forged one (same version, missing fields) can be built from
+     * one helper.
+     */
+    function buildV3Manifest(opts: { omitChainSeqFields?: boolean } = {}): {
+      zip: Buffer;
+    } {
+      const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+
+      const manifestSans: Record<string, unknown> = {
+        version: 3,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        // v2+ producers always stamp status/revokedAt on every entry
+        // (PROD15-FIXED-av2.md) — matched here so `verifyKeyBinding`'s
+        // cross-check is a non-factor and this test isolates §1b's own
+        // signable-set concern.
+        keyVersions: [
+          {
+            keyVersion: 1,
+            publicKey: publicKeyB64,
+            status: 'ACTIVE',
+            revokedAt: null,
+          },
+        ],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+      };
+      if (!opts.omitChainSeqFields) {
+        manifestSans.chainSeqCeiling = 4;
+        manifestSans.chainSeqSnapshotAt = '2026-05-01T01:00:30.000Z';
+      }
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+      return { zip };
+    }
+
+    it('round-trips a genuine v3 manifest (be-exported shape) end to end', async () => {
+      const { zip } = buildV3Manifest();
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('rejects a v3 manifest missing chainSeqCeiling/chainSeqSnapshotAt with a distinct reason (not a generic signature failure)', async () => {
+      const { zip } = buildV3Manifest({ omitChainSeqFields: true });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(false);
+      expect(report.manifest.reason).toMatch(
+        /chainseq_fields_missing_on_v3_manifest/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('rejects a v1/v2 manifest that illegitimately carries chainSeqCeiling/chainSeqSnapshotAt with a distinct reason (attacker-selectable downgrade)', async () => {
+      const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+
+      // A v2-declared manifest, honestly re-signed OVER an object that
+      // ALSO carries the two v3-only fields — modelling either version-
+      // downgrade skew or an attacker bolting extra fields onto a v2
+      // envelope. No genuine v2 producer emits these fields at all.
+      const manifestSans = {
+        version: 2,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [{ keyVersion: 1, publicKey: publicKeyB64 }],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+        chainSeqCeiling: 4,
+        chainSeqSnapshotAt: '2026-05-01T01:00:30.000Z',
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(false);
+      expect(report.manifest.reason).toMatch(
+        /chainseq_fields_present_on_v2_manifest/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('v1 bundles (predating chainSeqCeiling entirely) keep verifying unchanged', async () => {
+      // The existing pristine fixture IS a v1 manifest with neither field —
+      // this is the explicit backward-compatibility regression guard.
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+  });
 });
