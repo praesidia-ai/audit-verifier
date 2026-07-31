@@ -70,6 +70,7 @@ import {
   type BundleSignatureAlgorithm,
   merkleVerify,
   type MerkleProof,
+  GENESIS_PREV_ROW_HASH,
 } from './crypto.js';
 import { readZip, gunzip, type ZipEntry } from './zip.js';
 import { verifyRekorReceipt } from './rekor.js';
@@ -123,6 +124,52 @@ interface BundleManifest {
    */
   chainSeqCeiling?: number | null;
   chainSeqSnapshotAt?: string | null;
+  /**
+   * FIX01 F5(b) / manifest-v4 contract
+   * (`PROD16-CONTRACT-manifest-v4-checkpoints.md`) — the number of
+   * `AuditIntegrityCheckpoint` rows this export includes (in
+   * `integrity-checkpoints.ndjson.gz`), i.e. checkpoints whose `asOf` falls
+   * inside `[from, to)`. Part of the SIGNED preimage for the same reason
+   * `rowCount`/`rootCount` are: an unsigned count could be silently shrunk
+   * to suppress the one checkpoint that would reveal a suffix deletion. A
+   * genuine producer emits this on EVERY `version: 4` manifest and on NO
+   * earlier version — see `verifyManifest`'s version-keyed signable-set
+   * selection. Optional here only so this interface can represent all four
+   * wire versions; presence is enforced per-version, not left to chance.
+   */
+  integrityCheckpointCount?: number;
+}
+
+/**
+ * FIX01 F5(b) / manifest-v4 contract
+ * (`PROD16-CONTRACT-manifest-v4-checkpoints.md`) — one row per org per
+ * hourly tick from `AuditIntegrityCheckpointService` (`be`'s producer,
+ * `audit-integrity-checkpoint.entity.ts`). Append-only, NOT
+ * idempotency-keyed to a period, so duplicate/near-duplicate content
+ * across different `id`s is expected and not itself suspicious.
+ *
+ * Each checkpoint is signed INDEPENDENTLY of the manifest and of every
+ * other checkpoint — `signature` covers exactly
+ * `canonicalJson({organizationId, chainHeadHash, cumulativeRowCount, asOf})`
+ * under the org's active tenant signing key at `keyVersion`, the SAME
+ * substrate boundary as `audit_logs.signature` / `audit_merkle_roots
+ * .signature`, so a holder of DB write access but not the signing key
+ * cannot fabricate or alter a checkpoint's claimed content.
+ */
+interface BundleIntegrityCheckpoint {
+  id: string;
+  organizationId: string;
+  /** Base64 sha256 — same shape/derivation as `BundleRow.prevRowHash`. */
+  chainHeadHash: string;
+  /** Bigint-as-string (never re-parsed as a number — see the entity doc). */
+  cumulativeRowCount: string;
+  /** ISO instant the snapshot was taken. */
+  asOf: string;
+  signature: string;
+  signatureAlgorithm: BundleSignatureAlgorithm;
+  keyVersion: number;
+  /** Unused by verification; present for wire completeness. */
+  createdAt?: string;
 }
 
 /**
@@ -305,6 +352,46 @@ export interface VerifyReport {
    * rows for those, since rows outside `[from, to)` are never exported).
    */
   rootCoverage: ComponentResult;
+  /**
+   * FIX01 F5(b) — periodic signed integrity checkpoints
+   * (`PROD16-CONTRACT-manifest-v4-checkpoints.md`).
+   *
+   * `rootCoverage` only binds a root's committed row count once that root
+   * exists and its FULL period is inside the bundle's declared range — the
+   * newest un-rooted tail and any boundary root have no independent size
+   * commitment there. Checkpoints close PART of that gap for `version: 4`+
+   * bundles:
+   *
+   *   1. Every checkpoint's own signature is verified independently (same
+   *      REVOKED-key-rejection rule as rows/roots) — an attacker with only
+   *      DB write access, not the tenant signing key, cannot fabricate or
+   *      alter a checkpoint's claimed content.
+   *   2. `cumulativeRowCount` is checked for monotonic non-decrease across
+   *      checkpoints in `asOf` order.
+   *   3. Each checkpoint's `chainHeadHash` is independently recomputed from
+   *      the bundle's OWN rows (restricted to rows signed at/before that
+   *      checkpoint's `asOf`) and compared — this is checked for EVERY
+   *      checkpoint, not just the latest, which subsumes both the
+   *      "reconstruct the latest head" and "walk an earlier head backward"
+   *      halves of the recommended algorithm into one uniform check. A
+   *      checkpoint whose `asOf` predates every bundled row (a dormant org,
+   *      or a historical ranged export whose window ends before that
+   *      instant) is a legitimate, NOT-asserted case — see the component's
+   *      own doc comment on `verifyIntegrityCheckpoints`.
+   *
+   * KNOWN RESIDUAL, not closed by this component (see README "does NOT
+   * prove"): `AuditRetentionSealService.purgeWithSeal` is a real,
+   * already-shipped mechanism that legitimately hard-deletes signed
+   * `audit_logs` rows (GDPR-driven retention, feature-flagged, two-person
+   * approval-gated, off by default). A bundle spanning such a purge WILL
+   * legitimately show a `cumulativeRowCount` decrease and/or an
+   * unreachable earlier `chainHeadHash` between two checkpoints straddling
+   * the purge, and this component fails closed on that today (no seal
+   * evidence is in the bundle to distinguish it from tampering) — see the
+   * reason string, which names this possibility explicitly so an auditor
+   * doesn't read it as certain tampering.
+   */
+  integrityCheckpoints: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -404,8 +491,14 @@ export interface VerifyOptions {
  * ever computing a signature — never by stripping/re-deriving fields from
  * the received object, which would let an attacker inject unsigned-looking
  * fields into a signed payload.
+ *
+ * v4 (FIX01 F5(b) / `PROD16-CONTRACT-manifest-v4-checkpoints.md`) — adds
+ * `integrityCheckpointCount` (the 11 v3 fields plus this one, 12 total) and
+ * a new, conditionally-required bundle entry `integrity-checkpoints
+ * .ndjson.gz` carrying the signed `AuditIntegrityCheckpoint` rows
+ * themselves. Same fail-closed-both-directions rule as v3's fields.
  */
-const MAX_SUPPORTED_MANIFEST_VERSION = 3;
+const MAX_SUPPORTED_MANIFEST_VERSION = 4;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -444,6 +537,16 @@ export async function verifyBundle(
     byName.get('manifest.json')!.data.toString('utf8'),
   ) as BundleManifest;
   assertManifestStructure(manifest);
+
+  // FIX01 F5(b) / manifest-v4 — `integrity-checkpoints.ndjson.gz` is only
+  // required once the DECLARED version says it should exist; checked here
+  // (not added to the static `EXPECTED_ENTRIES`) because its presence is
+  // conditional on a field inside the file we just parsed.
+  if (manifest.version >= 4 && !byName.has('integrity-checkpoints.ndjson.gz')) {
+    throw new Error(
+      `bundle declares manifest.version ${manifest.version} (>= 4) but is missing required entry: integrity-checkpoints.ndjson.gz`,
+    );
+  }
 
   const publicKeysParsed: unknown = JSON.parse(
     byName.get('public-keys.json')!.data.toString('utf8'),
@@ -502,6 +605,22 @@ export async function verifyBundle(
   assertProofsStructure(proofs);
   const proofResult = verifyInclusionProofs(rows, roots, proofs);
 
+  // 6b) FIX01 F5(b) — parse + verify integrity checkpoints (v4+ only; an
+  // empty array for every earlier version).
+  const checkpoints: BundleIntegrityCheckpoint[] =
+    manifest.version >= 4
+      ? parseNdjson<BundleIntegrityCheckpoint>(
+          gunzip(byName.get('integrity-checkpoints.ndjson.gz')!.data),
+        )
+      : [];
+  assertIntegrityCheckpointsStructure(checkpoints, manifest.orgId);
+  const integrityCheckpointsResult = verifyIntegrityCheckpoints(
+    manifest,
+    rows,
+    checkpoints,
+    publicKeys,
+  );
+
   // 7) Optional Rekor fetch.
   const rekorResult = await verifyRekorReceipts(roots, options);
 
@@ -518,7 +637,12 @@ export async function verifyBundle(
   // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
   // match what is actually present, or a trailing-truncation attack
   // slips through (the surviving prefix still chains + proves).
-  const completenessResult = verifyCompleteness(manifest, rows, roots);
+  const completenessResult = verifyCompleteness(
+    manifest,
+    rows,
+    roots,
+    checkpoints,
+  );
 
   // 10) BUG-AUDIT-03 / PROD15 — Bind the (unsigned) `public-keys.json`
   // bytes AND lifecycle (status/revokedAt) the verifier trusts against
@@ -541,7 +665,8 @@ export async function verifyBundle(
     platformResult.ok &&
     completenessResult.ok &&
     keyBindingResult.ok &&
-    rootCoverageResult.ok;
+    rootCoverageResult.ok &&
+    integrityCheckpointsResult.ok;
 
   return {
     ok,
@@ -555,6 +680,7 @@ export async function verifyBundle(
     completeness: completenessResult,
     keyBinding: keyBindingResult,
     rootCoverage: rootCoverageResult,
+    integrityCheckpoints: integrityCheckpointsResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -649,6 +775,25 @@ function verifyManifest(
       reason: `chainseq_fields_missing_on_v3_manifest: manifest declares version ${manifest.version} but is missing chainSeqCeiling/chainSeqSnapshotAt — every genuine v3 producer emits both; this is version-downgrade skew or tampering, not a signature failure`,
     };
   }
+  // FIX01 F5(b) / manifest-v4 contract — same both-directions rule for
+  // `integrityCheckpointCount`.
+  const hasIntegrityCheckpointCount = 'integrityCheckpointCount' in manifest;
+  if (manifest.version <= 3 && hasIntegrityCheckpointCount) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `integrity_checkpoint_count_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries integrityCheckpointCount — no genuine producer below v4 ever emits this field; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
+  if (manifest.version >= 4 && !hasIntegrityCheckpointCount) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `integrity_checkpoint_count_missing_on_v4_manifest: manifest declares version ${manifest.version} but is missing integrityCheckpointCount — every genuine v4 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
 
   // Reconstruct the manifest-sans-signature envelope and canonicalize
   // it the same way the writer did. The two chainSeq fields join the
@@ -669,6 +814,9 @@ function verifyManifest(
   if (manifest.version >= 3) {
     signable.chainSeqCeiling = manifest.chainSeqCeiling;
     signable.chainSeqSnapshotAt = manifest.chainSeqSnapshotAt;
+  }
+  if (manifest.version >= 4) {
+    signable.integrityCheckpointCount = manifest.integrityCheckpointCount;
   }
   const bytes = canonicalJson(signable);
   // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
@@ -703,13 +851,16 @@ function verifyManifest(
  * the verifier binds "how many rows the signer committed to" against
  * "how many rows we were handed", so it MUST participate in `ok`.
  *
- * `checked = 2` (the row-count assertion + the root-count assertion).
+ * `checked = 2` (the row-count assertion + the root-count assertion), or
+ * `3` on a `version >= 4` manifest (see FIX01 F5(b) below).
  */
 function verifyCompleteness(
   manifest: BundleManifest,
   rows: BundleRow[],
   roots: BundleRoot[],
+  checkpoints: BundleIntegrityCheckpoint[],
 ): ComponentResult {
+  let checked = 2;
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
@@ -725,9 +876,24 @@ function verifyCompleteness(
       reason = `root count mismatch: bundle has ${roots.length} roots but signed manifest declares ${manifest.rootCount}`;
     }
   }
+  // FIX01 F5(b) / manifest-v4 — bind the SIGNED `integrityCheckpointCount`
+  // to what is actually present, same anti-suppression rationale as
+  // `rowCount`/`rootCount`: without this, an attacker who can delete
+  // `audit_integrity_checkpoints` rows before an honest re-export would
+  // get a smaller, honestly re-signed count with nothing to catch it.
+  if (manifest.version >= 4) {
+    checked += 1;
+    if (checkpoints.length !== manifest.integrityCheckpointCount) {
+      failed += 1;
+      if (firstFailure === undefined) {
+        firstFailure = 'integrityCheckpoints';
+        reason = `integrity checkpoint count mismatch: bundle has ${checkpoints.length} checkpoints but signed manifest declares ${manifest.integrityCheckpointCount}`;
+      }
+    }
+  }
   return {
     ok: failed === 0,
-    checked: 2,
+    checked,
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
@@ -1022,6 +1188,173 @@ function verifyRootCoverage(
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
   };
+}
+
+/**
+ * FIX01 F5(b) — see the `integrityCheckpoints` field doc comment on
+ * {@link VerifyReport} for the full rationale and the documented residual
+ * (legitimate `AuditRetentionSeal` purges can trigger these reasons too).
+ *
+ * No-ops (returns `{ok:true, checked:0, failed:0}`) for `manifest.version
+ * < 4` — earlier manifests carry no checkpoint commitment at all, so
+ * there is nothing to check, not a pass on a claim that was never made.
+ */
+function verifyIntegrityCheckpoints(
+  manifest: BundleManifest,
+  rows: BundleRow[],
+  checkpoints: BundleIntegrityCheckpoint[],
+  publicKeys: Map<number, PublicKeyRecord>,
+): ComponentResult {
+  if (manifest.version < 4) {
+    return { ok: true, checked: 0, failed: 0 };
+  }
+
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  // 1) Per-checkpoint signature authenticity — same REVOKED-key-rejection
+  // rule as rows/roots. This is the part of F5(b) with NO known
+  // false-positive path: it only fails on a genuinely wrong signature, a
+  // signature under a key not in this bundle's own signed set, or a
+  // REVOKED key.
+  for (const cp of checkpoints) {
+    checked += 1;
+    const entry = publicKeys.get(cp.keyVersion);
+    if (!entry) {
+      fail(
+        cp.id,
+        `checkpoint keyVersion ${cp.keyVersion} not in public-keys.json`,
+      );
+      continue;
+    }
+    if (entry.status === 'REVOKED') {
+      fail(cp.id, 'key_revoked');
+      continue;
+    }
+    const message = canonicalJson({
+      organizationId: cp.organizationId,
+      chainHeadHash: cp.chainHeadHash,
+      cumulativeRowCount: cp.cumulativeRowCount,
+      asOf: cp.asOf,
+    });
+    if (!verifySignature(cp.signatureAlgorithm, message, cp.signature, entry.publicKey)) {
+      fail(cp.id, 'checkpoint signature does not verify');
+    }
+  }
+
+  // 2) `cumulativeRowCount` must be monotonically non-decreasing in `asOf`
+  // order. Compared as BigInt (the wire value is bigint-as-string) to
+  // avoid Number precision loss on a very chatty tenant.
+  //
+  // KNOWN RESIDUAL — see the field doc comment on `VerifyReport
+  // .integrityCheckpoints`: `AuditRetentionSealService.purgeWithSeal` can
+  // legitimately DECREASE this value. No seal evidence is in the bundle
+  // today to distinguish that from tampering, so this still fails closed,
+  // but the reason string names the possibility explicitly.
+  const byAsOf = [...checkpoints].sort(
+    (a, b) => Date.parse(a.asOf) - Date.parse(b.asOf),
+  );
+  for (let i = 1; i < byAsOf.length; i++) {
+    checked += 1;
+    const prev = byAsOf[i - 1]!;
+    const cur = byAsOf[i]!;
+    let prevCount: bigint;
+    let curCount: bigint;
+    try {
+      prevCount = BigInt(prev.cumulativeRowCount);
+      curCount = BigInt(cur.cumulativeRowCount);
+    } catch {
+      fail(cur.id, 'checkpoint cumulativeRowCount is not a valid integer string');
+      continue;
+    }
+    if (curCount < prevCount) {
+      fail(
+        cur.id,
+        `cumulative_row_count_decreased: checkpoint at ${cur.asOf} claims cumulativeRowCount ${curCount} but an earlier checkpoint at ${prev.asOf} claimed ${prevCount} — a decrease means rows were deleted between these two signed snapshots UNLESS this org executed a signed AuditRetentionSeal purge in that window (not cross-checked by this verifier version; confirm against the org's AuditRetentionSeal records before treating this as tampering)`,
+      );
+    }
+  }
+
+  // 3) Each checkpoint's `chainHeadHash` must match the true tip of the
+  // bundle's OWN rows restricted to `signedAt <= asOf`. This subsumes both
+  // halves of the originally-recommended algorithm (recompute the latest
+  // head; walk an earlier head backward) into one per-checkpoint check.
+  //
+  // A checkpoint whose window contains NO bundled rows is legitimately
+  // ambiguous — either the org was dormant through `asOf` (its true head
+  // predates the bundle's `[from, to)` range, a boundary case exactly like
+  // `rootCoverage`'s boundary-period exemption) or a genuine
+  // `AuditRetentionSeal` purge removed every row in that window. Neither
+  // is distinguishable from the bundle alone, so it is SKIPPED (not
+  // asserted), EXCEPT when the checkpoint itself claims the all-zero
+  // genesis hash — that claim ("no rows existed yet") is fully consistent
+  // with an empty window and is checked as a pass, not skipped.
+  for (const cp of checkpoints) {
+    const cpMs = Date.parse(cp.asOf);
+    const tip = trueSubchainTip(rows, cpMs);
+    if (tip === null) {
+      if (cp.chainHeadHash === GENESIS_PREV_ROW_HASH) {
+        checked += 1; // consistent: no rows at/before asOf, claims genesis.
+      }
+      continue; // ambiguous (dormant/boundary/purged/broken) — not asserted.
+    }
+    checked += 1;
+    const computedLink = computeChainLink(tip);
+    if (computedLink !== cp.chainHeadHash) {
+      fail(
+        cp.id,
+        `chain_head_hash_mismatch: checkpoint at ${cp.asOf} claims chainHeadHash ${cp.chainHeadHash} but the bundle's own rows (as of that instant) chain to ${String(computedLink)} — this means rows were altered or deleted after the checkpoint was signed UNLESS explained by a signed AuditRetentionSeal purge in that window (not cross-checked by this verifier version)`,
+      );
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/**
+ * FIX01 F5(b) — the true tip (most-recently-chained row) of the SUBSET of
+ * `rows` with `signedAt <= atOrBeforeMs`, found by the same
+ * link-not-claimed-by-any-successor logic `verifyChain` uses for the
+ * OTHER end of the chain (the leading anchor). Returns `null` when the
+ * subset is empty, or when it doesn't resolve to exactly one tip (a
+ * within-window fork/break — already surfaced by `chain` itself; this
+ * function declines to double-report it here).
+ */
+function trueSubchainTip(
+  rows: BundleRow[],
+  atOrBeforeMs: number,
+): BundleRow | null {
+  const inWindow = rows.filter((r) => {
+    if (typeof r.signedAt !== 'string') return false;
+    const t = Date.parse(r.signedAt);
+    return !Number.isNaN(t) && t <= atOrBeforeMs;
+  });
+  if (inWindow.length === 0) return null;
+
+  const claimedLinks = new Set<string>();
+  for (const r of inWindow) {
+    if (typeof r.prevRowHash === 'string') claimedLinks.add(r.prevRowHash);
+  }
+  const tips = inWindow.filter((r) => {
+    const link = computeChainLink(r);
+    return link !== null && !claimedLinks.has(link);
+  });
+  return tips.length === 1 ? tips[0]! : null;
 }
 
 function verifyRowSignatures(
@@ -2057,6 +2390,47 @@ function assertManifestStructure(manifest: BundleManifest): void {
     !isIsoDate(manifest.chainSeqSnapshotAt)
   ) {
     throw new Error('manifest.json has an invalid structure');
+  }
+  // FIX01 F5(b) — same format-sanity-only check for
+  // `integrityCheckpointCount`; presence-vs-version is a tampering/skew
+  // concern checked in `verifyManifest`, not a format concern.
+  if (
+    'integrityCheckpointCount' in manifest &&
+    (!Number.isSafeInteger(manifest.integrityCheckpointCount) ||
+      manifest.integrityCheckpointCount! < 0)
+  ) {
+    throw new Error('manifest.json has an invalid structure');
+  }
+}
+
+function assertIntegrityCheckpointsStructure(
+  checkpoints: BundleIntegrityCheckpoint[],
+  orgId: string,
+): void {
+  const ids = new Set<string>();
+  for (const cp of checkpoints) {
+    if (
+      !cp ||
+      typeof cp !== 'object' ||
+      typeof cp.id !== 'string' ||
+      cp.id.length === 0 ||
+      ids.has(cp.id) ||
+      cp.organizationId !== orgId ||
+      typeof cp.chainHeadHash !== 'string' ||
+      typeof cp.cumulativeRowCount !== 'string' ||
+      !/^\d+$/.test(cp.cumulativeRowCount) ||
+      !isIsoDate(cp.asOf) ||
+      typeof cp.signature !== 'string' ||
+      (cp.signatureAlgorithm !== 'Ed25519' &&
+        cp.signatureAlgorithm !== 'ECDSA_P256_SHA256') ||
+      !Number.isSafeInteger(cp.keyVersion) ||
+      cp.keyVersion < 1
+    ) {
+      throw new Error(
+        `integrity-checkpoints.ndjson.gz has an invalid/duplicate checkpoint: ${String(cp?.id)}`,
+      );
+    }
+    ids.add(cp.id);
   }
 }
 

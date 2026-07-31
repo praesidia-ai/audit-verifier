@@ -155,6 +155,27 @@ checks every cryptographic invariant the bundle commits to:
     the bundle's date range is exempted (a genuine ranged export
     legitimately ships fewer rows for it, since rows outside `[from, to)`
     are never exported).
+11. **Integrity checkpoints** (`version: 4`+ only) — `be`'s
+    `AuditIntegrityCheckpointService` periodically (hourly) signs and
+    persists `{organizationId, chainHeadHash, cumulativeRowCount, asOf}`
+    for every org, independent of any Merkle-root period or bundle export.
+    When present, the verifier: (a) authenticates every checkpoint's own
+    signature (REVOKED-key rejection, same as rows/roots); (b) requires
+    `cumulativeRowCount` to be monotonically non-decreasing across
+    checkpoints in `asOf` order; (c) independently recomputes each
+    checkpoint's `chainHeadHash` from the bundle's OWN rows restricted to
+    `signedAt <= asOf` and compares. A checkpoint whose window contains no
+    bundled rows (a dormant org, or a historical ranged export ending
+    before that instant) is a legitimate boundary case and is skipped, not
+    asserted — mirroring root coverage's own boundary exemption — UNLESS
+    the checkpoint claims the all-zero genesis hash, which is fully
+    consistent with an empty window and IS checked. **Known residual:**
+    `AuditRetentionSealService.purgeWithSeal` (a real, already-shipped,
+    feature-flagged, two-person-approval-gated hard-delete of signed rows)
+    can legitimately trigger (b) or (c); no seal evidence is in the bundle
+    today to distinguish that from tampering, so this still fails closed,
+    with a reason string that names the possibility explicitly rather than
+    reading as certain tampering.
 
 S3 anchor receipts cannot be proven offline from their locator string alone.
 The library therefore fails closed for S3 by default; callers can provide an
@@ -162,7 +183,7 @@ The library therefore fails closed for S3 by default; callers can provide an
 trust boundary.
 
 `manifest.version` is checked against an explicit ceiling
-(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 3) — a bundle declaring a newer
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 4) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's
@@ -195,23 +216,40 @@ fields in the same change.
 - If `platform-attestation.json` is present (or `--allow-legacy-unattested`
   is NOT passed), that Praesidia's platform — not just the tenant — vouched
   for the key-to-org binding.
+- For `version: 4`+ bundles, that the org's cumulative signed-row count and
+  chain head at each checkpointed hour were not shrunk or rewritten after
+  the fact — bounding an undetectable suffix deletion in the un-rooted
+  tail, or a boundary period, to at most one checkpoint interval, in the
+  common case where the bundle's own rows span up to (or past) the
+  checkpoint's `asOf` (see invariant 11's boundary exemption and residual).
 
 **Does NOT prove**, even on `ok: true`:
 
 - **That every action was captured in the first place.** A signing outage
   (governance mode `off`, or a failed sign under `observe`) can produce an
   invisible hole: an unsigned row is invisible to the chain, the Merkle
-  roots, and the exported bundle alike, with no marker in the artifact. Two
-  hours of signing downtime and two hours of deleted rows currently look
-  identical to this verifier.
+  roots, the checkpoints, and the exported bundle alike, with no marker in
+  the artifact. Two hours of signing downtime and two hours of deleted
+  rows currently look identical to this verifier.
 - **That a not-yet-anchored (or boundary/partially-anchored) period wasn't
-  truncated.** Root coverage (10) only binds a root's committed count once
-  that root exists and its FULL period is inside the bundle's range. The
-  newest, not-yet-rooted tail of an org's history, and a boundary root that
-  only partially overlaps the requested range, have no independent size
-  commitment yet — closing that residual window requires the producer to
-  anchor a periodic cumulative checkpoint, which this verifier does not
-  receive today.
+  truncated — in full.** Root coverage (10) only binds a root's committed
+  count once that root exists and its FULL period is inside the bundle's
+  range. `version: 4`+ integrity checkpoints (11) now close PART of this:
+  when the bundle's rows demonstrably extend up to a checkpoint's `asOf`,
+  a suffix deletion after that instant is caught, bounding the
+  undetectable window to at most one checkpoint interval (hourly) for both
+  the un-rooted tail and a boundary period. The residual that remains
+  open even on `ok: true`: (a) bundles on `version <= 3` (no checkpoint
+  commitment at all — the original gap, unchanged); (b) a checkpoint whose
+  `asOf` predates every bundled row is a legitimate boundary/dormant-org
+  case and is deliberately NOT asserted, so a bundle whose ENTIRE checked
+  range sits before its org's actual current head (a narrow historical
+  export of a still-active org) gets no independent size commitment from
+  checkpoints either, same as before; (c) the checkpoint checks can
+  legitimately fail closed (report `ok: false`, not a silent pass) across
+  a genuine, signed `AuditRetentionSeal` hard-purge — that residual is
+  documented on the `integrityCheckpoints` component, not silently
+  absorbed.
 - **That Rekor/S3 anchoring exists at all**, unless you read the `rekor`
   component specifically. A bundle can report overall `ok: true` while
   `rekor.reason` says `no_external_witness` (this deployment has anchoring
@@ -259,6 +297,38 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.6.0 (FIX01 F5(b))
+
+- **`manifest.version: 4` is now understood** (`PROD16-CONTRACT-manifest-v4-checkpoints.md`).
+  Adds `integrityCheckpointCount` inside the signed manifest preimage and a
+  new, conditionally-required bundle entry `integrity-checkpoints.ndjson.gz`
+  carrying `be`'s `AuditIntegrityCheckpointService` rows
+  (`{organizationId, chainHeadHash, cumulativeRowCount, asOf}`, each
+  independently signed). Same both-directions version/field-presence rule
+  as v3's `chainSeqCeiling`/`chainSeqSnapshotAt`
+  (`integrity_checkpoint_count_present_on_v{1,2,3}_manifest` /
+  `integrity_checkpoint_count_missing_on_v4_manifest`).
+- **New `integrityCheckpoints` component** (see invariant 11 above):
+  authenticates each checkpoint's signature, requires monotonic
+  non-decreasing `cumulativeRowCount` across checkpoints, and cross-checks
+  each checkpoint's `chainHeadHash` against the bundle's own reconstructed
+  row chain as of that instant — closing PART of the previously-documented
+  "un-rooted tail / boundary period has no independent size commitment"
+  gap. See the "does NOT prove" section above for exactly which part
+  remains open (pre-v4 bundles; a checkpoint whose window predates every
+  bundled row; and a documented, explicit residual against the
+  already-shipped `AuditRetentionSeal` hard-purge mechanism, which this
+  verifier cannot yet distinguish from tampering).
+- `MAX_SUPPORTED_MANIFEST_VERSION` raised from 3 to 4.
+- `manifest.integrityCheckpointCount` (optional, additive) and
+  `completeness` now also binds it to the number of checkpoints actually
+  present, same anti-suppression rationale as `rowCount`/`rootCount`.
+- New `VerifyReport.integrityCheckpoints` field (additive) and a new CLI
+  output line. v1/v2/v3 bundles are completely unaffected — confirmed by
+  the full pre-existing 84-test suite passing unmodified alongside 11 new
+  tests built from `be`'s actual entity/service field set and signed
+  preimage, not a hand-built guess of it.
 
 ### 0.5.0 (PROD16 §1b)
 

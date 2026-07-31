@@ -2984,4 +2984,445 @@ describe('verifyBundle', () => {
       expect(report.ok).toBe(true);
     });
   });
+
+  describe('FIX01 F5(b) — manifest v4 integrity checkpoints', () => {
+    /**
+     * Mirrors the REAL `be` producer shape byte-for-byte:
+     *  - entity: `audit-integrity-checkpoint.entity.ts`
+     *    (`{id, organizationId, chainHeadHash, cumulativeRowCount, asOf,
+     *    signature, signatureAlgorithm, keyVersion, createdAt}`).
+     *  - signed preimage: `audit-integrity-checkpoint.service.ts`'s
+     *    `canonicalJson({organizationId, chainHeadHash, cumulativeRowCount,
+     *    asOf: asOf.toISOString()})` — reproduced here exactly, not
+     *    reinvented, so this is the round-trip test the ticket asked for
+     *    against the producer's actual field set and preimage, not a
+     *    hand-built guess of it.
+     */
+    interface CheckpointDef {
+      id: string;
+      asOfIso: string;
+      chainHeadHash: string;
+      cumulativeRowCount: string;
+      keyVersion?: number;
+      privateKeyOverride?: Uint8Array;
+      tamperSignature?: boolean;
+    }
+
+    function signCheckpoint(
+      def: CheckpointDef,
+      orgId: string,
+      privateKey: Uint8Array,
+    ): Record<string, unknown> {
+      const message = canonicalJson({
+        organizationId: orgId,
+        chainHeadHash: def.chainHeadHash,
+        cumulativeRowCount: def.cumulativeRowCount,
+        asOf: def.asOfIso,
+      });
+      let signature = signEd25519(message, privateKey);
+      if (def.tamperSignature) {
+        const bytes = Buffer.from(signature, 'base64');
+        bytes[0] = (bytes[0]! + 1) % 256;
+        signature = bytes.toString('base64');
+      }
+      return {
+        id: def.id,
+        organizationId: orgId,
+        chainHeadHash: def.chainHeadHash,
+        cumulativeRowCount: def.cumulativeRowCount,
+        asOf: def.asOfIso,
+        signature,
+        signatureAlgorithm: 'Ed25519',
+        keyVersion: def.keyVersion ?? 1,
+        createdAt: def.asOfIso,
+      };
+    }
+
+    /**
+     * Builds a v4 bundle on top of the standard 4-row fixture
+     * (`buildFixtureBundle`). `checkpointDefs` are signed with the
+     * fixture's primary key (seed 7) unless a def carries its own
+     * `privateKeyOverride`/`keyVersion`.
+     */
+    function buildV4Bundle(opts: {
+      checkpointDefs: CheckpointDef[];
+      integrityCheckpointCountOverride?: number;
+      omitCheckpointsFile?: boolean;
+      extraPublicKeys?: Record<string, unknown>;
+      extraManifestKeyVersions?: Array<Record<string, unknown>>;
+      versionOverride?: number;
+    }): { zip: Buffer } {
+      const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const orgId = originalManifest.orgId as string;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+
+      const checkpoints = opts.checkpointDefs.map((def) =>
+        signCheckpoint(
+          def,
+          orgId,
+          def.privateKeyOverride ?? privateKey,
+        ),
+      );
+
+      const version = opts.versionOverride ?? 4;
+      const manifestSans: Record<string, unknown> = {
+        version,
+        orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [
+          {
+            keyVersion: 1,
+            publicKey: publicKeyB64,
+            status: 'ACTIVE',
+            revokedAt: null,
+          },
+          ...(opts.extraManifestKeyVersions ?? []),
+        ],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+      };
+      if (version >= 3) {
+        manifestSans.chainSeqCeiling = 4;
+        manifestSans.chainSeqSnapshotAt = '2026-05-01T01:00:30.000Z';
+      }
+      if (version >= 4 || opts.integrityCheckpointCountOverride !== undefined) {
+        manifestSans.integrityCheckpointCount =
+          opts.integrityCheckpointCountOverride ?? checkpoints.length;
+      }
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+
+      const publicKeys: Record<string, unknown> = {
+        '1': { publicKey: publicKeyB64, status: 'ACTIVE', revokedAt: null },
+        ...(opts.extraPublicKeys ?? {}),
+      };
+
+      const checkpointsNdjson = Buffer.from(
+        checkpoints.map((c) => JSON.stringify(c)).join('\n') +
+          (checkpoints.length > 0 ? '\n' : ''),
+        'utf8',
+      );
+
+      const zipEntries = [
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+      ];
+      if (!opts.omitCheckpointsFile) {
+        zipEntries.push({
+          name: 'integrity-checkpoints.ndjson.gz',
+          data: gzipDeterministic(checkpointsNdjson),
+        });
+      }
+      return { zip: writeZip(zipEntries) };
+    }
+
+    // Fixture chain facts (see buildFixtureBundle): 4 rows, org
+    // '00000000-0000-0000-0000-000000000001', signedAt at
+    // 2026-05-01T00:00:0{1,61→01:01,...} — row 3 (last) is the true chain
+    // tip. `tipChainHeadHash` is recomputed independently here (NOT copied
+    // from the fixture's internals) via the same `computeChainLink`
+    // formula the verifier itself uses, over row 3's signable bytes + its
+    // own signature bytes.
+    function tipChainHeadHash(base: FixtureBundle): string {
+      const row3 = base.rows[3]!;
+      const canonical = canonicalJson(signableRow(row3));
+      const sigBytes = Buffer.from(row3.signature, 'base64');
+      return sha256(Buffer.concat([canonical, sigBytes])).toString('base64');
+    }
+
+    it('round-trips a genuine v4 manifest + checkpoints (be-exported shape) end to end', async () => {
+      const base = buildFixtureBundle();
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-0',
+            asOfIso: '2026-04-30T23:59:00.000Z', // before any row
+            chainHeadHash: GENESIS_PREV_ROW_HASH,
+            cumulativeRowCount: '0',
+          },
+          {
+            id: 'cp-1',
+            asOfIso: '2026-05-01T01:30:00.000Z', // after all 4 rows
+            chainHeadHash: tipChainHeadHash(base),
+            cumulativeRowCount: '4',
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(true);
+      expect(report.integrityCheckpoints.failed).toBe(0);
+      expect(report.completeness.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('rejects a v4 manifest missing integrityCheckpointCount with a distinct reason', async () => {
+      const seed = Buffer.alloc(32, 7);
+      const { privateKey, publicKey } = keypairFromSeed(seed);
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+      const manifestSans: Record<string, unknown> = {
+        version: 4,
+        orgId: originalManifest.orgId,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        rowCount: originalManifest.rowCount,
+        rootCount: originalManifest.rootCount,
+        keyVersions: [
+          {
+            keyVersion: 1,
+            publicKey: publicKeyB64,
+            status: 'ACTIVE',
+            revokedAt: null,
+          },
+        ],
+        generatedAt: originalManifest.generatedAt,
+        signatureAlgorithm: originalManifest.signatureAlgorithm,
+        chainSeqCeiling: 4,
+        chainSeqSnapshotAt: '2026-05-01T01:00:30.000Z',
+        // integrityCheckpointCount deliberately omitted.
+      };
+      const manifestBytes = canonicalJson(manifestSans);
+      const manifestSignature = signEd25519(manifestBytes, privateKey);
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: 1,
+      };
+      const zip = writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+        { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
+        { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+        {
+          name: 'public-keys.json',
+          data: entries.get('public-keys.json')!,
+        },
+        { name: 'README.md', data: entries.get('README.md')! },
+        {
+          name: 'integrity-checkpoints.ndjson.gz',
+          data: gzipDeterministic(Buffer.alloc(0)),
+        },
+      ]);
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(false);
+      expect(report.manifest.reason).toMatch(
+        /integrity_checkpoint_count_missing_on_v4_manifest/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('rejects a v3 manifest that illegitimately carries integrityCheckpointCount', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [],
+        versionOverride: 3,
+        integrityCheckpointCountOverride: 0,
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(false);
+      expect(report.manifest.reason).toMatch(
+        /integrity_checkpoint_count_present_on_v3_manifest/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('fails as a bundle-format error when v4 is declared but integrity-checkpoints.ndjson.gz is absent', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [],
+        omitCheckpointsFile: true,
+      });
+      await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
+        /missing required entry: integrity-checkpoints\.ndjson\.gz/,
+      );
+    });
+
+    it('fails closed on a tampered checkpoint signature', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-0',
+            asOfIso: '2026-04-30T23:59:00.000Z',
+            chainHeadHash: GENESIS_PREV_ROW_HASH,
+            cumulativeRowCount: '0',
+            tamperSignature: true,
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(false);
+      expect(report.integrityCheckpoints.reason).toMatch(
+        /checkpoint signature does not verify/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('fails closed on a checkpoint signed under a REVOKED key', async () => {
+      const seed2 = Buffer.alloc(32, 9);
+      const { privateKey: revokedPriv, publicKey: revokedPub } =
+        keypairFromSeed(seed2);
+      const revokedPubB64 = Buffer.from(revokedPub).toString('base64');
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-revoked',
+            asOfIso: '2026-04-30T23:59:00.000Z',
+            chainHeadHash: GENESIS_PREV_ROW_HASH,
+            cumulativeRowCount: '0',
+            keyVersion: 2,
+            privateKeyOverride: revokedPriv,
+          },
+        ],
+        extraPublicKeys: {
+          '2': {
+            publicKey: revokedPubB64,
+            status: 'REVOKED',
+            revokedAt: '2026-04-15T00:00:00.000Z',
+          },
+        },
+        extraManifestKeyVersions: [
+          {
+            keyVersion: 2,
+            publicKey: revokedPubB64,
+            status: 'REVOKED',
+            revokedAt: '2026-04-15T00:00:00.000Z',
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(false);
+      expect(report.integrityCheckpoints.reason).toMatch(/key_revoked/);
+      expect(report.ok).toBe(false);
+    });
+
+    it('fails closed when cumulativeRowCount decreases between two checkpoints (suffix-deletion signal)', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-a',
+            // Both well before any bundled row so the chain-head-hash
+            // check is skipped (ambiguous/dormant) and this test isolates
+            // the monotonic-count check alone.
+            asOfIso: '2026-04-30T22:00:00.000Z',
+            chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+              'base64',
+            ),
+            cumulativeRowCount: '5',
+          },
+          {
+            id: 'cp-b',
+            asOfIso: '2026-04-30T23:00:00.000Z',
+            chainHeadHash: sha256(Buffer.from('arbitrary-b')).toString(
+              'base64',
+            ),
+            cumulativeRowCount: '3',
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(false);
+      expect(report.integrityCheckpoints.reason).toMatch(
+        /cumulative_row_count_decreased/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('fails closed when a checkpoint claims a chainHeadHash the bundle rows do not reach', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-tip',
+            asOfIso: '2026-05-01T01:30:00.000Z', // after all 4 rows exist
+            chainHeadHash: GENESIS_PREV_ROW_HASH, // wrong: true tip isn't genesis
+            cumulativeRowCount: '4',
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(false);
+      expect(report.integrityCheckpoints.reason).toMatch(
+        /chain_head_hash_mismatch/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('does NOT flag a checkpoint whose asOf predates every bundled row (dormant-org / boundary export) — avoids a false suffix-deletion report', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-early',
+            asOfIso: '2026-04-30T22:00:00.000Z', // before row 0's signedAt
+            // A non-genesis, arbitrary claim: if this bundle's rows were
+            // wrongly treated as authoritative for this instant, this
+            // would look unreachable and fail. It must NOT be asserted.
+            chainHeadHash: sha256(Buffer.from('pre-range-head')).toString(
+              'base64',
+            ),
+            cumulativeRowCount: '117',
+          },
+        ],
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(true);
+      expect(report.integrityCheckpoints.failed).toBe(0);
+      expect(report.ok).toBe(true);
+    });
+
+    it('completeness fails closed when checkpoints.length disagrees with the signed integrityCheckpointCount', async () => {
+      const { zip } = buildV4Bundle({
+        checkpointDefs: [
+          {
+            id: 'cp-0',
+            asOfIso: '2026-04-30T23:59:00.000Z',
+            chainHeadHash: GENESIS_PREV_ROW_HASH,
+            cumulativeRowCount: '0',
+          },
+        ],
+        integrityCheckpointCountOverride: 2, // signed count says 2, only 1 present
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.completeness.ok).toBe(false);
+      expect(report.completeness.reason).toMatch(
+        /integrity checkpoint count mismatch/,
+      );
+      expect(report.ok).toBe(false);
+    });
+
+    it('v1-v3 bundles (no checkpoints file at all) verify integrityCheckpoints as a trivial pass', async () => {
+      const { zip } = buildBundleWithTamper({});
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.integrityCheckpoints.ok).toBe(true);
+      expect(report.integrityCheckpoints.checked).toBe(0);
+      expect(report.ok).toBe(true);
+    });
+  });
 });

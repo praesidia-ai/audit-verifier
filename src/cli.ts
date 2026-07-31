@@ -115,6 +115,7 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('completeness      ', report.completeness));
   lines.push(fmtComponent('key binding       ', report.keyBinding));
   lines.push(fmtComponent('root coverage     ', report.rootCoverage));
+  lines.push(fmtComponent('integrity chkpts  ', report.integrityCheckpoints));
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
