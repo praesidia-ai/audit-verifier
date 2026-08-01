@@ -322,8 +322,49 @@ interface BundleProofEntry {
 // Public report
 // ────────────────────────────────────────────────────────────────────────
 
+/**
+ * PA-0009 (`PA01-DECISIONS.md` D15) — four-state component verdict.
+ *
+ * `ok: boolean` alone cannot express "this component does not apply to
+ * this bundle" (e.g. no target-acknowledgment evidence because the org is
+ * evidence-grade-D, SDK-only, by design) or "there is not enough evidence
+ * present to decide" (distinct from "the evidence present says invalid").
+ * Collapsing either of those into `ok: false` is a lie in the other
+ * direction: a bundle that legitimately has nothing to check for a given
+ * component would drag the whole verdict down even though nothing is
+ * wrong.
+ *
+ * - `valid`       — checked, and every check passed.
+ * - `invalid`     — checked, and at least one check failed. The only
+ *                   status that should read as "this bundle is suspect."
+ * - `incomplete`  — evidence present is insufficient to decide either way
+ *                   (distinct from `unsupported`: the component DOES apply,
+ *                   but the bundle doesn't carry enough to confirm it).
+ * - `unsupported` — this component does not apply to this bundle at all
+ *                   (e.g. a manifest version below the one that introduces
+ *                   it, or a capture scope that never produces this
+ *                   evidence class). Never counted as a failure.
+ *
+ * As of this change none of the 11 pre-existing components ever produce
+ * `incomplete` or `unsupported` — their pass/fail semantics are preserved
+ * byte-for-byte (`status` is mechanically derived from the existing `ok`
+ * via `withStatus`, see below). The four-state type exists so the action
+ * components landing in PA-0010 (permit binding, target ack, evidence
+ * grade, etc. — `PA01-RESEARCH-proof.md` §4/§6) are built against the real
+ * shape from day one instead of being migrated twice.
+ */
+export type ComponentStatus = 'valid' | 'invalid' | 'incomplete' | 'unsupported';
+
 export interface ComponentResult {
+  /**
+   * Kept for backward compatibility with existing callers of the library
+   * (`verifyBundle`/`VerifyReport` have no importers outside this package
+   * as of PA-0009, confirmed by repo-wide grep, but the field is public
+   * API of a published package). DERIVED: `ok === (status === 'valid')`,
+   * always — never set independently of `status`.
+   */
   ok: boolean;
+  status: ComponentStatus;
   checked: number;
   failed: number;
   /** Identifier of the FIRST offender, when applicable. */
@@ -344,8 +385,54 @@ export interface ComponentResult {
   sealExemptions?: string[];
 }
 
+/**
+ * The shape every individual `verifyXxx()` function still returns —
+ * `ComponentResult` minus `status`. Kept distinct from `ComponentResult`
+ * itself so the compiler enforces that `status` is ALWAYS attached via
+ * `withStatus` at the `verifyBundle` call site, never hand-set (or
+ * forgotten) inside an individual component verifier.
+ */
+type RawComponentResult = Omit<ComponentResult, 'status'>;
+
+/**
+ * PA-0009 — attach a `status` to a `ComponentResult` produced by one of the
+ * pre-existing (boolean-only) component verifiers, deriving `ok` FROM
+ * `status` rather than the other way around, so a future call site that
+ * legitimately needs `incomplete`/`unsupported` can pass it explicitly
+ * without a second migration. Every one of today's 11 components calls
+ * this with no explicit `status` — i.e. their pass/fail behavior is
+ * unchanged, byte-for-byte, by this function's existence.
+ */
+function withStatus(
+  result: RawComponentResult,
+  status?: ComponentStatus,
+): ComponentResult {
+  const resolved: ComponentStatus = status ?? (result.ok ? 'valid' : 'invalid');
+  return { ...result, status: resolved, ok: resolved === 'valid' };
+}
+
+/**
+ * Top-level reduction (`PA01-DECISIONS.md` D15) — NOT "any component
+ * failed". `invalid` if any component is invalid; else `incomplete` if any
+ * is incomplete; else `valid`. `unsupported` components are excluded from
+ * the reduction entirely — they never drag the overall verdict down.
+ */
+function reduceStatus(
+  results: readonly ComponentResult[],
+): Exclude<ComponentStatus, 'unsupported'> {
+  if (results.some((r) => r.status === 'invalid')) return 'invalid';
+  if (results.some((r) => r.status === 'incomplete')) return 'incomplete';
+  return 'valid';
+}
+
 export interface VerifyReport {
   ok: boolean;
+  /**
+   * PA-0009 — real reduction over every component's `status`, see
+   * `reduceStatus`. Never `unsupported` at the top level (D15) — that
+   * status only ever appears per-component.
+   */
+  status: Exclude<ComponentStatus, 'unsupported'>;
   manifest: ComponentResult;
   rowSignatures: ComponentResult;
   chain: ComponentResult;
@@ -662,7 +749,7 @@ export async function verifyBundle(
   }
 
   // 3) Verify manifest signature.
-  const manifestResult = verifyManifest(manifest, publicKeys);
+  const manifestResult = withStatus(verifyManifest(manifest, publicKeys));
 
   // 4) Parse + verify rows.
   const rowsNdjson = gunzip(byName.get('rows.ndjson.gz')!.data);
@@ -673,28 +760,24 @@ export async function verifyBundle(
   // row + root signature checks. Every signature in a bundle uses
   // the same algorithm as the manifest (be-core's producer never
   // mixes algorithms within one bundle).
-  const rowSigResult = verifyRowSignatures(
-    rows,
-    publicKeys,
-    manifest.signatureAlgorithm,
+  const rowSigResult = withStatus(
+    verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm),
   );
-  const chainResult = verifyChain(rows);
+  const chainResult = withStatus(verifyChain(rows));
 
   // 5) Parse + verify roots.
   const rootsNdjson = gunzip(byName.get('roots.ndjson.gz')!.data);
   const roots = parseNdjson<BundleRoot>(rootsNdjson);
   assertRootsStructure(roots, manifest.orgId);
-  const rootSigResult = verifyRootSignatures(
-    roots,
-    publicKeys,
-    manifest.signatureAlgorithm,
+  const rootSigResult = withStatus(
+    verifyRootSignatures(roots, publicKeys, manifest.signatureAlgorithm),
   );
 
   // 6) Parse + verify inclusion proofs.
   const proofsNdjson = gunzip(byName.get('proofs.ndjson.gz')!.data);
   const proofs = parseNdjson<BundleProofEntry>(proofsNdjson);
   assertProofsStructure(proofs);
-  const proofResult = verifyInclusionProofs(rows, roots, proofs);
+  const proofResult = withStatus(verifyInclusionProofs(rows, roots, proofs));
 
   // 6b) FIX01 F5(b) — parse + verify integrity checkpoints (v4+ only; an
   // empty array for every earlier version).
@@ -722,69 +805,76 @@ export async function verifyBundle(
   assertSealedPurgesStructure(sealedPurges, manifest.orgId);
   const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys);
 
-  const integrityCheckpointsResult = verifyIntegrityCheckpoints(
-    manifest,
-    rows,
-    checkpoints,
-    publicKeys,
-    verifiedSeals,
+  const integrityCheckpointsResult = withStatus(
+    verifyIntegrityCheckpoints(
+      manifest,
+      rows,
+      checkpoints,
+      publicKeys,
+      verifiedSeals,
+    ),
   );
 
   // 7) Optional Rekor fetch.
-  const rekorResult = await verifyRekorReceipts(roots, options);
+  const rekorResult = withStatus(await verifyRekorReceipts(roots, options));
 
   // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
   // The entry remains optional in the ZIP grammar for backwards parsing,
   // but its absence fails verification unless explicitly allowed.
-  const platformResult = verifyPlatformAttestation(
-    byName.get('platform-attestation.json') ?? null,
-    publicKeysRaw,
-    manifest.orgId,
-    options,
+  const platformResult = withStatus(
+    verifyPlatformAttestation(
+      byName.get('platform-attestation.json') ?? null,
+      publicKeysRaw,
+      manifest.orgId,
+      options,
+    ),
   );
 
   // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
   // match what is actually present, or a trailing-truncation attack
   // slips through (the surviving prefix still chains + proves).
-  const completenessResult = verifyCompleteness(
-    manifest,
-    rows,
-    roots,
-    checkpoints,
+  const completenessResult = withStatus(
+    verifyCompleteness(manifest, rows, roots, checkpoints),
   );
 
   // 10) BUG-AUDIT-03 / PROD15 — Bind the (unsigned) `public-keys.json`
   // bytes AND lifecycle (status/revokedAt) the verifier trusts against
   // the SIGNED `manifest.keyVersions` set.
-  const keyBindingResult = verifyKeyBinding(manifest, publicKeysRaw, publicKeys);
+  const keyBindingResult = withStatus(
+    verifyKeyBinding(manifest, publicKeysRaw, publicKeys),
+  );
 
   // 11) PROD16 — Root row-coverage: bind each fully-contained root's
   // SIGNED rowCount to the bundle's own row/proof counts for that period,
   // closing the trailing-suffix-deletion gap `completeness` cannot see
   // (see the `rootCoverage` field doc comment above).
-  const rootCoverageResult = verifyRootCoverage(
-    manifest,
-    rows,
-    roots,
-    proofs,
-    verifiedSeals,
+  const rootCoverageResult = withStatus(
+    verifyRootCoverage(manifest, rows, roots, proofs, verifiedSeals),
   );
 
-  const ok =
-    manifestResult.ok &&
-    rowSigResult.ok &&
-    chainResult.ok &&
-    rootSigResult.ok &&
-    proofResult.ok &&
-    rekorResult.ok &&
-    platformResult.ok &&
-    completenessResult.ok &&
-    keyBindingResult.ok &&
-    rootCoverageResult.ok &&
-    integrityCheckpointsResult.ok;
+  // PA-0009 (D15) — real reduction over `status`, not an AND of `ok`. See
+  // `reduceStatus` doc comment: `invalid` beats `incomplete` beats `valid`,
+  // and `unsupported` components (none exist among these 11 yet) are
+  // excluded entirely rather than counted as failure.
+  const allResults = [
+    manifestResult,
+    rowSigResult,
+    chainResult,
+    rootSigResult,
+    proofResult,
+    rekorResult,
+    platformResult,
+    completenessResult,
+    keyBindingResult,
+    rootCoverageResult,
+    integrityCheckpointsResult,
+  ];
+  const status = reduceStatus(allResults);
+  const ok = status === 'valid';
 
   return {
     ok,
+    status,
     manifest: manifestResult,
     rowSignatures: rowSigResult,
     chain: chainResult,
@@ -818,7 +908,7 @@ export async function verifyBundle(
 function verifyManifest(
   manifest: BundleManifest,
   publicKeys: Map<number, PublicKeyRecord>,
-): ComponentResult {
+): RawComponentResult {
   const entry = publicKeys.get(manifest.signatureKeyVersion);
   if (!entry) {
     return {
@@ -976,7 +1066,7 @@ function verifyCompleteness(
   rows: BundleRow[],
   roots: BundleRoot[],
   checkpoints: BundleIntegrityCheckpoint[],
-): ComponentResult {
+): RawComponentResult {
   let checked = 2;
   let failed = 0;
   let firstFailure: string | undefined;
@@ -1077,7 +1167,7 @@ function verifyKeyBinding(
   manifest: BundleManifest,
   publicKeysRaw: Record<string, unknown>,
   publicKeys: Map<number, PublicKeyRecord>,
-): ComponentResult {
+): RawComponentResult {
   const signed = new Map<
     number,
     { publicKey: Uint8Array; status?: string; revokedAt?: string | null }
@@ -1240,7 +1330,7 @@ function verifyRootCoverage(
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
   verifiedSeals: BundleSealedPurge[],
-): ComponentResult {
+): RawComponentResult {
   const fromMs = Date.parse(manifest.from);
   const toMs = Date.parse(manifest.to);
 
@@ -1373,7 +1463,7 @@ function verifyIntegrityCheckpoints(
   checkpoints: BundleIntegrityCheckpoint[],
   publicKeys: Map<number, PublicKeyRecord>,
   verifiedSeals: BundleSealedPurge[],
-): ComponentResult {
+): RawComponentResult {
   if (manifest.version < 4) {
     return { ok: true, checked: 0, failed: 0 };
   }
@@ -1634,7 +1724,7 @@ function verifyRowSignatures(
   rows: BundleRow[],
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
-): ComponentResult {
+): RawComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
@@ -1766,7 +1856,7 @@ function verifyRowSignatures(
  * Two rows ever declaring the identical `prevRowHash` (a fork — two rows
  * both claiming to succeed the same predecessor) fails closed immediately.
  */
-function verifyChain(rows: BundleRow[]): ComponentResult {
+function verifyChain(rows: BundleRow[]): RawComponentResult {
   if (rows.length === 0) {
     return { ok: true, checked: 0, failed: 0 };
   }
@@ -1866,7 +1956,7 @@ function verifyRootSignatures(
   roots: BundleRoot[],
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
-): ComponentResult {
+): RawComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
@@ -1929,7 +2019,7 @@ function verifyInclusionProofs(
   rows: BundleRow[],
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
-): ComponentResult {
+): RawComponentResult {
   const rowsById = new Map<string, BundleRow>();
   for (const r of rows) rowsById.set(r.id, r);
   const rootsByHash = new Map<string, BundleRoot>();
@@ -2090,7 +2180,7 @@ function verifyInclusionProofs(
 async function verifyRekorReceipts(
   roots: BundleRoot[],
   options: VerifyOptions,
-): Promise<ComponentResult> {
+): Promise<RawComponentResult> {
   if (options.noRekor) {
     return {
       ok: true,
@@ -2335,7 +2425,7 @@ function verifyPlatformAttestation(
   publicKeysRaw: Record<string, unknown>,
   manifestOrgId: string,
   options: VerifyOptions,
-): ComponentResult {
+): RawComponentResult {
   // Missing external trust evidence is a verification failure by default. An
   // auditor may explicitly opt into legacy self-signed bundle semantics.
   if (!entry) {

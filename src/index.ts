@@ -11,5 +11,6 @@ export { verifyBundle } from './verify.js';
 export type {
   VerifyReport,
   ComponentResult,
+  ComponentStatus,
   VerifyOptions,
 } from './verify.js';

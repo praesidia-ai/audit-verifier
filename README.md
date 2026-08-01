@@ -32,14 +32,36 @@ Options:
                Trust this PEM or SPKI-DER platform public key.
   --allow-legacy-unattested
                Explicitly accept a pre-attestation legacy bundle.
-  --quiet      Print only the final OK/FAIL line.
+  --quiet      Print only the final status word (OK/FAIL/INCOMPLETE).
+  --json       Print the full VerifyReport as stable machine-readable JSON
+               (mutually exclusive with --quiet; --json wins if both given).
   --help       Show this help message.
 
 Exit codes:
-  0   All signatures, chain links, and proofs verified.
-  1   Verification failure (signature, chain, or proof mismatch).
+  0   status: valid   — all signatures, chain links, and proofs verified.
+  1   status: invalid — a real verification failure.
   2   I/O or bundle-format error (malformed zip, missing file, etc.).
+  3   status: incomplete — evidence present is insufficient to decide
+      (distinct from a failure; no component in this release can produce
+      it yet — reserved for the action-proof components of a future
+      release, see "Verdict shape" below).
 ```
+
+## Verdict shape
+
+Every component result (`report.manifest`, `report.rowSignatures`, ...) and
+the top-level report both carry a `status: 'valid' | 'invalid' | 'incomplete'
+| 'unsupported'` field (`ok: boolean` is kept for backward compatibility,
+always derived as `status === 'valid'`). The top-level `status` is a real
+reduction, not "any component failed": `invalid` if any component is
+`invalid`; else `incomplete` if any is `incomplete`; else `valid`. A
+component reporting `unsupported` — this bundle legitimately carries no
+evidence for that check — is reported but never drags the overall verdict
+down. As of this release none of the checks below can produce `incomplete`
+or `unsupported`; the states exist so future evidence-grade-dependent
+checks (e.g. target-acknowledgment evidence that a grade-D, SDK-only org
+never produces by design) can report "does not apply" honestly instead of
+a false pass or a false fail.
 
 ## What it verifies
 

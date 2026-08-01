@@ -484,6 +484,56 @@ describe('verifyBundle', () => {
     expect(report.bundle.proofsSeen).toBe(4);
   });
 
+  /**
+   * PA-0009 (`PA01-DECISIONS.md` D15) — `status` is now the authoritative
+   * per-component and top-level verdict; `ok` is derived from it
+   * (`status === 'valid'`). Every one of today's 11 components can only
+   * ever produce `valid`/`invalid` — `incomplete`/`unsupported` are
+   * reserved for the action-proof components landing in PA-0010 — so this
+   * asserts the derivation is exact, not that new states appear yet.
+   */
+  it('reports status: valid on every component of a pristine bundle, and top-level status valid', async () => {
+    const { zip } = buildBundleWithTamper({});
+    const report = await verifyBundle(zip, { noRekor: true });
+    expect(report.status).toBe('valid');
+    expect(report.ok).toBe(true);
+    for (const component of [
+      report.manifest,
+      report.rowSignatures,
+      report.chain,
+      report.rootSignatures,
+      report.inclusionProofs,
+      report.rekor,
+      report.completeness,
+      report.keyBinding,
+      report.rootCoverage,
+      report.integrityCheckpoints,
+    ]) {
+      expect(component.status).toBe('valid');
+      expect(component.ok).toBe(true);
+    }
+  });
+
+  it('reports status: invalid at both component and top level when a component fails, never incomplete/unsupported', async () => {
+    const { zip } = buildBundleWithTamper({
+      postSignRowByte: (rows) => {
+        rows[2]!.action = 'agent.deleted';
+      },
+    });
+    const report = await verifyBundle(zip, { noRekor: true });
+    expect(report.status).toBe('invalid');
+    expect(report.ok).toBe(false);
+    expect(report.rowSignatures.status).toBe('invalid');
+    expect(report.rowSignatures.ok).toBe(false);
+    // The reduction is real, not "any failed" — an untouched component
+    // stays `valid`, it is not dragged to `invalid` by a sibling failure.
+    // (`chain` is deliberately NOT asserted here: a tampered row payload
+    // also breaks the next row's prev-row-hash link, so `chain` legitimately
+    // fails too — `manifest`, whose signature covers none of the row
+    // content, is the clean independent witness.)
+    expect(report.manifest.status).toBe('valid');
+  });
+
   it('detects a tampered row payload byte (row signature mismatch)', async () => {
     const { zip } = buildBundleWithTamper({
       postSignRowByte: (rows) => {
@@ -4181,6 +4231,112 @@ describe('verifyBundle', () => {
           fs.rmSync(tmpDir, { recursive: true, force: true });
         }
       });
+    });
+  });
+
+  /**
+   * PA-0009 — CLI `--json` flag and the `status`-derived exit codes
+   * (0 valid / 1 invalid / 3 incomplete; 2 stays reserved for I/O/format
+   * errors and is unaffected by this ticket). No component in this build
+   * can produce `incomplete`, so exit 3 is not exercisable end-to-end yet
+   * — the switch statement's `case 'incomplete': return 3;` branch is
+   * exact-mirrored from `reduceStatus`'s own exhaustive union, and will be
+   * covered live once PA-0010 lands a component that can return it.
+   */
+  describe('PA-0009 — CLI --json flag and status exit codes', () => {
+    function cliPathOrThrow(): string {
+      const testDir = path.dirname(fileURLToPath(import.meta.url));
+      const cliPath = path.resolve(testDir, '../../dist/cli.js');
+      if (!fs.existsSync(cliPath)) {
+        throw new Error(
+          'dist/cli.js not found — `npm run build` must run before `npm test` ' +
+            '(the standard gate order in .claude/bin/verify.sh already does this).',
+        );
+      }
+      return cliPath;
+    }
+
+    function writeTempBundle(zip: Buffer): { tmpDir: string; bundlePath: string } {
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'audit-verifier-cli-status-'),
+      );
+      const bundlePath = path.join(tmpDir, 'bundle.zip');
+      fs.writeFileSync(bundlePath, zip);
+      return { tmpDir, bundlePath };
+    }
+
+    it('--json emits a stable JSON report with status: valid and exits 0 on a pristine bundle', () => {
+      const { zip } = buildBundleWithTamper({});
+      const cliPath = cliPathOrThrow();
+      const { tmpDir, bundlePath } = writeTempBundle(zip);
+      try {
+        const stdout = execFileSync(
+          process.execPath,
+          [
+            cliPath,
+            bundlePath,
+            '--no-rekor',
+            '--allow-legacy-unattested',
+            '--json',
+          ],
+          { encoding: 'utf8' },
+        );
+        const parsed = JSON.parse(stdout) as VerifyReport;
+        expect(parsed.status).toBe('valid');
+        expect(parsed.ok).toBe(true);
+        expect(parsed.manifest.status).toBe('valid');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('--json emits status: invalid and the process exits 1 on a tampered bundle', () => {
+      const { zip } = buildBundleWithTamper({
+        postSignRowByte: (rows) => {
+          rows[2]!.action = 'agent.deleted';
+        },
+      });
+      const cliPath = cliPathOrThrow();
+      const { tmpDir, bundlePath } = writeTempBundle(zip);
+      try {
+        execFileSync(
+          process.execPath,
+          [
+            cliPath,
+            bundlePath,
+            '--no-rekor',
+            '--allow-legacy-unattested',
+            '--json',
+          ],
+          { encoding: 'utf8' },
+        );
+        throw new Error('expected exit code 1, process did not exit non-zero');
+      } catch (err) {
+        const e = err as { status?: number; stdout?: string };
+        expect(e.status).toBe(1);
+        const parsed = JSON.parse(e.stdout ?? '{}') as VerifyReport;
+        expect(parsed.status).toBe('invalid');
+        expect(parsed.ok).toBe(false);
+        expect(parsed.rowSignatures.status).toBe('invalid');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('--quiet prints the status word (OK), not a hardcoded checkmark', () => {
+      const { zip } = buildBundleWithTamper({});
+      const cliPath = cliPathOrThrow();
+      const { tmpDir, bundlePath } = writeTempBundle(zip);
+      try {
+        const stdout = execFileSync(
+          process.execPath,
+          [cliPath, bundlePath, '--no-rekor', '--allow-legacy-unattested', '--quiet'],
+          { encoding: 'utf8' },
+        );
+        expect(stdout).toBe('OK\n');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
     });
   });
 });

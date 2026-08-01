@@ -3,23 +3,29 @@
  * `praesidia-verify` CLI entry point.
  *
  * Usage:
- *   praesidia-verify <bundle.zip> [--no-rekor] [--quiet] [--help]
+ *   praesidia-verify <bundle.zip> [--no-rekor] [--quiet] [--json] [--help]
  *
  * Exit codes:
- *   0  All checks passed.
- *   1  Verification failure (signature / chain / proof mismatch).
+ *   0  All checks passed (status: valid).
+ *   1  Verification failure (status: invalid — signature / chain / proof
+ *      mismatch, or any component invalid).
  *   2  I/O or bundle-format error (missing file, malformed zip, etc.).
+ *   3  Incomplete (status: incomplete — evidence present is insufficient
+ *      to decide; not the same as a failure, PA-0009 / `PA01-DECISIONS.md`
+ *      D15). No component in this build can produce `incomplete` yet — the
+ *      code path exists for the action-proof components landing in PA-0010.
  */
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { verifyBundle, type VerifyReport } from './verify.js';
+import { verifyBundle, type VerifyReport, type ComponentResult } from './verify.js';
 
 interface CliArgs {
   bundlePath: string | null;
   noRekor: boolean;
   quiet: boolean;
+  json: boolean;
   help: boolean;
   platformKeyPath: string | null;
   allowLegacyUnattested: boolean;
@@ -36,13 +42,18 @@ OPTIONS
                Trust this PEM or SPKI-DER platform attestation public key.
   --allow-legacy-unattested
                Explicitly accept bundles without platform attestation.
-  --quiet      Print only the final OK/FAIL summary line.
+  --quiet      Print only the final OK/FAIL/INCOMPLETE summary line.
+  --json       Print the full VerifyReport as stable machine-readable JSON
+               instead of the human-readable report (mutually exclusive
+               with --quiet; --json wins if both are passed).
   --help, -h   Show this help message.
 
 EXIT CODES
-  0   All signatures, chain links, and inclusion proofs verified.
-  1   Verification failure.
+  0   status: valid   — all signatures, chain links, and inclusion proofs
+      verified.
+  1   status: invalid — a real verification failure.
   2   I/O or bundle-format error.
+  3   status: incomplete — evidence present is insufficient to decide.
 
 The bundle is verified entirely offline — the verifier makes NO network
 calls. The Rekor receipt is verified against a PINNED Sigstore public key
@@ -54,6 +65,7 @@ function parseArgs(argv: string[]): CliArgs {
     bundlePath: null,
     noRekor: false,
     quiet: false,
+    json: false,
     help: false,
     platformKeyPath: null,
     allowLegacyUnattested: false,
@@ -62,6 +74,7 @@ function parseArgs(argv: string[]): CliArgs {
     const arg = argv[i]!;
     if (arg === '--no-rekor') out.noRekor = true;
     else if (arg === '--quiet') out.quiet = true;
+    else if (arg === '--json') out.json = true;
     else if (arg === '--help' || arg === '-h') out.help = true;
     else if (arg === '--allow-legacy-unattested') {
       out.allowLegacyUnattested = true;
@@ -86,9 +99,23 @@ function parseArgs(argv: string[]): CliArgs {
   return out;
 }
 
+/** `status` → the one-word summary token used by `--quiet` and `RESULT:`. */
+function statusWord(status: VerifyReport['status'] | ComponentResult['status']): string {
+  switch (status) {
+    case 'valid':
+      return 'OK';
+    case 'invalid':
+      return 'FAIL';
+    case 'incomplete':
+      return 'INCOMPLETE';
+    case 'unsupported':
+      return 'UNSUPPORTED';
+  }
+}
+
 function printReport(report: VerifyReport, quiet: boolean): void {
   if (quiet) {
-    process.stdout.write(report.ok ? 'OK\n' : 'FAIL\n');
+    process.stdout.write(`${statusWord(report.status)}\n`);
     return;
   }
   const lines: string[] = [];
@@ -131,7 +158,7 @@ function printReport(report: VerifyReport, quiet: boolean): void {
     lines.push(`             ${line}`);
   }
   lines.push('');
-  lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
+  lines.push(`RESULT: ${statusWord(report.status)}`);
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
   // Rekor witness was verified" when the caller explicitly skipped that
   // check. Repeat the caveat as its own line so it survives a skim.
@@ -144,21 +171,14 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   process.stdout.write(lines.join('\n') + '\n');
 }
 
-function fmtComponent(
-  label: string,
-  c: {
-    ok: boolean;
-    checked: number;
-    failed: number;
-    firstFailure?: string;
-    reason?: string;
-  },
-): string {
-  const tag = c.ok ? 'OK  ' : 'FAIL';
+function fmtComponent(label: string, c: ComponentResult): string {
+  // PA-0009 — render the real `status`, not a derived checkmark. `ok` is
+  // still the source for nothing here; `status` is authoritative.
+  const tag = c.status.toUpperCase().padEnd(11, ' ').slice(0, 11);
   const counts =
     c.failed > 0 ? `${c.failed}/${c.checked} failed` : `${c.checked} checked`;
   let extra = '';
-  if (!c.ok) {
+  if (c.status === 'invalid') {
     if (c.firstFailure) extra += `  first=${c.firstFailure}`;
     if (c.reason) extra += `  (${c.reason})`;
   } else if (c.reason) {
@@ -229,8 +249,27 @@ async function main(): Promise<number> {
     );
     return 2;
   }
-  printReport(report, args.quiet);
-  return report.ok ? 0 : 1;
+  if (args.json) {
+    // PA-0009 — stable machine-readable JSON mode. Prints the full
+    // `VerifyReport` (which now carries `status` at both the top level and
+    // per-component, see `verify.ts`) as the ONLY stdout output — no human
+    // text is interleaved, so callers can pipe this straight into a JSON
+    // parser. `--quiet` is ignored when `--json` is also passed.
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    printReport(report, args.quiet);
+  }
+  // PA-0009 (D15) — exit code is a function of `report.status`, not `ok`:
+  // 0 valid, 1 invalid, 3 incomplete. `unsupported` never appears at the
+  // top level (see `reduceStatus`), so no exit code is reserved for it.
+  switch (report.status) {
+    case 'valid':
+      return 0;
+    case 'invalid':
+      return 1;
+    case 'incomplete':
+      return 3;
+  }
 }
 
 main().then(
