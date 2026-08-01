@@ -12,8 +12,10 @@
  *   2  I/O or bundle-format error (missing file, malformed zip, etc.).
  *   3  Incomplete (status: incomplete — evidence present is insufficient
  *      to decide; not the same as a failure, PA-0009 / `PA01-DECISIONS.md`
- *      D15). No component in this build can produce `incomplete` yet — the
- *      code path exists for the action-proof components landing in PA-0010.
+ *      D15). PA-0010's `targetAck`/`callerResult` components produce this
+ *      when the relevant evidence event is legitimately redacted (a
+ *      `payload: null` with a present `payloadCommitment` — threat-model
+ *      row #10).
  */
 
 import * as fs from 'node:fs/promises';
@@ -157,6 +159,20 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   for (const line of report.integrityCheckpoints.sealExemptions ?? []) {
     lines.push(`             ${line}`);
   }
+  // PA-0010 — action-event evidence components (manifest v5). Print
+  // unconditionally (not gated on manifest version) so `unsupported` is
+  // visible rather than silently omitted — an auditor should be able to
+  // tell "this bundle predates action evidence" from "this build doesn't
+  // check it" at a glance.
+  lines.push(fmtComponent('action chain      ', report.actionEventChain));
+  lines.push(fmtComponent('permit binding    ', report.permitBinding));
+  lines.push(fmtComponent('request binding   ', report.requestBinding));
+  lines.push(fmtComponent('dispatch integrity', report.dispatchIntegrity));
+  lines.push(fmtComponent('target ack        ', report.targetAck));
+  lines.push(fmtComponent('caller result     ', report.callerResult));
+  lines.push(fmtComponent('closure legality  ', report.closureLegality));
+  lines.push(fmtComponent('evidence grade    ', report.evidenceGrade));
+  lines.push(fmtComponent('action completeness', report.actionCompleteness));
   lines.push('');
   lines.push(`RESULT: ${statusWord(report.status)}`);
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external

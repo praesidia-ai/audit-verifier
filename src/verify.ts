@@ -138,6 +138,113 @@ interface BundleManifest {
    * wire versions; presence is enforced per-version, not left to chance.
    */
   integrityCheckpointCount?: number;
+  /**
+   * PA-0010 / `PA01-CONTRACT-manifest-v5-actions.md` — count of
+   * `protected_action_events` rows this export includes (in
+   * `action-events.ndjson.gz`), whose `observedAt` falls inside
+   * `[from, to)`. Same anti-suppression rationale as
+   * `rowCount`/`integrityCheckpointCount`. Present on every `version: 5`
+   * manifest, absent on every earlier version — enforced in
+   * `verifyManifest`'s signable-set selection, not left to chance.
+   */
+  actionEventCount?: number;
+  /**
+   * PA-0010 — `sha256(canonicalJson(activeCaptureScopeDeclaration))`, hex,
+   * lowercase. Makes the org's capture-scope registry itself
+   * tamper-evident (ACT-005) — a narrowed scope that silently excludes a
+   * whole action class from capture must be a signed, comparable value,
+   * not an unsigned side-channel.
+   */
+  captureScopeDigest?: string;
+  /**
+   * PA-0010 / corrigendum C4 — count of CLOSED protected actions in
+   * `[from, to)` by their CLAIMED evidence grade (D8), plus the org's
+   * governance mode at export time. THIS IS A DECLARED FIELD, WRITTEN BY
+   * `be` — the grade-C party. The verifier's `evidenceGrade` component
+   * (`verifyEvidenceGrade`) independently DERIVES the grade from the
+   * evidence actually present in `action-events.ndjson.gz` and flags a
+   * declared grade that exceeds the derived one as `invalid` — this field
+   * is never trusted at face value. All four keys are always present
+   * (`0` for a grade with no actions), never omitted.
+   */
+  evidenceGradeSummary?: {
+    A: number;
+    B: number;
+    C: number;
+    D: number;
+    /**
+     * Corrigendum C4 — "enforcementMode must be on the record": an
+     * observe-mode action must never be countable as enforced. `be`
+     * resolves this per-org via `GovernanceFlagService.getModeForOrg`;
+     * any mode other than `'enforce'` reads as `'observe'`.
+     */
+    enforcementMode: 'observe' | 'enforce';
+  };
+}
+
+/**
+ * PA-0010 / `PA01-CONTRACT-manifest-v5-actions.md` — one row per
+ * `protected_action_events` record in `[from, to)`, ordered by
+ * `(actionId, actionSeq)`. Mirrors `be`'s `serializeActionEvent` wire
+ * shape exactly (`bundle-exporter.service.ts`).
+ *
+ * SEC-PA01-DISCOVERED-01 (found this pass, not silently patched) — `be`
+ * commit `e9e39b88`'s `serializeActionEvent` does NOT ship six fields
+ * that `protected-action-canonical.helper.ts`'s `SignableProtectedActionEventRow`
+ * requires to reconstruct the exact signed preimage: `timeSource`,
+ * `permitNonce` (the top-level entity column — distinct from
+ * `payload.permitNonce`, which IS present), `edgeVersion`,
+ * `adapterVersion`, `externalReceiptRef`, `artifactStorageRef`. Without
+ * them this verifier cannot recompute the exact bytes `be` signed, so it
+ * cannot independently verify ANY action-event signature against a
+ * REAL `be`-produced v5 bundle today. This is a genuine PRODUCER gap
+ * (documented in `PA01-CONTRACT-manifest-v5-actions.md`'s amended
+ * contract and filed as `.claude/backlog/PA-0026.md` for `backend-dev`),
+ * not a verifier defect — per POLICY §1 ("do not fix it yourself and do
+ * not silently loosen a check to accommodate it"), the fields below are
+ * declared REQUIRED to match the corrected contract, and a bundle
+ * missing any of them fails closed as a bundle-format error
+ * (`assertActionEventsStructure`), exactly like every other missing
+ * required field in this file. This is intentional, fail-closed
+ * behavior: an event whose exact signed bytes cannot be reconstructed
+ * must never be silently accepted as "probably fine."
+ */
+interface BundleActionEvent {
+  actionId: string;
+  /** Wire `number` (be's `toWireActionSeq`, lossless-or-throw); signable preimage uses the bigint-as-string form — see {@link signableActionEvent}. */
+  actionSeq: number;
+  eventType: string;
+  /** Wire `number` (be's plain `Number(...)` cast); signable preimage uses the decimal-string form (D9) — see {@link signableActionEvent}. */
+  schemaVersion: number;
+  observedAt: string;
+  receivedAt: string;
+  /** Wire name for the entity's `issuerId` column (contract-pinned rename). */
+  issuer: string;
+  trustDomain: string;
+  payload: Record<string, unknown> | null;
+  payloadCommitment: string | null;
+  /** Hex, 64 chars. Genesis (first event of an actionId) = 64 hex zeros. */
+  prevEventCommitment: string;
+  signature: string;
+  signatureAlgorithm: BundleSignatureAlgorithm;
+  keyVersion: number;
+  // Superset fields `be` already ships (bundle-exporter.service.ts
+  // `serializeActionEvent`):
+  organizationId: string;
+  issuerType: string;
+  dispatched: boolean;
+  /** This event's own commitment. Independently RECOMPUTED and compared, never trusted — see {@link verifyActionEventChain}. */
+  eventCommitment: string;
+  producerVersion: string;
+  // Required for exact signable-preimage reconstruction (see the
+  // SEC-PA01-DISCOVERED-01 note above) — not yet shipped by `be` as of
+  // commit `e9e39b88`.
+  timeSource: string;
+  permitNonce: string | null;
+  edgeVersion: string | null;
+  adapterVersion: string | null;
+  externalReceiptRef: string | null;
+  artifactStorageRef: string | null;
 }
 
 /**
@@ -558,6 +665,112 @@ export interface VerifyReport {
    * treated as reconciling (an arithmetic coincidence is not evidence).
    */
   integrityCheckpoints: ComponentResult;
+  /**
+   * PA-0010 (`PA01-CONTRACT-manifest-v5-actions.md`, `PA01-DECISIONS.md`
+   * D7/D9) — per-`actionId` `actionSeq` monotonicity (1-based, gapless,
+   * mirroring the DB trigger) + `prevEventCommitment` hash-chain walk,
+   * PLUS the per-event signature verification the chain-link recomputation
+   * depends on (mirrors `chain` + `rowSignatures` combined, since no
+   * separate top-level field exists for action-event signatures — see
+   * `PA01-CONTRACT-manifest-v5-actions.md`'s component list). The FIRST
+   * event present for a given `actionId` is accepted as an opaque
+   * out-of-range anchor (mirrors BUGHUNT-SDK-02) UNLESS its `actionSeq` is
+   * `1`, in which case its `prevEventCommitment` MUST equal the genesis
+   * value. `unsupported` on `manifest.version < 5`.
+   */
+  actionEventChain: ComponentResult;
+  /**
+   * PA-0010 — binds `PERMIT_ISSUED`/`PERMIT_CONSUMED` within one
+   * `actionId`'s stream (`payload.permitId` === `payload.permitNonce`,
+   * `payload.requestCommitment` matches across both events — D2's
+   * commitment binding) and asserts NO two `PERMIT_CONSUMED` events across
+   * the WHOLE bundle share the same `payload.permitNonce` (a duplicate
+   * would mean the durable single-use gate, SEC-PA01-01/corrigendum C1,
+   * was bypassed). `unsupported` on `manifest.version < 5`.
+   */
+  permitBinding: ComponentResult;
+  /**
+   * PA-0010 (D2) — every `DISPATCH_ATTEMPTED.payload.requestCommitment`
+   * must be a well-formed `sha256` hex digest and, when the same
+   * `actionId` also carries a `PERMIT_CONSUMED` event, the two commitments
+   * must be byte-identical — a mismatch is exactly the TOCTOU
+   * request-substitution threat-model row #2 targets.
+   * `unsupported` on `manifest.version < 5`.
+   */
+  requestBinding: ComponentResult;
+  /**
+   * PA-0010 (D9) — every `DISPATCH_ATTEMPTED` event must carry
+   * `dispatched: true`; a POST-dispatch closure (`SUCCEEDED`,
+   * `FAILED_NO_EFFECT`, `PARTIAL`, `REVERSED`, `TARGET_REJECTED`,
+   * `OUTCOME_UNKNOWN`) requires at least one such event in the same
+   * `actionId`'s stream, and a PRE-dispatch closure (`DENIED`, `EXPIRED`,
+   * `CANCELLED_BEFORE_DISPATCH`) must never have one. `unsupported` on
+   * `manifest.version < 5`.
+   */
+  dispatchIntegrity: ComponentResult;
+  /**
+   * PA-0010 (D8) — independently re-checks EVERY `TARGET_ACKNOWLEDGED`
+   * event's structural grade consistency (mirrors `be`'s
+   * `assertGradeConsistency`, re-derived here rather than trusted): grade
+   * `A` requires a non-empty `targetSignature`/`signatureAlgorithm`, grade
+   * `B` requires a non-empty `edgeAttestation` and
+   * `destinationAuthenticated: true`. `status: 'incomplete'` when the
+   * event's `payload` is legitimately redacted (`payload: null` with a
+   * present `payloadCommitment`) rather than a hard failure — threat-model
+   * row #10. `unsupported` on `manifest.version < 5`.
+   */
+  targetAck: ComponentResult;
+  /**
+   * PA-0010 — every `CALLER_RESULT_OBSERVED` event's `payload.success`
+   * must be a boolean and, when present, `payload.resultCommitment` a
+   * well-formed `sha256` hex digest (mirrors `computeResultCommitment`'s
+   * output shape). Same redaction `incomplete` handling as `targetAck`.
+   * `unsupported` on `manifest.version < 5`.
+   */
+  callerResult: ComponentResult;
+  /**
+   * PA-0010 (D7, corrigendum C4's sibling concern) — THE CENTERPIECE.
+   * Re-derives `PA01-DECISIONS.md` D7's frozen closure state machine
+   * (`REASON_ALLOWED_CLOSURES` / phase-reachability) independently in this
+   * package (never imported from `be`) and validates every `ACTION_CLOSED`
+   * / `OUTCOME_RECONCILED` event's declared `(closure, reason)` pair
+   * against it. On top of the reason/closure table, this component NEVER
+   * trusts the declared `reason` field alone: any closure that CLAIMS
+   * positive evidence (`TARGET_REJECTED`, `SUCCEEDED`, `FAILED_NO_EFFECT`,
+   * `PARTIAL`, `REVERSED`) is independently required to have an ACTUAL
+   * `TARGET_ACKNOWLEDGED` or `CALLER_RESULT_OBSERVED` event in the same
+   * `actionId`'s stream — regardless of what `reason` says. **This is the
+   * single check that makes a bundle claiming `FAILED_NO_EFFECT` with only
+   * timeout evidence verify as `invalid`** (D7's hard rule, cross-checked
+   * against the event set actually present, not the self-declared label).
+   * `unsupported` on `manifest.version < 5`.
+   */
+  closureLegality: ComponentResult;
+  /**
+   * PA-0010 (D8, corrigendum C4) — DERIVES, does not believe. For every
+   * CLOSED action in `[from, to)`, derives a grade purely from the
+   * evidence actually present (target signature → A; customer-edge
+   * attestation + authenticated destination → B; else C; SDK-self-report
+   * with no Praesidia-observed evidence → D), then compares the derived
+   * distribution against the manifest's SIGNED, `be`-DECLARED
+   * `evidenceGradeSummary` using a cumulative-from-strongest rule: a
+   * declared count in a grade bucket exceeding what the derived evidence
+   * can support at that strength (or higher) is `invalid`, named
+   * `declared_grade_exceeds_derived_evidence`. Also asserts
+   * `enforcementMode`: if the summary declares `'enforce'` but any
+   * counted event's own signed payload declares `'observe'`, that is
+   * `invalid` (`observe_mode_action_counted_as_enforced`) — an
+   * observe-mode action must never be countable as enforced.
+   * `unsupported` on `manifest.version < 5`.
+   */
+  evidenceGrade: ComponentResult;
+  /**
+   * PA-0010 — binds the SIGNED `manifest.actionEventCount` to the number
+   * of rows actually present in `action-events.ndjson.gz`, the same
+   * truncation defense `completeness` provides for rows/roots/checkpoints.
+   * `unsupported` on `manifest.version < 5`.
+   */
+  actionCompleteness: ComponentResult;
   bundle: {
     orgId: string;
     from: string;
@@ -579,6 +792,8 @@ export interface VerifyReport {
      * a `rootCoverage` / `integrityCheckpoints` finding.
      */
     sealedPurgesVerified: number;
+    /** PA-0010 — count of lines in `action-events.ndjson.gz` (0 when `manifest.version < 5` — the entry does not exist). */
+    actionEventsSeen: number;
   };
 }
 
@@ -675,8 +890,14 @@ export interface VerifyOptions {
  * a new, conditionally-required bundle entry `integrity-checkpoints
  * .ndjson.gz` carrying the signed `AuditIntegrityCheckpoint` rows
  * themselves. Same fail-closed-both-directions rule as v3's fields.
+ *
+ * v5 (PA-0010 / `PA01-CONTRACT-manifest-v5-actions.md`) — adds
+ * `actionEventCount`/`captureScopeDigest`/`evidenceGradeSummary` (the 12
+ * v4 fields plus these 3, 15 total) and a new, REQUIRED-even-when-empty
+ * bundle entry `action-events.ndjson.gz` carrying the signed
+ * `protected_action_events` rows. Same fail-closed-both-directions rule.
  */
-const MAX_SUPPORTED_MANIFEST_VERSION = 4;
+const MAX_SUPPORTED_MANIFEST_VERSION = 5;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -723,6 +944,15 @@ export async function verifyBundle(
   if (manifest.version >= 4 && !byName.has('integrity-checkpoints.ndjson.gz')) {
     throw new Error(
       `bundle declares manifest.version ${manifest.version} (>= 4) but is missing required entry: integrity-checkpoints.ndjson.gz`,
+    );
+  }
+  // PA-0010 / manifest-v5 — `action-events.ndjson.gz` is REQUIRED whenever
+  // `manifest.version >= 5`, even when the org has zero protected-action
+  // activity in range (an empty-but-present file) — identical rule to
+  // `integrity-checkpoints.ndjson.gz` on `>= 4`.
+  if (manifest.version >= 5 && !byName.has('action-events.ndjson.gz')) {
+    throw new Error(
+      `bundle declares manifest.version ${manifest.version} (>= 5) but is missing required entry: action-events.ndjson.gz`,
     );
   }
 
@@ -815,6 +1045,47 @@ export async function verifyBundle(
     ),
   );
 
+  // 6d) PA-0010 — parse + verify action-event evidence (v5+ only; an
+  // empty array for every earlier version, mirroring integrity checkpoints).
+  const actionEvents: BundleActionEvent[] =
+    manifest.version >= 5
+      ? parseNdjson<BundleActionEvent>(
+          gunzip(byName.get('action-events.ndjson.gz')!.data),
+        )
+      : [];
+  assertActionEventsStructure(actionEvents, manifest.orgId);
+  const actionEventsSupported = manifest.version >= 5;
+
+  const actionEventChainResult = actionEventsSupported
+    ? withStatus(verifyActionEventChain(actionEvents, publicKeys, manifest.signatureAlgorithm))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const permitBindingResult = actionEventsSupported
+    ? withStatus(verifyPermitBinding(actionEvents))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const requestBindingResult = actionEventsSupported
+    ? withStatus(verifyRequestBinding(actionEvents))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const dispatchIntegrityResult = actionEventsSupported
+    ? withStatus(verifyDispatchIntegrity(actionEvents))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const targetAckRaw = actionEventsSupported ? verifyTargetAck(actionEvents) : null;
+  const targetAckResult = actionEventsSupported
+    ? withStatus(targetAckRaw!.result, targetAckRaw!.status)
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const callerResultRaw = actionEventsSupported ? verifyCallerResult(actionEvents) : null;
+  const callerResultResult = actionEventsSupported
+    ? withStatus(callerResultRaw!.result, callerResultRaw!.status)
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const closureLegalityResult = actionEventsSupported
+    ? withStatus(verifyClosureLegality(actionEvents))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const evidenceGradeResult = actionEventsSupported
+    ? withStatus(verifyEvidenceGrade(actionEvents, manifest))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const actionCompletenessResult = actionEventsSupported
+    ? withStatus(verifyActionCompleteness(manifest, actionEvents))
+    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+
   // 7) Optional Rekor fetch.
   const rekorResult = withStatus(await verifyRekorReceipts(roots, options));
 
@@ -868,6 +1139,15 @@ export async function verifyBundle(
     keyBindingResult,
     rootCoverageResult,
     integrityCheckpointsResult,
+    actionEventChainResult,
+    permitBindingResult,
+    requestBindingResult,
+    dispatchIntegrityResult,
+    targetAckResult,
+    callerResultResult,
+    closureLegalityResult,
+    evidenceGradeResult,
+    actionCompletenessResult,
   ];
   const status = reduceStatus(allResults);
   const ok = status === 'valid';
@@ -886,6 +1166,15 @@ export async function verifyBundle(
     keyBinding: keyBindingResult,
     rootCoverage: rootCoverageResult,
     integrityCheckpoints: integrityCheckpointsResult,
+    actionEventChain: actionEventChainResult,
+    permitBinding: permitBindingResult,
+    requestBinding: requestBindingResult,
+    dispatchIntegrity: dispatchIntegrityResult,
+    targetAck: targetAckResult,
+    callerResult: callerResultResult,
+    closureLegality: closureLegalityResult,
+    evidenceGrade: evidenceGradeResult,
+    actionCompleteness: actionCompletenessResult,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -897,6 +1186,7 @@ export async function verifyBundle(
       proofsSeen: proofs.length,
       sealedPurgesSeen: sealedPurges.length,
       sealedPurgesVerified: verifiedSeals.length,
+      actionEventsSeen: actionEvents.length,
     },
   };
 }
@@ -1001,6 +1291,64 @@ function verifyManifest(
       reason: `integrity_checkpoint_count_missing_on_v4_manifest: manifest declares version ${manifest.version} but is missing integrityCheckpointCount — every genuine v4 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
     };
   }
+  // PA-0010 / manifest-v5 contract — same both-directions rule for the
+  // three action-evidence fields, each with its own named reason so an
+  // auditor can tell version-skew from tampering.
+  const hasActionEventCount = 'actionEventCount' in manifest;
+  const hasCaptureScopeDigest = 'captureScopeDigest' in manifest;
+  const hasEvidenceGradeSummary = 'evidenceGradeSummary' in manifest;
+  if (manifest.version <= 4) {
+    if (hasActionEventCount) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `action_event_count_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries actionEventCount — no genuine producer below v5 ever emits this field; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+    if (hasCaptureScopeDigest) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `capture_scope_digest_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries captureScopeDigest — no genuine producer below v5 ever emits this field; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+    if (hasEvidenceGradeSummary) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `evidence_grade_summary_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries evidenceGradeSummary — no genuine producer below v5 ever emits this field; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+  }
+  if (manifest.version >= 5) {
+    if (!hasActionEventCount) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `action_event_count_missing_on_v5_manifest: manifest declares version ${manifest.version} but is missing actionEventCount — every genuine v5 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+    if (!hasCaptureScopeDigest) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `capture_scope_digest_missing_on_v5_manifest: manifest declares version ${manifest.version} but is missing captureScopeDigest — every genuine v5 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+    if (!hasEvidenceGradeSummary) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `evidence_grade_summary_missing_on_v5_manifest: manifest declares version ${manifest.version} but is missing evidenceGradeSummary — every genuine v5 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
+      };
+    }
+  }
 
   // Reconstruct the manifest-sans-signature envelope and canonicalize
   // it the same way the writer did. The two chainSeq fields join the
@@ -1024,6 +1372,11 @@ function verifyManifest(
   }
   if (manifest.version >= 4) {
     signable.integrityCheckpointCount = manifest.integrityCheckpointCount;
+  }
+  if (manifest.version >= 5) {
+    signable.actionEventCount = manifest.actionEventCount;
+    signable.captureScopeDigest = manifest.captureScopeDigest;
+    signable.evidenceGradeSummary = manifest.evidenceGradeSummary;
   }
   const bytes = canonicalJson(signable);
   // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
@@ -1718,6 +2071,923 @@ function trueSubchainTip(
     return link !== null && !claimedLinks.has(link);
   });
   return tips.length === 1 ? tips[0]! : null;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// PA-0010 — action-event evidence components (manifest v5)
+// ════════════════════════════════════════════════════════════════════════
+
+/** Genesis previous-commitment value for a `protected_action_events` stream — 64 hex zeros, mirrors `protected-action-canonical.helper.ts`'s `GENESIS_EVENT_COMMITMENT`. */
+const GENESIS_EVENT_COMMITMENT = '0'.repeat(64);
+
+/**
+ * D7 (`PA01-DECISIONS.md`, frozen) — re-derived independently here (never
+ * imported from `be`, a separate published package) so `closureLegality`
+ * does not trust `be`'s own transition logic, only the frozen DECISION.
+ */
+const PRE_DISPATCH_ALLOWED_CLOSURES = new Set([
+  'DENIED',
+  'EXPIRED',
+  'CANCELLED_BEFORE_DISPATCH',
+  'DUPLICATE_SUPPRESSED',
+  'EVIDENCE_INCOMPLETE',
+]);
+const POST_DISPATCH_ALLOWED_CLOSURES = new Set([
+  'TARGET_REJECTED',
+  'SUCCEEDED',
+  'FAILED_NO_EFFECT',
+  'PARTIAL',
+  'REVERSED',
+  'OUTCOME_UNKNOWN',
+  'EVIDENCE_INCOMPLETE',
+  'DUPLICATE_SUPPRESSED',
+]);
+/** Closures that CLAIM positive evidence about what happened — the set `closureLegality` requires an actual evidencing event for, regardless of the declared `reason`. */
+const EVIDENCE_CLAIMING_CLOSURES = new Set([
+  'TARGET_REJECTED',
+  'SUCCEEDED',
+  'FAILED_NO_EFFECT',
+  'PARTIAL',
+  'REVERSED',
+]);
+const REASON_ALLOWED_CLOSURES: Record<string, Set<string>> = {
+  // D7's hard rule, encoded structurally: a reason with NO positive
+  // evidence about the outcome may never resolve to a closure that claims
+  // to know it.
+  TIMEOUT: new Set(['OUTCOME_UNKNOWN', 'EVIDENCE_INCOMPLETE']),
+  EVIDENCED: EVIDENCE_CLAIMING_CLOSURES,
+  POLICY: new Set(['DENIED']),
+  EXPIRY: new Set(['EXPIRED']),
+  CANCELLATION: new Set(['CANCELLED_BEFORE_DISPATCH']),
+  REPLAY: new Set(['DUPLICATE_SUPPRESSED']),
+};
+const RECONCILABLE_FROM = new Set(['OUTCOME_UNKNOWN', 'EVIDENCE_INCOMPLETE']);
+const RECONCILABLE_TO = new Set([
+  ...EVIDENCE_CLAIMING_CLOSURES,
+  'OUTCOME_UNKNOWN',
+  'EVIDENCE_INCOMPLETE',
+  'DUPLICATE_SUPPRESSED',
+]);
+
+/** Strict lowercase-hex decoder — mirrors `decodeBase64Strict`'s discipline for the event chain's hex-encoded commitments. */
+function decodeHex64Strict(value: unknown): Buffer | null {
+  if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) return null;
+  return Buffer.from(value, 'hex');
+}
+
+function isSha256HexDigest(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/**
+ * Reconstructs the exact `SignableProtectedActionEventRow` shape
+ * `protected-action-canonical.helper.ts` signs — see
+ * {@link BundleActionEvent}'s SEC-PA01-DISCOVERED-01 doc comment for why
+ * every one of these fields must be present on the wire for this to be
+ * possible at all.
+ */
+function signableActionEvent(e: BundleActionEvent): Record<string, unknown> {
+  return {
+    organizationId: e.organizationId,
+    actionId: e.actionId,
+    actionSeq: String(e.actionSeq),
+    eventType: e.eventType,
+    schemaVersion: String(e.schemaVersion),
+    issuerType: e.issuerType,
+    issuerId: e.issuer,
+    trustDomain: e.trustDomain,
+    timeSource: e.timeSource,
+    observedAt: e.observedAt,
+    receivedAt: e.receivedAt,
+    dispatched: e.dispatched,
+    permitNonce: e.permitNonce,
+    payload: e.payload,
+    payloadCommitment: e.payloadCommitment,
+    producerVersion: e.producerVersion,
+    edgeVersion: e.edgeVersion,
+    adapterVersion: e.adapterVersion,
+    externalReceiptRef: e.externalReceiptRef,
+    artifactStorageRef: e.artifactStorageRef,
+    prevEventCommitment: e.prevEventCommitment,
+  };
+}
+
+/**
+ * Verifies one event's signature against `message = canonicalBytes ||
+ * prevEventCommitmentBytes` (mirrors `ProtectedActionEventService.runAppend`
+ * exactly) and, on success, independently RECOMPUTES this event's own
+ * commitment (`sha256(canonicalBytes || sigBytes)`, hex) — the value the
+ * verifier trusts for chain-walking, never the wire-declared
+ * `eventCommitment` field.
+ */
+function verifyEventSignatureAndCommitment(
+  e: BundleActionEvent,
+  publicKeys: Map<number, PublicKeyRecord>,
+  manifestAlgorithm: BundleSignatureAlgorithm,
+): { ok: boolean; reason?: string; computedCommitment: string | null } {
+  const entry = publicKeys.get(e.keyVersion);
+  if (!entry) {
+    return {
+      ok: false,
+      reason: `event keyVersion ${e.keyVersion} not in public-keys.json`,
+      computedCommitment: null,
+    };
+  }
+  if (entry.status === 'REVOKED') {
+    return { ok: false, reason: 'key_revoked', computedCommitment: null };
+  }
+  const prevBytes = decodeHex64Strict(e.prevEventCommitment);
+  if (prevBytes === null) {
+    return {
+      ok: false,
+      reason: 'event prevEventCommitment missing or malformed',
+      computedCommitment: null,
+    };
+  }
+  const canonical = canonicalJson(signableActionEvent(e));
+  const message = Buffer.concat([canonical, prevBytes]);
+  const algorithm = e.signatureAlgorithm ?? manifestAlgorithm;
+  if (!verifySignature(algorithm, message, e.signature, entry.publicKey)) {
+    return {
+      ok: false,
+      reason: 'event signature does not verify',
+      computedCommitment: null,
+    };
+  }
+  const sigBytes = decodeBase64Strict(e.signature);
+  if (sigBytes === null) {
+    return {
+      ok: false,
+      reason: 'event signature is not canonical base64',
+      computedCommitment: null,
+    };
+  }
+  const computedCommitment = sha256(
+    Buffer.concat([canonical, sigBytes]),
+  ).toString('hex');
+  return { ok: true, computedCommitment };
+}
+
+/** Group action events by `actionId`, sorted by `actionSeq` ascending within each group. */
+function groupActionEvents(
+  events: BundleActionEvent[],
+): Map<string, BundleActionEvent[]> {
+  const byAction = new Map<string, BundleActionEvent[]>();
+  for (const e of events) {
+    const arr = byAction.get(e.actionId) ?? [];
+    arr.push(e);
+    byAction.set(e.actionId, arr);
+  }
+  for (const arr of byAction.values()) {
+    arr.sort((a, b) => a.actionSeq - b.actionSeq);
+  }
+  return byAction;
+}
+
+/**
+ * PA-0010 — per-`actionId` `actionSeq` monotonicity + `prevEventCommitment`
+ * hash-chain walk, PLUS the per-event signature verification the chain-link
+ * recomputation depends on. See {@link VerifyReport.actionEventChain}'s doc
+ * comment for the full rationale, including the BUGHUNT-SDK-02-style
+ * boundary-anchor exemption for the first event of each `actionId` present
+ * in this bundle.
+ */
+function verifyActionEventChain(
+  events: BundleActionEvent[],
+  publicKeys: Map<number, PublicKeyRecord>,
+  manifestAlgorithm: BundleSignatureAlgorithm,
+): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const byAction = groupActionEvents(events);
+  for (const [actionId, stream] of byAction) {
+    let prevComputed: string | null = null;
+    for (let i = 0; i < stream.length; i++) {
+      const e = stream[i]!;
+      const id = `${actionId}#${e.actionSeq}`;
+      checked += 1;
+
+      // Clock sanity: an event must never claim it was received before it
+      // was observed (threat-model row #6, clock manipulation).
+      const observedMs = Date.parse(e.observedAt);
+      const receivedMs = Date.parse(e.receivedAt);
+      if (
+        Number.isNaN(observedMs) ||
+        Number.isNaN(receivedMs) ||
+        receivedMs < observedMs
+      ) {
+        fail(
+          id,
+          'clock_skew: receivedAt is before observedAt (or either is unparseable) — platform-received time can never precede issuer-observed time',
+        );
+        continue;
+      }
+
+      const sigResult = verifyEventSignatureAndCommitment(
+        e,
+        publicKeys,
+        manifestAlgorithm,
+      );
+      if (!sigResult.ok) {
+        fail(id, sigResult.reason ?? 'event signature does not verify');
+        prevComputed = null;
+        continue;
+      }
+
+      if (i === 0) {
+        // First event of this actionId present in the bundle. A genuine
+        // genesis (actionSeq === 1) MUST declare the genesis commitment;
+        // any other actionSeq is accepted as an opaque out-of-range
+        // anchor (the action's earlier events fall before the bundle's
+        // declared [from, to) range) — mirrors BUGHUNT-SDK-02.
+        if (
+          e.actionSeq === 1 &&
+          e.prevEventCommitment !== GENESIS_EVENT_COMMITMENT
+        ) {
+          fail(
+            id,
+            'genesis_prev_event_commitment_mismatch: actionSeq 1 must declare the all-zero genesis prevEventCommitment',
+          );
+        }
+      } else {
+        const prev = stream[i - 1]!;
+        if (e.actionSeq !== prev.actionSeq + 1) {
+          fail(
+            id,
+            `action_event_seq_gap: actionSeq ${e.actionSeq} does not immediately follow ${prev.actionSeq} for actionId ${actionId} — actionSeq must be monotonic and gapless within the bundle`,
+          );
+        } else if (e.prevEventCommitment !== prevComputed) {
+          fail(
+            id,
+            'action_event_chain_break: prevEventCommitment does not match the independently recomputed commitment of the previous event in this actionId\'s stream',
+          );
+        }
+      }
+      prevComputed = sigResult.computedCommitment;
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** Extract a non-empty string field from a payload, or `null`. */
+function payloadStr(
+  payload: Record<string, unknown> | null,
+  key: string,
+): string | null {
+  const v = payload?.[key];
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+/**
+ * PA-0010 (D2, SEC-PA01-01/corrigendum C1) — see
+ * {@link VerifyReport.permitBinding}'s doc comment.
+ */
+function verifyPermitBinding(events: BundleActionEvent[]): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const nonceToActionIds = new Map<string, Set<string>>();
+  const byAction = groupActionEvents(events);
+  for (const [actionId, stream] of byAction) {
+    const issued = stream.find((e) => e.eventType === 'PERMIT_ISSUED');
+    const consumed = stream.find((e) => e.eventType === 'PERMIT_CONSUMED');
+    if (!consumed) continue;
+    checked += 1;
+    const id = `${actionId}#${consumed.actionSeq}`;
+    const nonce = payloadStr(consumed.payload, 'permitNonce');
+    if (!nonce) {
+      fail(id, 'PERMIT_CONSUMED.payload.permitNonce is missing or empty');
+    } else {
+      const set = nonceToActionIds.get(nonce) ?? new Set<string>();
+      set.add(actionId);
+      nonceToActionIds.set(nonce, set);
+    }
+    if (issued) {
+      const issuedPermitId = payloadStr(issued.payload, 'permitId');
+      if (nonce && issuedPermitId && issuedPermitId !== nonce) {
+        fail(
+          id,
+          'permit_binding_mismatch: PERMIT_CONSUMED.payload.permitNonce does not match this actionId\'s PERMIT_ISSUED.payload.permitId',
+        );
+      }
+      const issuedCommitment = payloadStr(issued.payload, 'requestCommitment');
+      const consumedCommitment = payloadStr(
+        consumed.payload,
+        'requestCommitment',
+      );
+      if (
+        issuedCommitment &&
+        consumedCommitment &&
+        issuedCommitment !== consumedCommitment
+      ) {
+        fail(
+          id,
+          'permit_request_commitment_mismatch: PERMIT_ISSUED and PERMIT_CONSUMED disagree on requestCommitment for the same actionId — D2 commitment substitution',
+        );
+      }
+    }
+  }
+
+  // SEC-PA01-01/corrigendum C1 — the durable single-use gate. A genuine
+  // `be` bundle NEVER ships two PERMIT_CONSUMED events sharing the same
+  // permitNonce (the second insert fails with a 23505 unique violation
+  // and is never persisted) — a duplicate here means the durable
+  // uniqueness constraint was bypassed or the bundle was forged.
+  for (const [nonce, actionIds] of nonceToActionIds) {
+    if (actionIds.size > 1) {
+      checked += 1;
+      fail(
+        nonce,
+        `permit_nonce_reused: permitNonce "${nonce}" was consumed by ${actionIds.size} distinct actionIds (${[...actionIds].join(', ')}) — the durable single-use gate must admit exactly one PERMIT_CONSUMED per nonce`,
+      );
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** PA-0010 (D2) — see {@link VerifyReport.requestBinding}'s doc comment. */
+function verifyRequestBinding(events: BundleActionEvent[]): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const byAction = groupActionEvents(events);
+  for (const [actionId, stream] of byAction) {
+    const dispatched = stream.find((e) => e.eventType === 'DISPATCH_ATTEMPTED');
+    if (!dispatched) continue;
+    checked += 1;
+    const id = `${actionId}#${dispatched.actionSeq}`;
+    const dispatchCommitment = payloadStr(dispatched.payload, 'requestCommitment');
+    if (!isSha256HexDigest(dispatchCommitment ?? undefined)) {
+      fail(
+        id,
+        'DISPATCH_ATTEMPTED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
+      );
+      continue;
+    }
+    const consumed = stream.find((e) => e.eventType === 'PERMIT_CONSUMED');
+    const consumedCommitment = consumed
+      ? payloadStr(consumed.payload, 'requestCommitment')
+      : null;
+    if (consumedCommitment && consumedCommitment !== dispatchCommitment) {
+      fail(
+        id,
+        'commitment_mismatch: DISPATCH_ATTEMPTED and PERMIT_CONSUMED disagree on requestCommitment for the same actionId — request substitution (threat-model row #2)',
+      );
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** PA-0010 (D9) — see {@link VerifyReport.dispatchIntegrity}'s doc comment. */
+function verifyDispatchIntegrity(
+  events: BundleActionEvent[],
+): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const byAction = groupActionEvents(events);
+  for (const [actionId, stream] of byAction) {
+    for (const e of stream.filter((x) => x.eventType === 'DISPATCH_ATTEMPTED')) {
+      checked += 1;
+      if (e.dispatched !== true) {
+        fail(
+          `${actionId}#${e.actionSeq}`,
+          'DISPATCH_ATTEMPTED event must carry dispatched: true (D9)',
+        );
+      }
+    }
+    const closed = stream.find(
+      (e) => e.eventType === 'ACTION_CLOSED',
+    );
+    if (!closed) continue;
+    const closure = payloadStr(closed.payload, 'closure');
+    if (!closure) continue;
+    const reachedDispatch = stream.some(
+      (e) => e.eventType === 'DISPATCH_ATTEMPTED' && e.dispatched === true,
+    );
+    checked += 1;
+    const id = `${actionId}#${closed.actionSeq}`;
+    if (POST_DISPATCH_ALLOWED_CLOSURES.has(closure) && !PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) && !reachedDispatch) {
+      fail(
+        id,
+        `dispatch_evidence_missing: closure "${closure}" requires a prior DISPATCH_ATTEMPTED(dispatched:true) event, none found for actionId ${actionId}`,
+      );
+    }
+    if (PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) && !POST_DISPATCH_ALLOWED_CLOSURES.has(closure) && reachedDispatch) {
+      fail(
+        id,
+        `dispatch_evidence_contradiction: closure "${closure}" is pre-dispatch-only but a DISPATCH_ATTEMPTED(dispatched:true) event exists for actionId ${actionId}`,
+      );
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** PA-0010 (D8) — see {@link VerifyReport.targetAck}'s doc comment. */
+function verifyTargetAck(events: BundleActionEvent[]): {
+  result: RawComponentResult;
+  status?: ComponentStatus;
+} {
+  let checked = 0;
+  let failed = 0;
+  let redacted = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  for (const e of events) {
+    if (e.eventType !== 'TARGET_ACKNOWLEDGED') continue;
+    checked += 1;
+    const id = `${e.actionId}#${e.actionSeq}`;
+    if (e.payload === null) {
+      if (e.payloadCommitment) {
+        redacted += 1;
+        continue;
+      }
+      fail(id, 'TARGET_ACKNOWLEDGED carries neither payload nor payloadCommitment');
+      continue;
+    }
+    const grade = e.payload.grade;
+    if (grade === 'A') {
+      const sig = payloadStr(e.payload, 'targetSignature');
+      const alg = payloadStr(e.payload, 'signatureAlgorithm');
+      if (!sig || !alg) {
+        fail(
+          id,
+          'target_ack_grade_a_missing_signature: grade A requires a non-empty targetSignature and signatureAlgorithm',
+        );
+      }
+    } else if (grade === 'B') {
+      const attestation = payloadStr(e.payload, 'edgeAttestation');
+      if (!attestation || e.payload.destinationAuthenticated !== true) {
+        fail(
+          id,
+          'target_ack_grade_b_missing_attestation: grade B requires a non-empty edgeAttestation and destinationAuthenticated: true',
+        );
+      }
+    } else if (grade !== 'C' && grade !== 'D') {
+      fail(id, `target_ack_unknown_grade: "${String(grade)}"`);
+    }
+  }
+
+  return {
+    result: {
+      ok: failed === 0,
+      checked,
+      failed,
+      ...(firstFailure !== undefined ? { firstFailure } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    },
+    status: failed === 0 && redacted > 0 ? 'incomplete' : undefined,
+  };
+}
+
+/** PA-0010 — see {@link VerifyReport.callerResult}'s doc comment. */
+function verifyCallerResult(events: BundleActionEvent[]): {
+  result: RawComponentResult;
+  status?: ComponentStatus;
+} {
+  let checked = 0;
+  let failed = 0;
+  let redacted = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  for (const e of events) {
+    if (e.eventType !== 'CALLER_RESULT_OBSERVED') continue;
+    checked += 1;
+    const id = `${e.actionId}#${e.actionSeq}`;
+    if (e.payload === null) {
+      if (e.payloadCommitment) {
+        redacted += 1;
+        continue;
+      }
+      fail(id, 'CALLER_RESULT_OBSERVED carries neither payload nor payloadCommitment');
+      continue;
+    }
+    if (typeof e.payload.success !== 'boolean') {
+      fail(id, 'CALLER_RESULT_OBSERVED.payload.success must be a boolean');
+      continue;
+    }
+    const commitment = e.payload.resultCommitment;
+    if (commitment !== undefined && commitment !== null && !isSha256HexDigest(commitment)) {
+      fail(
+        id,
+        'CALLER_RESULT_OBSERVED.payload.resultCommitment is present but not a well-formed sha256 hex digest',
+      );
+    }
+  }
+
+  return {
+    result: {
+      ok: failed === 0,
+      checked,
+      failed,
+      ...(firstFailure !== undefined ? { firstFailure } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    },
+    status: failed === 0 && redacted > 0 ? 'incomplete' : undefined,
+  };
+}
+
+/**
+ * PA-0010 (D7) — THE CENTERPIECE. See
+ * {@link VerifyReport.closureLegality}'s doc comment.
+ */
+function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const byAction = groupActionEvents(events);
+  for (const [actionId, stream] of byAction) {
+    let currentClosure: string | null = null;
+    let firstClosureSeen = false;
+    for (const e of stream) {
+      if (e.eventType !== 'ACTION_CLOSED' && e.eventType !== 'OUTCOME_RECONCILED') {
+        continue;
+      }
+      checked += 1;
+      const id = `${actionId}#${e.actionSeq}`;
+      const hasEvidencingEvent = stream.some(
+        (x) =>
+          x.actionSeq < e.actionSeq &&
+          (x.eventType === 'TARGET_ACKNOWLEDGED' ||
+            x.eventType === 'CALLER_RESULT_OBSERVED'),
+      );
+
+      if (e.eventType === 'ACTION_CLOSED') {
+        if (firstClosureSeen) {
+          fail(id, 'multiple_action_closed: an actionId may only be first-closed once (append-only D6 — a re-close is a defect or forgery)');
+          continue;
+        }
+        firstClosureSeen = true;
+        const closure = payloadStr(e.payload, 'closure');
+        const closureReason = payloadStr(e.payload, 'reason');
+        if (!closure || !closureReason) {
+          fail(id, 'ACTION_CLOSED.payload must carry both closure and reason');
+          continue;
+        }
+        const reachedDispatch = stream.some(
+          (x) =>
+            x.actionSeq < e.actionSeq &&
+            x.eventType === 'DISPATCH_ATTEMPTED' &&
+            x.dispatched === true,
+        );
+        const phaseAllowed = reachedDispatch
+          ? POST_DISPATCH_ALLOWED_CLOSURES
+          : PRE_DISPATCH_ALLOWED_CLOSURES;
+        if (!phaseAllowed.has(closure)) {
+          fail(
+            id,
+            `closure_not_reachable_from_phase: closure "${closure}" is not reachable from ${reachedDispatch ? 'a dispatched' : 'a pre-dispatch'} action`,
+          );
+          currentClosure = closure;
+          continue;
+        }
+        const reasonAllowed = REASON_ALLOWED_CLOSURES[closureReason];
+        if (!reasonAllowed || !reasonAllowed.has(closure)) {
+          // D7's hard rule, structurally: this is what catches a bundle
+          // claiming e.g. FAILED_NO_EFFECT with reason: TIMEOUT.
+          fail(
+            id,
+            `closure_reason_mismatch: closure "${closure}" cannot be produced by reason "${closureReason}" (D7 — a reason with no positive evidence about the outcome may never resolve to a closure that claims to know it)`,
+          );
+          currentClosure = closure;
+          continue;
+        }
+        if (EVIDENCE_CLAIMING_CLOSURES.has(closure) && !hasEvidencingEvent) {
+          // THE single most important assertion in this package: even
+          // when the declared `reason` field passed the check above (an
+          // attacker who lies about `reason` too), an evidence-claiming
+          // closure with NO actual TARGET_ACKNOWLEDGED/CALLER_RESULT_OBSERVED
+          // event anywhere earlier in this actionId's stream is invalid —
+          // a bundle claiming FAILED_NO_EFFECT with only timeout evidence
+          // (or no evidence at all) verifies as invalid here.
+          fail(
+            id,
+            `closure_lacks_evidencing_event: closure "${closure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
+          );
+        }
+        currentClosure = closure;
+      } else {
+        // OUTCOME_RECONCILED
+        const toClosure = payloadStr(e.payload, 'toClosure');
+        if (!toClosure) {
+          fail(id, 'OUTCOME_RECONCILED.payload must carry toClosure');
+          continue;
+        }
+        if (currentClosure === null || !RECONCILABLE_FROM.has(currentClosure)) {
+          fail(
+            id,
+            `illegal_reconciliation: closure "${currentClosure ?? 'none'}" is terminal and cannot be reconciled`,
+          );
+          currentClosure = toClosure;
+          continue;
+        }
+        if (!RECONCILABLE_TO.has(toClosure)) {
+          fail(
+            id,
+            `illegal_reconciliation_target: reconciliation cannot resolve to closure "${toClosure}" — it is not an evidence-backed terminal outcome`,
+          );
+          currentClosure = toClosure;
+          continue;
+        }
+        if (EVIDENCE_CLAIMING_CLOSURES.has(toClosure) && !hasEvidencingEvent) {
+          fail(
+            id,
+            `closure_lacks_evidencing_event: reconciled closure "${toClosure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
+          );
+        }
+        currentClosure = toClosure;
+      }
+    }
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/**
+ * PA-0010 (D8, corrigendum C4) — DERIVES, does not believe. See
+ * {@link VerifyReport.evidenceGrade}'s doc comment.
+ */
+function verifyEvidenceGrade(
+  events: BundleActionEvent[],
+  manifest: BundleManifest,
+): RawComponentResult {
+  let checked = 0;
+  let failed = 0;
+  let firstFailure: string | undefined;
+  let reason: string | undefined;
+  const fail = (id: string, msg: string): void => {
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = id;
+      reason = msg;
+    }
+  };
+
+  const declared = manifest.evidenceGradeSummary;
+  if (!declared) {
+    // v5 presence is already enforced by `verifyManifest`; nothing to
+    // cross-check if somehow absent (structural error caught elsewhere).
+    return { ok: true, checked: 0, failed: 0 };
+  }
+
+  const derived = { A: 0, B: 0, C: 0, D: 0 };
+  const byAction = groupActionEvents(events);
+  let observeModeEventSeen = false;
+  for (const [, stream] of byAction) {
+    const closed = stream.find((e) => e.eventType === 'ACTION_CLOSED');
+    if (!closed) continue;
+    // Best (strongest) grade any TARGET_ACKNOWLEDGED event in this
+    // action's stream structurally supports.
+    let best: 'A' | 'B' | 'C' | 'D' | null = null;
+    let sdkOnly = true;
+    for (const e of stream) {
+      if (e.eventType === 'TARGET_ACKNOWLEDGED' && e.payload) {
+        const grade = e.payload.grade;
+        if (
+          grade === 'A' &&
+          payloadStr(e.payload, 'targetSignature') &&
+          payloadStr(e.payload, 'signatureAlgorithm')
+        ) {
+          best = 'A';
+        } else if (
+          grade === 'B' &&
+          payloadStr(e.payload, 'edgeAttestation') &&
+          e.payload.destinationAuthenticated === true &&
+          best !== 'A'
+        ) {
+          best = 'B';
+        }
+      }
+      // Any Praesidia-issued (non-SDK) event beyond proposal is
+      // "Praesidia observed" evidence — at least grade C.
+      const trustDomain = e.trustDomain.toLowerCase();
+      const issuerType = e.issuerType.toLowerCase();
+      if (!trustDomain.includes('sdk') && issuerType !== 'sdk-report') {
+        sdkOnly = false;
+      }
+    }
+    let actionGrade: 'A' | 'B' | 'C' | 'D';
+    if (best === 'A') actionGrade = 'A';
+    else if (best === 'B') actionGrade = 'B';
+    else if (sdkOnly) actionGrade = 'D';
+    else actionGrade = 'C';
+    derived[actionGrade] += 1;
+
+    for (const e of stream) {
+      const mode = e.payload?.enforcementMode;
+      if (mode === 'observe') observeModeEventSeen = true;
+    }
+  }
+
+  checked += 3; // the three cumulative-from-strongest bucket checks below
+  const declaredCumA = declared.A;
+  const declaredCumAB = declared.A + declared.B;
+  const declaredCumABC = declared.A + declared.B + declared.C;
+  const derivedCumA = derived.A;
+  const derivedCumAB = derived.A + derived.B;
+  const derivedCumABC = derived.A + derived.B + derived.C;
+  if (declaredCumA > derivedCumA) {
+    fail(
+      'evidenceGradeSummary.A',
+      `declared_grade_exceeds_derived_evidence: manifest declares ${declared.A} grade-A actions but only ${derived.A} action(s) in the shipped event stream carry grade-A-shaped evidence (a target signature)`,
+    );
+  } else if (declaredCumAB > derivedCumAB) {
+    fail(
+      'evidenceGradeSummary.B',
+      `declared_grade_exceeds_derived_evidence: manifest declares ${declaredCumAB} grade-A/B actions but only ${derivedCumAB} action(s) in the shipped event stream carry grade-A/B-shaped evidence`,
+    );
+  } else if (declaredCumABC > derivedCumABC) {
+    fail(
+      'evidenceGradeSummary.C',
+      `declared_grade_exceeds_derived_evidence: manifest declares ${declaredCumABC} grade-A/B/C actions but only ${derivedCumABC} action(s) in the shipped event stream support at least grade C`,
+    );
+  }
+
+  checked += 1;
+  if (declared.enforcementMode === 'enforce' && observeModeEventSeen) {
+    fail(
+      'evidenceGradeSummary.enforcementMode',
+      'observe_mode_action_counted_as_enforced: manifest declares enforcementMode "enforce" but at least one counted event\'s own signed payload declares enforcementMode "observe"',
+    );
+  }
+
+  return {
+    ok: failed === 0,
+    checked,
+    failed,
+    ...(firstFailure !== undefined ? { firstFailure } : {}),
+    ...(reason !== undefined ? { reason } : {}),
+  };
+}
+
+/** PA-0010 — see {@link VerifyReport.actionCompleteness}'s doc comment. */
+function verifyActionCompleteness(
+  manifest: BundleManifest,
+  events: BundleActionEvent[],
+): RawComponentResult {
+  if (events.length !== manifest.actionEventCount) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `action event count mismatch: bundle has ${events.length} action events but signed manifest declares ${manifest.actionEventCount}`,
+    };
+  }
+  return { ok: true, checked: 1, failed: 0 };
+}
+
+function assertActionEventsStructure(
+  events: BundleActionEvent[],
+  orgId: string,
+): void {
+  const seen = new Set<string>();
+  for (const e of events) {
+    const dupKey = `${String(e?.actionId)}#${String(e?.actionSeq)}`;
+    if (seen.has(dupKey)) {
+      throw new Error(
+        `action-events.ndjson.gz has an invalid/duplicate event: (actionId, actionSeq) = (${String(e?.actionId)}, ${String(e?.actionSeq)}) appears more than once — the DB's own UNIQUE (actionId, actionSeq) constraint means a genuine producer can never emit this; a resubmitted/replayed event was spliced into the export`,
+      );
+    }
+    seen.add(dupKey);
+    if (
+      !e ||
+      typeof e !== 'object' ||
+      typeof e.actionId !== 'string' ||
+      e.actionId.length === 0 ||
+      !Number.isSafeInteger(e.actionSeq) ||
+      e.actionSeq < 1 ||
+      typeof e.eventType !== 'string' ||
+      e.eventType.length === 0 ||
+      typeof e.schemaVersion !== 'number' ||
+      !isIsoDate(e.observedAt) ||
+      !isIsoDate(e.receivedAt) ||
+      typeof e.issuer !== 'string' ||
+      typeof e.trustDomain !== 'string' ||
+      (e.payload !== null && typeof e.payload !== 'object') ||
+      (e.payload === null && !e.payloadCommitment) ||
+      (e.payloadCommitment !== null && typeof e.payloadCommitment !== 'string') ||
+      typeof e.prevEventCommitment !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(e.prevEventCommitment) ||
+      typeof e.signature !== 'string' ||
+      (e.signatureAlgorithm !== 'Ed25519' &&
+        e.signatureAlgorithm !== 'ECDSA_P256_SHA256') ||
+      !Number.isSafeInteger(e.keyVersion) ||
+      e.keyVersion < 1 ||
+      e.organizationId !== orgId ||
+      typeof e.issuerType !== 'string' ||
+      typeof e.dispatched !== 'boolean' ||
+      typeof e.eventCommitment !== 'string' ||
+      typeof e.producerVersion !== 'string' ||
+      // SEC-PA01-DISCOVERED-01 — required for exact signable-preimage
+      // reconstruction; see BundleActionEvent's doc comment.
+      typeof e.timeSource !== 'string' ||
+      (e.permitNonce !== null && typeof e.permitNonce !== 'string') ||
+      (e.edgeVersion !== null && typeof e.edgeVersion !== 'string') ||
+      (e.adapterVersion !== null && typeof e.adapterVersion !== 'string') ||
+      (e.externalReceiptRef !== null && typeof e.externalReceiptRef !== 'string') ||
+      (e.artifactStorageRef !== null && typeof e.artifactStorageRef !== 'string')
+    ) {
+      throw new Error(
+        `action-events.ndjson.gz has an invalid/incomplete event: actionId=${String(e?.actionId)} actionSeq=${String(e?.actionSeq)} — every field required to reconstruct the signed preimage (organizationId, issuerType, dispatched, timeSource, permitNonce, edgeVersion, adapterVersion, externalReceiptRef, artifactStorageRef) must be present, per PA01-CONTRACT-manifest-v5-actions.md`,
+      );
+    }
+  }
 }
 
 function verifyRowSignatures(
@@ -2763,6 +4033,40 @@ function assertManifestStructure(manifest: BundleManifest): void {
       manifest.integrityCheckpointCount! < 0)
   ) {
     throw new Error('manifest.json has an invalid structure');
+  }
+  // PA-0010 — same format-sanity-only checks for the three v5 fields;
+  // presence-vs-version is a tampering/skew concern checked in
+  // `verifyManifest`, not a format concern.
+  if (
+    'actionEventCount' in manifest &&
+    (!Number.isSafeInteger(manifest.actionEventCount) ||
+      manifest.actionEventCount! < 0)
+  ) {
+    throw new Error('manifest.json has an invalid structure');
+  }
+  if (
+    'captureScopeDigest' in manifest &&
+    typeof manifest.captureScopeDigest !== 'string'
+  ) {
+    throw new Error('manifest.json has an invalid structure');
+  }
+  if ('evidenceGradeSummary' in manifest) {
+    const s = manifest.evidenceGradeSummary;
+    if (
+      !s ||
+      typeof s !== 'object' ||
+      !Number.isSafeInteger(s.A) ||
+      s.A < 0 ||
+      !Number.isSafeInteger(s.B) ||
+      s.B < 0 ||
+      !Number.isSafeInteger(s.C) ||
+      s.C < 0 ||
+      !Number.isSafeInteger(s.D) ||
+      s.D < 0 ||
+      (s.enforcementMode !== 'observe' && s.enforcementMode !== 'enforce')
+    ) {
+      throw new Error('manifest.json has an invalid structure');
+    }
   }
 }
 

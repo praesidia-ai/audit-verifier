@@ -42,9 +42,10 @@ Exit codes:
   1   status: invalid — a real verification failure.
   2   I/O or bundle-format error (malformed zip, missing file, etc.).
   3   status: incomplete — evidence present is insufficient to decide
-      (distinct from a failure; no component in this release can produce
-      it yet — reserved for the action-proof components of a future
-      release, see "Verdict shape" below).
+      (distinct from a failure). The `targetAck`/`callerResult` components
+      produce this when a piece of evidence was legitimately redacted
+      (`payload: null` with a `payloadCommitment` present) rather than
+      illegitimately stripped — see "Verdict shape" below.
 ```
 
 ## Verdict shape
@@ -57,11 +58,12 @@ reduction, not "any component failed": `invalid` if any component is
 `invalid`; else `incomplete` if any is `incomplete`; else `valid`. A
 component reporting `unsupported` — this bundle legitimately carries no
 evidence for that check — is reported but never drags the overall verdict
-down. As of this release none of the checks below can produce `incomplete`
-or `unsupported`; the states exist so future evidence-grade-dependent
-checks (e.g. target-acknowledgment evidence that a grade-D, SDK-only org
-never produces by design) can report "does not apply" honestly instead of
-a false pass or a false fail.
+down. The nine action-evidence components (invariants 13-21 below) report
+`unsupported` on every bundle below `manifest.version: 5` (there is no
+action-event evidence to check at all), and `targetAck`/`callerResult`
+report `incomplete` when the relevant evidence event is legitimately
+redacted. Every other component in this release only ever produces
+`valid`/`invalid`.
 
 ## What it verifies
 
@@ -254,17 +256,73 @@ checks every cryptographic invariant the bundle commits to:
     can do is leave `rootCoverage`/`integrityCheckpoints` failing closed
     exactly as they did before this entry existed.
 
+13. **Action-event chain integrity** (`version: 5`+ only, `actionEventChain`)
+    — every `protected_action_events` row in `action-events.ndjson.gz` is
+    signature-verified (message = `canonicalJson(signable) ||
+    prevEventCommitmentBytes`, mirroring the row-signature binding) and
+    chained by an independently RECOMPUTED `sha256(canonical || sigBytes)`
+    per `actionId` — never the wire-declared `eventCommitment`. `actionSeq`
+    must be monotonic and gapless within the bundle for each `actionId`;
+    the first event seen for an `actionId` is accepted as an opaque
+    out-of-range anchor unless its `actionSeq` is `1`, in which case it
+    must declare the genesis commitment (mirrors invariant 3's mid-range
+    anchor rule). A `receivedAt` before `observedAt` is flagged as clock
+    skew.
+14. **Permit binding** (`permitBinding`) — `PERMIT_ISSUED`/`PERMIT_CONSUMED`
+    within one `actionId` must agree on the request commitment and the
+    permit identifier, and no `permitNonce` may be consumed by two distinct
+    `actionId`s across the whole bundle (the durable single-use gate).
+15. **Request binding** (`requestBinding`) — `DISPATCH_ATTEMPTED` and
+    `PERMIT_CONSUMED` must agree on `requestCommitment` for the same
+    `actionId` — the authoritative-commitment-substitution defense.
+16. **Dispatch integrity** (`dispatchIntegrity`) — every `DISPATCH_ATTEMPTED`
+    event must carry `dispatched: true`; a post-dispatch closure requires
+    one such event, a pre-dispatch-only closure must never have one.
+17. **Target acknowledgment** (`targetAck`) — every `TARGET_ACKNOWLEDGED`
+    event's claimed grade is independently re-checked structurally (grade A
+    needs a target signature, grade B needs an authenticated edge
+    attestation) rather than trusted.
+18. **Caller result** (`callerResult`) — every `CALLER_RESULT_OBSERVED`
+    event's `payload.success` must be boolean and any
+    `payload.resultCommitment` well-formed.
+19. **Closure legality** (`closureLegality`) — re-derives D7's frozen
+    closure state machine independently (never trusts `be`'s own logic) and
+    additionally requires an ACTUAL `TARGET_ACKNOWLEDGED`/
+    `CALLER_RESULT_OBSERVED` event for any closure that claims a determined
+    outcome, regardless of the declared `reason`. **This is the check that
+    makes a bundle claiming `FAILED_NO_EFFECT` with only timeout evidence
+    verify as `invalid`.**
+20. **Evidence grade** (`evidenceGrade`) — derives a grade per closed action
+    from the evidence actually present and flags a declared
+    `evidenceGradeSummary` count that exceeds what the evidence supports,
+    and an `enforcementMode: 'enforce'` declaration contradicted by an
+    `'observe'`-mode event.
+21. **Action completeness** (`actionCompleteness`) — the signed
+    `actionEventCount` must match the rows actually present in
+    `action-events.ndjson.gz`.
+
 S3 anchor receipts cannot be proven offline from their locator string alone.
 The library therefore fails closed for S3 by default; callers can provide an
 `anchorReceiptVerifier` that validates the object/version against their S3
 trust boundary.
 
 `manifest.version` is checked against an explicit ceiling
-(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 4) — a bundle declaring a newer
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 5) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's
 fields in the same change.
+
+**Known producer gap (as of this release):** a real `version: 5` bundle
+with non-empty action-event content, produced by `be` commit `e9e39b88`, is
+currently rejected as a bundle-format error — `be`'s wire row omits six
+fields (`timeSource`, `permitNonce`, `edgeVersion`, `adapterVersion`,
+`externalReceiptRef`, `artifactStorageRef`) this verifier needs to
+reconstruct the exact bytes `be` signed. This is intentional, fail-closed
+behavior for an unverifiable signature, not a defect in this package —
+tracked as `be`'s `PA-0027`. `version: 5` bundles with an EMPTY
+`action-events.ndjson.gz` (no protected-action activity in range) verify
+correctly today.
 
 ## What this verifier does — and does NOT — prove
 
@@ -364,6 +422,25 @@ fields in the same change.
   This is a static, offline artifact check. It says nothing about whether
   the platform is currently signing correctly, whether retention jobs are
   about to destroy signed data, or any other live operational property.
+- **That the bound `args` of a protected action were authorized BY A
+  PRINCIPAL, only that they were not altered after policy ran.** On the
+  agent-runtime dispatch path, the arguments a Permit binds are the
+  model's own proposed arguments — a Permit proves byte-for-byte integrity
+  from policy decision to dispatch, not that a human or an upstream
+  authority chose those exact bytes. Prompt injection that steers an
+  agent's proposed arguments yields a fully valid, fully signed Permit and
+  a fully valid `closureLegality`/`evidenceGrade` verdict. This verifier
+  (and every consumer of its report) must not present a valid verdict as
+  "this exact action was authorized" without qualifying by whom
+  (`PA01-DECISIONS.md` corrigendum C4).
+- **That an unmediated dispatch path was covered at all.** A dispatch that
+  never touches an instrumented Proof Edge (e.g. today's uninstrumented
+  outbound-webhook path) produces ZERO bundle evidence — there is nothing
+  in the artifact for this verifier to check, by construction. The signed
+  `captureScopeDigest` makes the org's capture-scope REGISTRY
+  tamper-evident, but detecting that a real dispatch bypassed the registry
+  entirely requires comparing bundle evidence against live system activity,
+  which is outside what an offline, single-bundle verifier can ever prove.
 
 ## Architecture
 
@@ -386,6 +463,42 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.9.0 (PA-0010 — manifest v5 action-event evidence, `PA01-CONTRACT-manifest-v5-actions.md`)
+
+- **`manifest.version: 5` is now understood.** Adds `actionEventCount` /
+  `captureScopeDigest` / `evidenceGradeSummary` inside the signed manifest
+  preimage and a new REQUIRED-even-when-empty `action-events.ndjson.gz`
+  entry. Same fail-closed-both-directions version negotiation as v3/v4
+  (named reasons: `action_event_count_present_on_v{n}_manifest` /
+  `_missing_on_v5_manifest`, etc.).
+- **Nine new components** (see invariants 13-21 above):
+  `actionEventChain`, `permitBinding`, `requestBinding`,
+  `dispatchIntegrity`, `targetAck`, `callerResult`, `closureLegality`,
+  `evidenceGrade`, `actionCompleteness`. All nine report `unsupported` on
+  `manifest.version < 5`, never dragging the verdict down.
+- **`evidenceGrade` DERIVES the grade, never trusts `be`'s declaration**
+  (`PA01-DECISIONS.md` corrigendum C4) — a declared grade exceeding what
+  the shipped evidence actually supports is `invalid`
+  (`declared_grade_exceeds_derived_evidence`), and an `enforcementMode:
+  'enforce'` declaration contradicted by an observe-mode event is
+  `invalid` (`observe_mode_action_counted_as_enforced`).
+- **`closureLegality` re-derives D7's frozen closure state machine
+  independently** and requires an ACTUAL evidencing event for any closure
+  claiming a determined outcome, regardless of the declared `reason` —
+  this is what makes a bundle claiming `FAILED_NO_EFFECT` with only
+  timeout evidence verify as `invalid`.
+- **`targetAck`/`callerResult` can report `status: 'incomplete'`** — the
+  first components in this package to use that state — when the relevant
+  evidence event is legitimately redacted (`payload: null` with a present
+  `payloadCommitment`).
+- New `VerifyReport.bundle.actionEventsSeen` field (additive).
+- **Known producer gap** (not a defect in this package): `be` commit
+  `e9e39b88` omits six fields (`timeSource`, `permitNonce`, `edgeVersion`,
+  `adapterVersion`, `externalReceiptRef`, `artifactStorageRef`) required
+  to reconstruct the signed per-event preimage — a real `be` v5 bundle
+  with non-empty action-event content is correctly rejected as a
+  bundle-format error until `be`'s `PA-0027` lands.
 
 ### 0.7.0 (FIX01 audit-verifier2 — sealed-purge cross-check, `BE-0003`)
 
