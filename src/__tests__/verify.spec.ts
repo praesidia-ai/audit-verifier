@@ -5251,6 +5251,116 @@ describe('verifyBundle', () => {
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.closureLegality.status).toBe('valid');
       });
+
+      describe('PA-0033 (HIGH-1 security re-attack) — presence of an evidencing event is not evidence', () => {
+        /** Post-dispatch, evidenced only by a single CALLER_RESULT_OBSERVED — the exact shape the re-attack exploited. */
+        function timeoutEvidencedFailure(
+          actionId: string,
+          callerResultPayload: Record<string, unknown>,
+        ): ActionEventDef[] {
+          return [
+            {
+              actionId,
+              actionSeq: 1,
+              eventType: 'ACTION_PROPOSED',
+              observedAtIso: isoSecond(T0, 0),
+              payload: { actionClass: 'mcp.tool.call', protocol: 'mcp' },
+            },
+            {
+              actionId,
+              actionSeq: 2,
+              eventType: 'DISPATCH_ATTEMPTED',
+              observedAtIso: isoSecond(T0, 1),
+              dispatched: true,
+              payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+            },
+            {
+              actionId,
+              actionSeq: 3,
+              eventType: 'CALLER_RESULT_OBSERVED',
+              observedAtIso: isoSecond(T0, 2),
+              payload: callerResultPayload,
+            },
+            {
+              actionId,
+              actionSeq: 4,
+              eventType: 'ACTION_CLOSED',
+              observedAtIso: isoSecond(T0, 3),
+              payload: { closure: 'FAILED_NO_EFFECT', reason: 'EVIDENCED' },
+            },
+          ];
+        }
+
+        it('HIGH-1 EXACT REPRODUCTION: FAILED_NO_EFFECT/EVIDENCED justified only by a timeout-shaped CALLER_RESULT_OBSERVED (outcomeClass: no_response_received) verifies as invalid, named reason', async () => {
+          const actionId = 'aaaaaaaa-0000-7000-8000-0000000000h6';
+          const events = timeoutEvidencedFailure(actionId, {
+            success: false,
+            resultSummary: 'Tool call timed out after 30000ms',
+            resultCommitment: 'b'.repeat(64),
+            outcomeClass: 'no_response_received',
+          });
+          const { zip } = buildV5Bundle({ events });
+          const report = await verifyBundle(zip, { noRekor: true });
+          expect(report.closureLegality.status).toBe('invalid');
+          expect(report.closureLegality.reason).toMatch(/closure_evidencing_event_not_positive/);
+          expect(report.status).toBe('invalid');
+        });
+
+        it('a legitimate negative result (outcomeClass: completed_with_error) DOES support FAILED_NO_EFFECT — verifies as valid', async () => {
+          const actionId = 'aaaaaaaa-0000-7000-8000-0000000000h7';
+          const events = timeoutEvidencedFailure(actionId, {
+            success: false,
+            resultSummary: 'error',
+            resultCommitment: 'b'.repeat(64),
+            outcomeClass: 'completed_with_error',
+          });
+          const { zip } = buildV5Bundle({ events });
+          const report = await verifyBundle(zip, { noRekor: true });
+          expect(report.closureLegality.status).toBe('valid');
+        });
+
+        it('a bundle predating PA-0034 (CALLER_RESULT_OBSERVED{success:false}, no outcomeClass field at all) is neither valid nor invalid — it is incomplete, never a silent pass', async () => {
+          const actionId = 'aaaaaaaa-0000-7000-8000-0000000000h8';
+          const events = timeoutEvidencedFailure(actionId, {
+            success: false,
+            resultSummary: 'Tool call timed out after 30000ms',
+            resultCommitment: 'b'.repeat(64),
+            // no outcomeClass — the pre-PA-0034 wire shape.
+          });
+          const { zip } = buildV5Bundle({ events });
+          const report = await verifyBundle(zip, { noRekor: true });
+          expect(report.closureLegality.status).toBe('incomplete');
+          expect(report.closureLegality.ok).toBe(false);
+          expect(report.closureLegality.reason).toMatch(/closure_evidencing_event_ambiguous/);
+          expect(report.status).toBe('incomplete');
+        });
+
+        it('rejects a CALLER_RESULT_OBSERVED whose outcomeClass contradicts payload.success', async () => {
+          const actionId = 'aaaaaaaa-0000-7000-8000-0000000000h9';
+          const events = timeoutEvidencedFailure(actionId, {
+            success: false,
+            resultCommitment: 'b'.repeat(64),
+            outcomeClass: 'completed_success', // says success but success:false — contradiction
+          });
+          const { zip } = buildV5Bundle({ events });
+          const report = await verifyBundle(zip, { noRekor: true });
+          expect(report.callerResult.status).toBe('invalid');
+          expect(report.callerResult.reason).toMatch(/outcomeClass.*inconsistent with payload\.success/);
+        });
+
+        it('rejects a CALLER_RESULT_OBSERVED with an unrecognized outcomeClass value', async () => {
+          const actionId = 'aaaaaaaa-0000-7000-8000-0000000000ha';
+          const events = timeoutEvidencedFailure(actionId, {
+            success: false,
+            resultCommitment: 'b'.repeat(64),
+            outcomeClass: 'partial_response', // not in the recognized set
+          });
+          const { zip } = buildV5Bundle({ events });
+          const report = await verifyBundle(zip, { noRekor: true });
+          expect(report.callerResult.status).toBe('invalid');
+          expect(report.callerResult.reason).toMatch(/not a recognized value/);
+        });
+      });
     });
 
     describe('evidenceGrade — corrigendum C4: derive, do not believe', () => {

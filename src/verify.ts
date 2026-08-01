@@ -725,6 +725,11 @@ export interface VerifyReport {
    * must be a boolean and, when present, `payload.resultCommitment` a
    * well-formed `sha256` hex digest (mirrors `computeResultCommitment`'s
    * output shape). Same redaction `incomplete` handling as `targetAck`.
+   * PA-0033 — when present, `payload.outcomeClass` must be one of
+   * `completed_success` / `completed_with_error` / `no_response_received`
+   * and consistent with `payload.success`; `outcomeClass` is OPTIONAL here
+   * (structurally) but `closureLegality` treats its absence as ambiguous,
+   * never as positive evidence — see that component's doc comment.
    * `unsupported` on `manifest.version < 5`.
    */
   callerResult: ComponentResult;
@@ -739,10 +744,24 @@ export interface VerifyReport {
    * positive evidence (`TARGET_REJECTED`, `SUCCEEDED`, `FAILED_NO_EFFECT`,
    * `PARTIAL`, `REVERSED`) is independently required to have an ACTUAL
    * `TARGET_ACKNOWLEDGED` or `CALLER_RESULT_OBSERVED` event in the same
-   * `actionId`'s stream — regardless of what `reason` says. **This is the
-   * single check that makes a bundle claiming `FAILED_NO_EFFECT` with only
-   * timeout evidence verify as `invalid`** (D7's hard rule, cross-checked
-   * against the event set actually present, not the self-declared label).
+   * `actionId`'s stream — regardless of what `reason` says.
+   *
+   * PA-0033 (HIGH-1) — presence of an evidencing-TYPED event is not
+   * evidence: `CALLER_RESULT_OBSERVED{success:false}` is what `be` writes
+   * for BOTH a genuine negative result AND a client-side timeout. This
+   * component now requires the evidencing event to carry a POSITIVE
+   * outcome (`TARGET_ACKNOWLEDGED` always qualifies; `CALLER_RESULT_OBSERVED`
+   * qualifies via `payload.outcomeClass` — `completed_success` /
+   * `completed_with_error` positive, `no_response_received` a confirmed
+   * non-answer, see `be`'s paired PA-0034). A confirmed non-answer is
+   * `invalid` (`closure_evidencing_event_not_positive`) — **this is the
+   * check that makes a bundle claiming `FAILED_NO_EFFECT` justified only
+   * by a timeout verify as `invalid`, not just one claiming no evidence at
+   * all.** A bundle whose `CALLER_RESULT_OBSERVED` events predate the
+   * `outcomeClass` field (`success: false`, field absent — indistinguishable
+   * offline from a timeout) can neither be trusted (`valid`) nor condemned
+   * (`invalid`): it downgrades the whole component to `status: 'incomplete'`
+   * (`closure_evidencing_event_ambiguous`), never silently `valid`.
    * `unsupported` on `manifest.version < 5`.
    */
   closureLegality: ComponentResult;
@@ -1076,8 +1095,9 @@ export async function verifyBundle(
   const callerResultResult = actionEventsSupported
     ? withStatus(callerResultRaw!.result, callerResultRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const closureLegalityRaw = actionEventsSupported ? verifyClosureLegality(actionEvents) : null;
   const closureLegalityResult = actionEventsSupported
-    ? withStatus(verifyClosureLegality(actionEvents))
+    ? withStatus(closureLegalityRaw!.result, closureLegalityRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const evidenceGradeResult = actionEventsSupported
     ? withStatus(verifyEvidenceGrade(actionEvents, manifest))
@@ -2129,6 +2149,28 @@ const RECONCILABLE_TO = new Set([
   'DUPLICATE_SUPPRESSED',
 ]);
 
+/**
+ * PA-0033 (HIGH-1 fix, `PA01-CONTRACT-manifest-v5-actions.md`) —
+ * `CALLER_RESULT_OBSERVED.payload.outcomeClass`, paired with `be`'s
+ * PA-0034. `payload.success` alone is NOT evidence of what happened: `be`'s
+ * generic exception handler records a client-side TIMEOUT as
+ * `success: false`, indistinguishable on that field alone from a target
+ * that actually answered negatively. `outcomeClass` disambiguates:
+ * `completed_success`/`completed_with_error` mean the target genuinely
+ * answered (positive evidence, `success` must be `true`/`false`
+ * respectively); `no_response_received` means no answer was ever obtained
+ * (timeout/transport failure — `success` must be `false`, and this value
+ * is exactly HIGH-1's shape). An unrecognized value is a structural
+ * failure (`verifyCallerResult`) and, independently, `closureLegality`
+ * never treats an unrecognized value as capable of justifying a
+ * determined outcome (fail-closed either way).
+ */
+const CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS: Record<string, boolean> = {
+  completed_success: true,
+  completed_with_error: false,
+  no_response_received: false,
+};
+
 /** Strict lowercase-hex decoder — mirrors `decodeBase64Strict`'s discipline for the event chain's hex-encoded commitments. */
 function decodeHex64Strict(value: unknown): Buffer | null {
   if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) return null;
@@ -2653,6 +2695,32 @@ function verifyCallerResult(events: BundleActionEvent[]): {
         id,
         'CALLER_RESULT_OBSERVED.payload.resultCommitment is present but not a well-formed sha256 hex digest',
       );
+      continue;
+    }
+    // PA-0033 (HIGH-1) — `outcomeClass` is OPTIONAL on the wire (bundles
+    // predating `be`'s PA-0034 never carry it — see `closureLegality`'s
+    // ambiguous-evidence handling for what that means for THAT check).
+    // When present, though, it must be a recognized value and consistent
+    // with `success` — a producer that ships both must not be allowed to
+    // contradict itself.
+    const outcomeClass = e.payload.outcomeClass;
+    if (outcomeClass !== undefined) {
+      if (
+        typeof outcomeClass !== 'string' ||
+        !(outcomeClass in CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS)
+      ) {
+        fail(
+          id,
+          `CALLER_RESULT_OBSERVED.payload.outcomeClass is present but not a recognized value (completed_success | completed_with_error | no_response_received): ${JSON.stringify(outcomeClass)}`,
+        );
+      } else if (
+        CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS[outcomeClass] !== e.payload.success
+      ) {
+        fail(
+          id,
+          `CALLER_RESULT_OBSERVED.payload.outcomeClass ("${outcomeClass}") is inconsistent with payload.success (${String(e.payload.success)})`,
+        );
+      }
     }
   }
 
@@ -2669,10 +2737,90 @@ function verifyCallerResult(events: BundleActionEvent[]): {
 }
 
 /**
+ * PA-0033 (HIGH-1 fix) — classifies a single candidate evidencing event
+ * (`TARGET_ACKNOWLEDGED` or `CALLER_RESULT_OBSERVED`) for
+ * `evidencingSupport` below. THIS is where "presence of an event" is
+ * turned into "the event actually evidences something", which is the gap
+ * the security re-attack found: the pre-fix check only asked "does an
+ * evidencing-TYPED event exist", never "does it carry positive content".
+ *
+ * - `TARGET_ACKNOWLEDGED` is unconditionally `'positive'`: this event type
+ *   is, by D9's vocabulary, only ever emitted when the target actually
+ *   acknowledged the request — there is no "we never heard back" shape of
+ *   a `TARGET_ACKNOWLEDGED` event, redacted or not. This is NOT true of
+ *   `CALLER_RESULT_OBSERVED` — see below — and that asymmetry is exactly
+ *   why HIGH-1 exists on one event type and not the other.
+ * - `CALLER_RESULT_OBSERVED` with a redacted payload (`payload: null` +
+ *   `payloadCommitment`) is `'ambiguous'`: the commitment proves an event
+ *   was signed, not what it says.
+ * - `CALLER_RESULT_OBSERVED` with `payload.outcomeClass` present is
+ *   `'positive'` for `completed_success`/`completed_with_error`,
+ *   `'negative'` for `no_response_received` (exactly HIGH-1's shape —
+ *   `be`'s PA-0034 sets this on the timeout/transport-failure branches)
+ *   or any value `verifyCallerResult` doesn't recognize (fail-closed: an
+ *   unrecognized value must never rescue a determined closure).
+ * - `CALLER_RESULT_OBSERVED` with NO `outcomeClass` at all (a bundle that
+ *   predates `be`'s PA-0034 field) is `'positive'` when `payload.success
+ *   === true` — a genuine completion cannot be produced by a timeout, so
+ *   `success: true` was never ambiguous even before the field existed —
+ *   and `'ambiguous'` when `payload.success === false`, because THAT is
+ *   the exact byte pattern a timeout and a genuine negative result both
+ *   produce pre-PA-0034; this verifier cannot tell them apart offline and
+ *   must not guess either way.
+ */
+function callerResultEvidencePositivity(
+  payload: Record<string, unknown> | null,
+): 'positive' | 'negative' | 'ambiguous' {
+  if (payload === null) return 'ambiguous';
+  const outcomeClass = payload.outcomeClass;
+  if (typeof outcomeClass === 'string') {
+    if (outcomeClass === 'no_response_received') return 'negative';
+    if (outcomeClass in CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS) return 'positive';
+    return 'negative'; // unrecognized value — verifyCallerResult flags it invalid separately; never treat it as positive support here.
+  }
+  return payload.success === true ? 'positive' : 'ambiguous';
+}
+
+/**
+ * PA-0033 (HIGH-1 fix) — the single positivity verdict for an
+ * `ACTION_CLOSED`/`OUTCOME_RECONCILED` event at `beforeSeq`, over every
+ * candidate evidencing event earlier in `stream`. `'positive'` wins over
+ * everything else the moment it is seen (one genuine acknowledgment or
+ * completion is sufficient); short of that, `'negative'` (a confirmed
+ * non-answer, e.g. a timeout) is distinguished from `'ambiguous'` (cannot
+ * tell offline, pre-PA-0034 shape) so the caller can fail closed on the
+ * former while degrading to `incomplete` — never `valid` — on the latter.
+ * `'none'` means no candidate evidencing event exists at all.
+ */
+function evidencingSupport(
+  stream: BundleActionEvent[],
+  beforeSeq: number,
+): 'positive' | 'negative' | 'ambiguous' | 'none' {
+  let sawNegative = false;
+  let sawAmbiguous = false;
+  for (const x of stream) {
+    if (x.actionSeq >= beforeSeq) continue;
+    if (x.eventType === 'TARGET_ACKNOWLEDGED') return 'positive';
+    if (x.eventType === 'CALLER_RESULT_OBSERVED') {
+      const p = callerResultEvidencePositivity(x.payload);
+      if (p === 'positive') return 'positive';
+      if (p === 'ambiguous') sawAmbiguous = true;
+      else sawNegative = true;
+    }
+  }
+  if (sawAmbiguous) return 'ambiguous';
+  if (sawNegative) return 'negative';
+  return 'none';
+}
+
+/**
  * PA-0010 (D7) — THE CENTERPIECE. See
  * {@link VerifyReport.closureLegality}'s doc comment.
  */
-function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult {
+function verifyClosureLegality(events: BundleActionEvent[]): {
+  result: RawComponentResult;
+  status?: ComponentStatus;
+} {
   let checked = 0;
   let failed = 0;
   let firstFailure: string | undefined;
@@ -2682,6 +2830,23 @@ function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult 
     if (firstFailure === undefined) {
       firstFailure = id;
       reason = msg;
+    }
+  };
+  // PA-0033 — evidence that EXISTS but cannot be confirmed positive
+  // offline (a bundle whose `CALLER_RESULT_OBSERVED` events predate
+  // `be`'s PA-0034 `outcomeClass` field, with `success: false`). Never
+  // counted toward `failed` — this is not proof of tampering — but never
+  // silently accepted either: it downgrades the WHOLE component to
+  // `incomplete` (unless something else genuinely fails), so it can never
+  // read as `valid`.
+  let ambiguousCount = 0;
+  let firstAmbiguous: string | undefined;
+  let ambiguousReason: string | undefined;
+  const flagAmbiguous = (id: string, msg: string): void => {
+    ambiguousCount += 1;
+    if (firstAmbiguous === undefined) {
+      firstAmbiguous = id;
+      ambiguousReason = msg;
     }
   };
 
@@ -2695,12 +2860,7 @@ function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult 
       }
       checked += 1;
       const id = `${actionId}#${e.actionSeq}`;
-      const hasEvidencingEvent = stream.some(
-        (x) =>
-          x.actionSeq < e.actionSeq &&
-          (x.eventType === 'TARGET_ACKNOWLEDGED' ||
-            x.eventType === 'CALLER_RESULT_OBSERVED'),
-      );
+      const support = evidencingSupport(stream, e.actionSeq);
 
       if (e.eventType === 'ACTION_CLOSED') {
         if (firstClosureSeen) {
@@ -2742,18 +2902,32 @@ function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult 
           currentClosure = closure;
           continue;
         }
-        if (EVIDENCE_CLAIMING_CLOSURES.has(closure) && !hasEvidencingEvent) {
+        if (EVIDENCE_CLAIMING_CLOSURES.has(closure)) {
           // THE single most important assertion in this package: even
           // when the declared `reason` field passed the check above (an
           // attacker who lies about `reason` too), an evidence-claiming
-          // closure with NO actual TARGET_ACKNOWLEDGED/CALLER_RESULT_OBSERVED
-          // event anywhere earlier in this actionId's stream is invalid —
-          // a bundle claiming FAILED_NO_EFFECT with only timeout evidence
-          // (or no evidence at all) verifies as invalid here.
-          fail(
-            id,
-            `closure_lacks_evidencing_event: closure "${closure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
-          );
+          // closure needs an ACTUAL positive evidencing event, not merely
+          // an event of an evidencing TYPE — PA-0033 (HIGH-1): a bundle
+          // claiming FAILED_NO_EFFECT justified only by a timeout-shaped
+          // `CALLER_RESULT_OBSERVED` (`outcomeClass: 'no_response_received'`,
+          // or pre-PA-0034 `success: false` with no `outcomeClass` at all)
+          // must never verify `valid` here.
+          if (support === 'none') {
+            fail(
+              id,
+              `closure_lacks_evidencing_event: closure "${closure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
+            );
+          } else if (support === 'negative') {
+            fail(
+              id,
+              `closure_evidencing_event_not_positive: closure "${closure}" claims a determined outcome but every TARGET_ACKNOWLEDGED/CALLER_RESULT_OBSERVED event earlier in this actionId's stream carries a confirmed non-positive outcome (outcomeClass: "no_response_received") — HIGH-1: presence of an evidencing-typed event is not evidence of what happened`,
+            );
+          } else if (support === 'ambiguous') {
+            flagAmbiguous(
+              id,
+              `closure_evidencing_event_ambiguous: closure "${closure}" claims a determined outcome but its only supporting CALLER_RESULT_OBSERVED event(s) predate the outcomeClass field (or are redacted) and cannot be confirmed positive offline — re-export from a producer carrying PA-0034's field to resolve`,
+            );
+          }
         }
         currentClosure = closure;
       } else {
@@ -2779,23 +2953,48 @@ function verifyClosureLegality(events: BundleActionEvent[]): RawComponentResult 
           currentClosure = toClosure;
           continue;
         }
-        if (EVIDENCE_CLAIMING_CLOSURES.has(toClosure) && !hasEvidencingEvent) {
-          fail(
-            id,
-            `closure_lacks_evidencing_event: reconciled closure "${toClosure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
-          );
+        if (EVIDENCE_CLAIMING_CLOSURES.has(toClosure)) {
+          if (support === 'none') {
+            fail(
+              id,
+              `closure_lacks_evidencing_event: reconciled closure "${toClosure}" claims a determined outcome but no TARGET_ACKNOWLEDGED or CALLER_RESULT_OBSERVED event exists earlier in this actionId's stream to support it`,
+            );
+          } else if (support === 'negative') {
+            fail(
+              id,
+              `closure_evidencing_event_not_positive: reconciled closure "${toClosure}" claims a determined outcome but every TARGET_ACKNOWLEDGED/CALLER_RESULT_OBSERVED event earlier in this actionId's stream carries a confirmed non-positive outcome (outcomeClass: "no_response_received") — HIGH-1: presence of an evidencing-typed event is not evidence of what happened`,
+            );
+          } else if (support === 'ambiguous') {
+            flagAmbiguous(
+              id,
+              `closure_evidencing_event_ambiguous: reconciled closure "${toClosure}" claims a determined outcome but its only supporting CALLER_RESULT_OBSERVED event(s) predate the outcomeClass field (or are redacted) and cannot be confirmed positive offline — re-export from a producer carrying PA-0034's field to resolve`,
+            );
+          }
         }
         currentClosure = toClosure;
       }
     }
   }
 
+  const status: ComponentStatus | undefined =
+    failed === 0 && ambiguousCount > 0 ? 'incomplete' : undefined;
   return {
-    ok: failed === 0,
-    checked,
-    failed,
-    ...(firstFailure !== undefined ? { firstFailure } : {}),
-    ...(reason !== undefined ? { reason } : {}),
+    result: {
+      ok: failed === 0,
+      checked,
+      failed,
+      ...(firstFailure !== undefined
+        ? { firstFailure }
+        : status === 'incomplete' && firstAmbiguous !== undefined
+          ? { firstFailure: firstAmbiguous }
+          : {}),
+      ...(reason !== undefined
+        ? { reason }
+        : status === 'incomplete' && ambiguousReason !== undefined
+          ? { reason: ambiguousReason }
+          : {}),
+    },
+    status,
   };
 }
 
