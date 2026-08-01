@@ -284,14 +284,22 @@ checks every cryptographic invariant the bundle commits to:
     attestation) rather than trusted.
 18. **Caller result** (`callerResult`) — every `CALLER_RESULT_OBSERVED`
     event's `payload.success` must be boolean and any
-    `payload.resultCommitment` well-formed.
+    `payload.resultCommitment` well-formed. When present, `payload
+    .outcomeClass` (`completed_success`/`completed_with_error`/
+    `no_response_received`, PA-0033) must be a recognized value and
+    consistent with `payload.success`.
 19. **Closure legality** (`closureLegality`) — re-derives D7's frozen
     closure state machine independently (never trusts `be`'s own logic) and
-    additionally requires an ACTUAL `TARGET_ACKNOWLEDGED`/
+    additionally requires an ACTUAL, POSITIVE `TARGET_ACKNOWLEDGED`/
     `CALLER_RESULT_OBSERVED` event for any closure that claims a determined
-    outcome, regardless of the declared `reason`. **This is the check that
-    makes a bundle claiming `FAILED_NO_EFFECT` with only timeout evidence
-    verify as `invalid`.**
+    outcome, regardless of the declared `reason` — presence of an
+    evidencing-typed event is not by itself evidence (PA-0033, HIGH-1):
+    `TARGET_ACKNOWLEDGED` is always positive, `CALLER_RESULT_OBSERVED` is
+    positive only via `outcomeClass` (or `success: true` on bundles
+    predating that field). **This is the check that makes a bundle claiming
+    `FAILED_NO_EFFECT` justified only by a timeout — confirmed via
+    `outcomeClass: 'no_response_received'`, or ambiguous pre-field
+    `success: false` — verify as `invalid` or `incomplete`, never `valid`.**
 20. **Evidence grade** (`evidenceGrade`) — derives a grade per closed action
     from the evidence actually present and flags a declared
     `evidenceGradeSummary` count that exceeds what the evidence supports,
@@ -463,6 +471,29 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.9.1 (PA-0033 — HIGH-1 security re-attack fix, `PA01-SEC-reattack.md`)
+
+- **`closureLegality` now requires the evidencing event to carry a POSITIVE outcome, not merely
+  exist.** A security re-attack found that `be` records a client-side timeout as
+  `CALLER_RESULT_OBSERVED{success:false}` — the same wire shape a genuine negative tool result
+  produces — so a bundle claiming `FAILED_NO_EFFECT`/`EVIDENCED` built on nothing but a timeout
+  previously verified `valid`. Fixed via a new optional `CALLER_RESULT_OBSERVED.payload.outcomeClass`
+  field (`completed_success` / `completed_with_error` / `no_response_received`, paired with `be`'s
+  PA-0034): a confirmed `no_response_received` is `invalid`
+  (`closure_evidencing_event_not_positive`, the HIGH-1 regression guard); `TARGET_ACKNOWLEDGED`
+  remains unconditionally positive (D9: this event type has no "no answer" shape).
+- **New `incomplete` case, not a silent `valid`.** A v5 bundle whose `CALLER_RESULT_OBSERVED` events
+  predate the `outcomeClass` field (`success: false`, field absent) cannot be told apart from a
+  timeout offline — this now verifies `status: 'incomplete'`
+  (`closure_evidencing_event_ambiguous`), never `valid`. Scoped to `success: false` only:
+  `success: true` (every existing happy-path bundle) is unaffected — a genuine completion can never
+  be produced by a timeout, so it was never ambiguous.
+- `callerResult` structurally validates `outcomeClass` when present: must be one of the three
+  recognized values and consistent with `payload.success`.
+- **Verification-strictness change: tightened, not weakened.** New failure/incomplete modes only; no
+  previously-`invalid` bundle becomes `valid` or `incomplete`, and no previously-`valid`
+  `success:true` bundle is affected.
 
 ### 0.9.0 (PA-0010 — manifest v5 action-event evidence, `PA01-CONTRACT-manifest-v5-actions.md`)
 
