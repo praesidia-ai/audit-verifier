@@ -154,7 +154,18 @@ checks every cryptographic invariant the bundle commits to:
     that class of deletion; a boundary root that only partially overlaps
     the bundle's date range is exempted (a genuine ranged export
     legitimately ships fewer rows for it, since rows outside `[from, to)`
-    are never exported).
+    are never exported). A shrinkage (fewer rows/proofs than the root's
+    own signed `rowCount`) is downgraded from a hard failure to a distinct
+    `seal_exempted` pass — naming the responsible seal's `id` and
+    `approvalId` — when a VERIFIED entry in `sealed-purges.ndjson.gz`
+    (invariant 12) names the exact same `(periodStart, periodEnd,
+    rootHash)`. This closes `BE-0003`: a bundle spanning a legitimate,
+    signed, two-person-approval-gated `AuditRetentionSeal` retention purge
+    no longer reads as tampering. A shrinkage with no matching VERIFIED
+    seal keeps failing exactly as before — this is a narrowing of the
+    failure surface, never a widening; a period with MORE rows than its
+    own signed root committed to is a different anomaly a purge record can
+    never explain and always keeps failing regardless of any seal.
 11. **Integrity checkpoints** (`version: 4`+ only) — `be`'s
     `AuditIntegrityCheckpointService` periodically (hourly) signs and
     persists `{organizationId, chainHeadHash, cumulativeRowCount, asOf}`
@@ -169,13 +180,57 @@ checks every cryptographic invariant the bundle commits to:
     before that instant) is a legitimate boundary case and is skipped, not
     asserted — mirroring root coverage's own boundary exemption — UNLESS
     the checkpoint claims the all-zero genesis hash, which is fully
-    consistent with an empty window and IS checked. **Known residual:**
-    `AuditRetentionSealService.purgeWithSeal` (a real, already-shipped,
-    feature-flagged, two-person-approval-gated hard-delete of signed rows)
-    can legitimately trigger (b) or (c); no seal evidence is in the bundle
-    today to distinguish that from tampering, so this still fails closed,
-    with a reason string that names the possibility explicitly rather than
-    reading as certain tampering.
+    consistent with an empty window and IS checked. A `(b)` decrease or
+    `(c)` mismatch between two checkpoints is downgraded to a
+    `seal_exempted` pass — listing every contributing seal's `id` — when
+    VERIFIED `sealed-purges.ndjson.gz` entries whose `deletedAt` falls
+    strictly after the earlier checkpoint and at/before the later one
+    (`(prev.asOf, cur.asOf]`) sum to at least the observed
+    `cumulativeRowCount` decrease. A window with NO verified seal evidence
+    at all — even when the arithmetic would otherwise be trivially
+    satisfied — is never treated as reconciling; an empty seal window is
+    the absence of evidence, not evidence. A decrease/mismatch the
+    verified seals do not fully account for keeps failing closed, since
+    that residual could still be genuine tampering on top of a legitimate
+    purge.
+12. **Sealed-purge evidence** (`sealed-purges.ndjson.gz`, wholly optional
+    and never gated on `manifest.version`) — one entry per
+    `AuditRetentionSeal` row whose purged period overlaps the bundle. Each
+    entry carries its OWN signature, independent of the manifest and of
+    every other entry, over `canonicalJson({organizationId, periodStart,
+    periodEnd, rowCount, rootHash, rekorReceipt})` — the seal's existing
+    envelope from `AuditRetentionSealService.purgeWithSeal`, re-emitted
+    onto the bundle wire unchanged. This entry is deliberately **NOT**
+    part of the signed manifest preimage (see the "Why this entry is
+    unsigned" note below) — its own per-entry signature is what makes it
+    trustworthy on its own, without needing a manifest-level count. An
+    entry with a `null` signature (legacy backfilled rows), a
+    `signingKeyVersion` absent from `public-keys.json`, a `REVOKED` key, or
+    a signature that fails to verify is excluded from every downstream use
+    (invariants 10 and 11) — it can never cause a NEW failure, only fail to
+    help explain an existing one. A validly-signed entry that simply names
+    a different period/root than the finding under evaluation is likewise
+    not used — a near-miss is not evidence.
+
+    **Why this entry is unsigned at the manifest level:** the shipped
+    verifier's signable set (`verifyManifest`'s `signable` object) is a
+    closed field-by-field whitelist keyed by `manifest.version` — an extra
+    unknown key on `manifest.json` is silently excluded from the
+    reconstructed preimage, so `be` could add an unsigned count today
+    without breaking this verifier's signature check, but a genuine
+    anti-suppression count (mirroring `rowCount`/`integrityCheckpointCount`)
+    would need a coordinated `manifest.version` bump the same way v3→v4 was
+    — a decision deliberately deferred, not made silently. Until then, each
+    entry's OWN signature is the tamper-evidence: a holder of raw DB write
+    access but not the tenant signing key cannot fabricate an entry that
+    survives the authenticity gate above, so an attacker who deletes rows
+    AND scrubs the matching seal entry from the wire only returns the
+    affected finding to the pre-existing, conservative fail-closed state —
+    never a forgery of a purge that did not happen. **This is why omission
+    of this optional, unsigned file can never itself be a false `ok:
+    true`** — the worst a missing/tampered/non-matching sealed-purge entry
+    can do is leave `rootCoverage`/`integrityCheckpoints` failing closed
+    exactly as they did before this entry existed.
 
 S3 anchor receipts cannot be proven offline from their locator string alone.
 The library therefore fails closed for S3 by default; callers can provide an
@@ -209,7 +264,10 @@ fields in the same change.
   range, the number of rows and proofs present matches what that root's own
   signature committed to at anchor time (invariant 10) — this is what lets
   the verifier catch a deleted trailing suffix, not just a truncated
-  archive.
+  archive. A shrinkage explained by a VERIFIED `sealed-purges.ndjson.gz`
+  entry naming the exact same period+root (invariant 12) is reported as a
+  distinct, named `seal_exempted` pass instead — an UNEXPLAINED shrinkage
+  (no matching verified seal) still fails closed exactly as before.
 - If Rekor/S3 anchoring is present and not skipped via `--no-rekor`, that
   the anchor receipt is a genuine, cryptographically valid transparency-log
   entry bound to the exact root hash in the bundle.
@@ -222,6 +280,9 @@ fields in the same change.
   tail, or a boundary period, to at most one checkpoint interval, in the
   common case where the bundle's own rows span up to (or past) the
   checkpoint's `asOf` (see invariant 11's boundary exemption and residual).
+  An unexplained decrease/mismatch across a checkpoint window still fails
+  closed; one fully accounted for by VERIFIED sealed-purge evidence in
+  that exact window is reported as a distinct, named `seal_exempted` pass.
 
 **Does NOT prove**, even on `ok: true`:
 
@@ -245,11 +306,17 @@ fields in the same change.
   case and is deliberately NOT asserted, so a bundle whose ENTIRE checked
   range sits before its org's actual current head (a narrow historical
   export of a still-active org) gets no independent size commitment from
-  checkpoints either, same as before; (c) the checkpoint checks can
-  legitimately fail closed (report `ok: false`, not a silent pass) across
-  a genuine, signed `AuditRetentionSeal` hard-purge — that residual is
-  documented on the `integrityCheckpoints` component, not silently
-  absorbed.
+  checkpoints either, same as before; (c) a genuine, signed
+  `AuditRetentionSeal` hard-purge is now reconciled — and downgraded to a
+  named `seal_exempted` pass — ONLY when `sealed-purges.ndjson.gz` carries
+  a VERIFIED entry whose `deletedAt` falls in the affected checkpoint
+  window and whose summed `rowCount` accounts for the observed decrease
+  (invariant 12). A purge with no corresponding sealed-purge entry in the
+  bundle (e.g. an export produced by a `be` version that predates this
+  wiring, or one where the entry was legitimately omitted/empty) still
+  fails closed exactly as before — this closes the false-positive ONLY
+  when the producer actually ships the matching evidence, it does not
+  weaken the check for bundles that don't.
 - **That Rekor/S3 anchoring exists at all**, unless you read the `rekor`
   component specifically. A bundle can report overall `ok: true` while
   `rekor.reason` says `no_external_witness` (this deployment has anchoring
@@ -297,6 +364,43 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.7.0 (FIX01 audit-verifier2 — sealed-purge cross-check, `BE-0003`)
+
+- **New, wholly optional bundle entry `sealed-purges.ndjson.gz`** (see
+  invariant 12) — one independently-signed `AuditRetentionSeal` entry per
+  legitimate retention purge overlapping the bundle. Deliberately **NOT**
+  part of the signed manifest preimage (no `manifest.version` bump, no new
+  signed count) — each entry's own signature is the sole tamper-evidence,
+  by design (see the README's "Why this entry is unsigned" note).
+- **`rootCoverage` no longer reports tampering on a legitimately sealed
+  retention purge** (`BE-0003`, closed): a root-period shrinkage is
+  downgraded to a named `seal_exempted` pass when a VERIFIED sealed-purge
+  entry names the exact same `(periodStart, periodEnd, rootHash)`. An
+  unexplained shrinkage — or one where the actual count EXCEEDS the
+  committed count, which no purge can explain — still fails closed exactly
+  as before.
+- **`integrityCheckpoints`'s documented residual (a legitimate purge
+  reading as tampering) is now closed the same way**: a
+  `cumulative_row_count_decreased` or `chain_head_hash_mismatch` finding
+  between two checkpoints is downgraded when VERIFIED sealed-purge entries
+  whose `deletedAt` falls in that exact checkpoint window sum to at least
+  the observed decrease. An empty seal window is NEVER treated as
+  reconciling, even when the raw arithmetic would otherwise be trivially
+  satisfied (e.g. a hash mismatch with no count change) — an exemption
+  always names at least one real, verified seal.
+- **Both downgrades are strictly a narrowing of the failure surface,
+  never a widening** — a bundle with no sealed-purge evidence at all (or
+  only unverifiable/non-matching entries) verifies byte-for-byte as
+  before this release; confirmed by the full pre-existing 95-test suite
+  passing unmodified alongside the new tests.
+- New `ComponentResult.sealExemptions` field (additive) on `rootCoverage`
+  and `integrityCheckpoints`, and new `VerifyReport.bundle.sealedPurgesSeen`
+  / `sealedPurgesVerified` counters (additive). New CLI output lines.
+- `rowCount` on `BundleSealedPurge` is bigint-as-string and is NEVER
+  re-parsed as a `Number` anywhere in this verifier (the same discipline
+  already applied to `cumulativeRowCount`/`chainSeqCeiling`) — only
+  `BigInt(...)` comparisons and digit-string regex validation.
 
 ### 0.6.0 (FIX01 F5(b))
 

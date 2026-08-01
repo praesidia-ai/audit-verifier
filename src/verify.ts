@@ -261,6 +261,52 @@ interface BundleRoot {
   signatureAlgorithm?: BundleSignatureAlgorithm;
 }
 
+/**
+ * FIX01 (audit-verifier2) / `FIX01-FIXED-be4.md`'s "FOR AUDIT-VERIFIER" spec
+ * — one row per `AuditRetentionSeal` whose `[periodStart, periodEnd)`
+ * overlaps the bundle's `[from, to)` OR whose `deletedAt` falls inside it.
+ *
+ * NOT part of the signed manifest preimage (no `sealedPurgeCount` field
+ * exists, deliberately — see the "Why this entry is unsigned" reasoning in
+ * the spec, reproduced on `verifySealedPurgeAuthenticity` below). Evidence
+ * from this file is used ONLY to downgrade an otherwise-failing
+ * `rootCoverage` / `integrityCheckpoints` finding to an explained pass —
+ * it can never cause a new failure, and an attacker without the tenant
+ * signing key cannot fabricate an entry that survives the authenticity
+ * gate, so treating this file as wholly optional/unversioned (present or
+ * absent, parsed either way, never gated on `manifest.version`) cannot
+ * weaken any existing check.
+ */
+interface BundleSealedPurge {
+  id: string;
+  organizationId: string;
+  /** Inclusive start of the purged period. ISO 8601. */
+  periodStart: string;
+  /** Exclusive end of the purged period. ISO 8601. */
+  periodEnd: string;
+  /** Bigint-as-string — NEVER re-parse as a number. Rows the seal replaces. */
+  rowCount: string;
+  /** Base64 sha256 — the AuditMerkleRoot.rootHash that covered this period before the purge. */
+  rootHash: string;
+  rekorReceipt: Record<string, unknown> | null;
+  /**
+   * Base64 signature over canonicalJson({organizationId, periodStart,
+   * periodEnd, rowCount, rootHash, rekorReceipt}) — the seal's OWN
+   * envelope. `null` only for legacy backfilled rows that predate the
+   * signed-seal path — treated as UNVERIFIABLE, never as evidence of
+   * legitimacy (see `verifySealedPurgeAuthenticity`).
+   */
+  signature: string | null;
+  signingKeyVersion: number | null;
+  signatureAlgorithm: BundleSignatureAlgorithm | null;
+  /** Wall-clock instant the purge committed. ISO 8601. */
+  deletedAt: string;
+  /** users.id of the operator who executed the purge. */
+  deletedBy: string;
+  /** approval_requests.id of the consumed two-person-approval. */
+  approvalId: string;
+}
+
 interface BundleProofEntry {
   rowId: string;
   status?: string;
@@ -284,6 +330,18 @@ export interface ComponentResult {
   firstFailure?: string;
   /** Human-readable reason, when applicable. */
   reason?: string;
+  /**
+   * FIX01 (audit-verifier2) — `BE-0003` / integrity-checkpoint sealed-purge
+   * cross-check. Present only on `rootCoverage` / `integrityCheckpoints`
+   * when a finding that would otherwise have failed closed was downgraded
+   * to a pass because a VERIFIED (independently signature-checked)
+   * `AuditRetentionSeal` bundle entry exactly reconciles it. Each entry
+   * names the seal(s) responsible so an auditor can distinguish "explained
+   * by a legitimate purge" from either "clean" (component ok, no entries)
+   * or "tampering" (component not ok). Never present when the component
+   * would have passed anyway — this is a downgrade record, not a summary.
+   */
+  sealExemptions?: string[];
 }
 
 export interface VerifyReport {
@@ -350,6 +408,21 @@ export interface VerifyReport {
    * `[from, to)` range (boundary periods that only partially overlap the
    * range are exempted — a genuine ranged export legitimately ships fewer
    * rows for those, since rows outside `[from, to)` are never exported).
+   *
+   * FIX01 (audit-verifier2) / `BE-0003` — a shrinkage this component would
+   * otherwise report as a hard failure is downgraded to a pass (recorded
+   * in `sealExemptions`, not silently absorbed) when a VERIFIED entry in
+   * `sealed-purges.ndjson.gz` names the exact same `(periodStart,
+   * periodEnd, rootHash)` as the affected root — i.e. the tenant's own
+   * signature attests that period was legitimately, two-person-approval
+   * -gated purged via `AuditRetentionSealService.purgeWithSeal`, not
+   * silently truncated. A shrinkage with no matching VERIFIED seal keeps
+   * failing exactly as before this change: this is strictly a narrowing of
+   * the failure surface, never a widening (see
+   * `verifySealedPurgeAuthenticity`'s doc comment for why an unverified —
+   * missing signature, unknown key, or REVOKED key — seal entry can never
+   * be used for this, and why that is sufficient even though the entry
+   * itself sits outside the signed manifest preimage).
    */
   rootCoverage: ComponentResult;
   /**
@@ -379,17 +452,23 @@ export interface VerifyReport {
    *      instant) is a legitimate, NOT-asserted case — see the component's
    *      own doc comment on `verifyIntegrityCheckpoints`.
    *
-   * KNOWN RESIDUAL, not closed by this component (see README "does NOT
-   * prove"): `AuditRetentionSealService.purgeWithSeal` is a real,
-   * already-shipped mechanism that legitimately hard-deletes signed
-   * `audit_logs` rows (GDPR-driven retention, feature-flagged, two-person
-   * approval-gated, off by default). A bundle spanning such a purge WILL
-   * legitimately show a `cumulativeRowCount` decrease and/or an
-   * unreachable earlier `chainHeadHash` between two checkpoints straddling
-   * the purge, and this component fails closed on that today (no seal
-   * evidence is in the bundle to distinguish it from tampering) — see the
-   * reason string, which names this possibility explicitly so an auditor
-   * doesn't read it as certain tampering.
+   * PARTIALLY-CLOSED RESIDUAL (FIX01, audit-verifier2) —
+   * `AuditRetentionSealService.purgeWithSeal` is a real, already-shipped
+   * mechanism that legitimately hard-deletes signed `audit_logs` rows
+   * (GDPR-driven retention, feature-flagged, two-person approval-gated,
+   * off by default). A bundle spanning such a purge legitimately shows a
+   * `cumulativeRowCount` decrease and/or an unreachable earlier
+   * `chainHeadHash` between two checkpoints straddling the purge. When
+   * `sealed-purges.ndjson.gz` carries VERIFIED entries whose `deletedAt`
+   * falls in the affected checkpoint window and whose summed `rowCount`
+   * accounts for the observed decrease, this is now downgraded to a pass
+   * (recorded in `sealExemptions`, listing every contributing seal). A
+   * window with NO verified seal evidence at all, or whose seals do not
+   * account for the full decrease, still fails closed exactly as before —
+   * this is a narrowing of the failure surface, never a widening. See
+   * `verifySealedPurgeAuthenticity` / `reconcilePurgeWindow` for the exact
+   * reconciliation rule, including why an empty seal window is NEVER
+   * treated as reconciling (an arithmetic coincidence is not evidence).
    */
   integrityCheckpoints: ComponentResult;
   bundle: {
@@ -401,6 +480,18 @@ export interface VerifyReport {
     rowsSeen: number;
     rootsSeen: number;
     proofsSeen: number;
+    /**
+     * FIX01 (audit-verifier2) — count of lines in `sealed-purges.ndjson.gz`
+     * (0 if the entry is absent — it is wholly optional, never required).
+     */
+    sealedPurgesSeen: number;
+    /**
+     * Subset of `sealedPurgesSeen` whose own signature verified against a
+     * non-REVOKED key in `public-keys.json` — see
+     * `verifySealedPurgeAuthenticity`. Only this subset can ever downgrade
+     * a `rootCoverage` / `integrityCheckpoints` finding.
+     */
+    sealedPurgesVerified: number;
   };
 }
 
@@ -614,11 +705,29 @@ export async function verifyBundle(
         )
       : [];
   assertIntegrityCheckpointsStructure(checkpoints, manifest.orgId);
+
+  // 6c) FIX01 (audit-verifier2) — parse + authenticity-check sealed-purge
+  // evidence. Wholly OPTIONAL and UNVERSIONED (never gated on
+  // `manifest.version`, unlike integrity checkpoints): the entry is not
+  // part of the signed manifest preimage (see `BundleSealedPurge`'s doc
+  // comment), so its absence is never a bundle-format error and its
+  // presence never changes what a genuine bundle is required to contain.
+  // `verifiedSeals` is the authenticity-gated subset actually usable for
+  // the downstream cross-checks (2 and 3 in the spec's numbered
+  // algorithm) — see `verifySealedPurgeAuthenticity`.
+  const sealedPurgesEntry = byName.get('sealed-purges.ndjson.gz') ?? null;
+  const sealedPurges: BundleSealedPurge[] = sealedPurgesEntry
+    ? parseNdjson<BundleSealedPurge>(gunzip(sealedPurgesEntry.data))
+    : [];
+  assertSealedPurgesStructure(sealedPurges, manifest.orgId);
+  const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys);
+
   const integrityCheckpointsResult = verifyIntegrityCheckpoints(
     manifest,
     rows,
     checkpoints,
     publicKeys,
+    verifiedSeals,
   );
 
   // 7) Optional Rekor fetch.
@@ -653,7 +762,13 @@ export async function verifyBundle(
   // SIGNED rowCount to the bundle's own row/proof counts for that period,
   // closing the trailing-suffix-deletion gap `completeness` cannot see
   // (see the `rootCoverage` field doc comment above).
-  const rootCoverageResult = verifyRootCoverage(manifest, rows, roots, proofs);
+  const rootCoverageResult = verifyRootCoverage(
+    manifest,
+    rows,
+    roots,
+    proofs,
+    verifiedSeals,
+  );
 
   const ok =
     manifestResult.ok &&
@@ -690,6 +805,8 @@ export async function verifyBundle(
       rowsSeen: rows.length,
       rootsSeen: roots.length,
       proofsSeen: proofs.length,
+      sealedPurgesSeen: sealedPurges.length,
+      sealedPurgesVerified: verifiedSeals.length,
     },
   };
 }
@@ -1122,6 +1239,7 @@ function verifyRootCoverage(
   rows: BundleRow[],
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
+  verifiedSeals: BundleSealedPurge[],
 ): ComponentResult {
   const fromMs = Date.parse(manifest.from);
   const toMs = Date.parse(manifest.to);
@@ -1149,6 +1267,7 @@ function verifyRootCoverage(
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
+  const sealExemptions: string[] = [];
 
   for (const root of roots) {
     const periodStartMs = Date.parse(root.periodStart);
@@ -1164,19 +1283,45 @@ function verifyRootCoverage(
     const rowsInPeriod =
       lowerBound(rowTimes, periodEndMs) - lowerBound(rowTimes, periodStartMs);
     if (rowsInPeriod !== root.rowCount) {
+      // FIX01 (audit-verifier2) / `BE-0003` — only a SHRINKAGE
+      // (rowsInPeriod < root.rowCount) is a candidate for the sealed-purge
+      // exemption. A period that has MORE rows than its own signed root
+      // committed to is a different, unexplained anomaly a purge record
+      // can never account for, so that direction keeps failing
+      // unconditionally regardless of any matching seal.
+      const seal =
+        rowsInPeriod < root.rowCount
+          ? findMatchingSeal(verifiedSeals, root)
+          : null;
+      if (seal) {
+        sealExemptions.push(
+          `seal_exempted: root ${root.id} for period ${root.periodStart}..${root.periodEnd} legitimately purged per AuditRetentionSeal ${seal.id} (approval ${seal.approvalId})`,
+        );
+        continue;
+      }
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
-        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${rowsInPeriod} rows with signedAt inside its period — a fully-anchored period must not lose rows`;
+        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${rowsInPeriod} rows with signedAt inside its period — a fully-anchored period must not lose rows (unless explained by a verified AuditRetentionSeal covering this exact period+root — none found)`;
       }
       continue;
     }
     const proofsForRoot = proofCountByRootHash.get(root.rootHash) ?? 0;
     if (proofsForRoot !== root.rowCount) {
+      const seal =
+        proofsForRoot < root.rowCount
+          ? findMatchingSeal(verifiedSeals, root)
+          : null;
+      if (seal) {
+        sealExemptions.push(
+          `seal_exempted: root ${root.id} for period ${root.periodStart}..${root.periodEnd} legitimately purged per AuditRetentionSeal ${seal.id} (approval ${seal.approvalId})`,
+        );
+        continue;
+      }
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
-        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${proofsForRoot} proof entries referencing it`;
+        reason = `root ${root.id} commits to rowCount ${root.rowCount} but the bundle contains ${proofsForRoot} proof entries referencing it (unless explained by a verified AuditRetentionSeal covering this exact period+root — none found)`;
       }
     }
   }
@@ -1187,7 +1332,30 @@ function verifyRootCoverage(
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(sealExemptions.length > 0 ? { sealExemptions } : {}),
   };
+}
+
+/**
+ * FIX01 (audit-verifier2) / `BE-0003` — find a VERIFIED sealed-purge entry
+ * that names the exact same period+root as the root under evaluation. Exact
+ * string equality on `periodStart`/`periodEnd`/`rootHash`, per the spec —
+ * these are the same ISO/base64 values both sides derive from the same
+ * underlying `AuditMerkleRoot` row, so no fuzzy/tolerant matching is used
+ * (a near-miss is NOT evidence; it is itself suspicious).
+ */
+function findMatchingSeal(
+  verifiedSeals: BundleSealedPurge[],
+  root: BundleRoot,
+): BundleSealedPurge | null {
+  return (
+    verifiedSeals.find(
+      (seal) =>
+        seal.periodStart === root.periodStart &&
+        seal.periodEnd === root.periodEnd &&
+        seal.rootHash === root.rootHash,
+    ) ?? null
+  );
 }
 
 /**
@@ -1204,6 +1372,7 @@ function verifyIntegrityCheckpoints(
   rows: BundleRow[],
   checkpoints: BundleIntegrityCheckpoint[],
   publicKeys: Map<number, PublicKeyRecord>,
+  verifiedSeals: BundleSealedPurge[],
 ): ComponentResult {
   if (manifest.version < 4) {
     return { ok: true, checked: 0, failed: 0 };
@@ -1213,6 +1382,7 @@ function verifyIntegrityCheckpoints(
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
+  const sealExemptions: string[] = [];
   const fail = (id: string, msg: string): void => {
     failed += 1;
     if (firstFailure === undefined) {
@@ -1255,31 +1425,56 @@ function verifyIntegrityCheckpoints(
   // order. Compared as BigInt (the wire value is bigint-as-string) to
   // avoid Number precision loss on a very chatty tenant.
   //
-  // KNOWN RESIDUAL — see the field doc comment on `VerifyReport
-  // .integrityCheckpoints`: `AuditRetentionSealService.purgeWithSeal` can
-  // legitimately DECREASE this value. No seal evidence is in the bundle
-  // today to distinguish that from tampering, so this still fails closed,
-  // but the reason string names the possibility explicitly.
+  // FIX01 (audit-verifier2) — `AuditRetentionSealService.purgeWithSeal` can
+  // legitimately DECREASE this value. `reconcilePurgeWindow` downgrades
+  // this to a pass ONLY when a VERIFIED seal (or seals) whose `deletedAt`
+  // falls in `(prev.asOf, cur.asOf]` sums to at least the observed
+  // decrease — see that function's doc comment for why an empty seal
+  // window is never treated as reconciling even when the arithmetic is
+  // trivially satisfied.
   const byAsOf = [...checkpoints].sort(
     (a, b) => Date.parse(a.asOf) - Date.parse(b.asOf),
   );
+  // Precomputed once, shared with the chainHeadHash loop (3) below so both
+  // checks reconcile against the exact same prev/cur pair and BigInt
+  // parse — `null` marks a checkpoint whose cumulativeRowCount failed to
+  // parse (already reported as its own failure here; the hash-mismatch
+  // loop below silently skips reconciliation for such a pair rather than
+  // double-reporting the format error).
+  const countsByAsOf: Array<bigint | null> = byAsOf.map((cp) => {
+    try {
+      return BigInt(cp.cumulativeRowCount);
+    } catch {
+      return null;
+    }
+  });
   for (let i = 1; i < byAsOf.length; i++) {
     checked += 1;
     const prev = byAsOf[i - 1]!;
     const cur = byAsOf[i]!;
-    let prevCount: bigint;
-    let curCount: bigint;
-    try {
-      prevCount = BigInt(prev.cumulativeRowCount);
-      curCount = BigInt(cur.cumulativeRowCount);
-    } catch {
+    const prevCount = countsByAsOf[i - 1];
+    const curCount = countsByAsOf[i];
+    if (prevCount === null || curCount === null) {
       fail(cur.id, 'checkpoint cumulativeRowCount is not a valid integer string');
       continue;
     }
     if (curCount < prevCount) {
+      const decrease = prevCount - curCount;
+      const { exempted, seals } = reconcilePurgeWindow(
+        prev.asOf,
+        cur.asOf,
+        decrease,
+        verifiedSeals,
+      );
+      if (exempted) {
+        sealExemptions.push(
+          `seal_exempted: cumulativeRowCount decrease of ${decrease} between checkpoints ${prev.asOf}..${cur.asOf} reconciled by AuditRetentionSeal(s) ${seals.map((s) => `${s.id} (approval ${s.approvalId})`).join(', ')}`,
+        );
+        continue;
+      }
       fail(
         cur.id,
-        `cumulative_row_count_decreased: checkpoint at ${cur.asOf} claims cumulativeRowCount ${curCount} but an earlier checkpoint at ${prev.asOf} claimed ${prevCount} — a decrease means rows were deleted between these two signed snapshots UNLESS this org executed a signed AuditRetentionSeal purge in that window (not cross-checked by this verifier version; confirm against the org's AuditRetentionSeal records before treating this as tampering)`,
+        `cumulative_row_count_decreased: checkpoint at ${cur.asOf} claims cumulativeRowCount ${curCount} but an earlier checkpoint at ${prev.asOf} claimed ${prevCount} — a decrease means rows were deleted between these two signed snapshots and no verified AuditRetentionSeal in sealed-purges.ndjson.gz accounts for it (confirm against the org's AuditRetentionSeal records before treating this as tampering)`,
       );
     }
   }
@@ -1310,9 +1505,43 @@ function verifyIntegrityCheckpoints(
     checked += 1;
     const computedLink = computeChainLink(tip);
     if (computedLink !== cp.chainHeadHash) {
+      // FIX01 (audit-verifier2) — reconcile against the SAME prev/cur pair
+      // and decrease amount as check (2) above, per the spec ("For a
+      // cumulative_row_count_decreased OR chain_head_hash_mismatch finding
+      // ... collect every verifiedSeals entry ..."). Only applies when `cp`
+      // has a predecessor in asOf order; the very first checkpoint has
+      // nothing to reconcile against and keeps failing as before (no
+      // regression — this matches the pre-existing, unaffected behavior).
+      const idx = byAsOf.findIndex((c) => c.id === cp.id);
+      let exempted = false;
+      let sealNames: string[] = [];
+      if (idx > 0) {
+        const prev = byAsOf[idx - 1]!;
+        const prevCount = countsByAsOf[idx - 1];
+        const curCount = countsByAsOf[idx];
+        if (prevCount !== null && curCount !== null) {
+          const decrease = prevCount - curCount;
+          const reconciled = reconcilePurgeWindow(
+            prev.asOf,
+            cp.asOf,
+            decrease,
+            verifiedSeals,
+          );
+          exempted = reconciled.exempted;
+          sealNames = reconciled.seals.map(
+            (s) => `${s.id} (approval ${s.approvalId})`,
+          );
+        }
+      }
+      if (exempted) {
+        sealExemptions.push(
+          `seal_exempted: chainHeadHash mismatch at checkpoint ${cp.id} (asOf ${cp.asOf}) reconciled by AuditRetentionSeal(s) ${sealNames.join(', ')}`,
+        );
+        continue;
+      }
       fail(
         cp.id,
-        `chain_head_hash_mismatch: checkpoint at ${cp.asOf} claims chainHeadHash ${cp.chainHeadHash} but the bundle's own rows (as of that instant) chain to ${String(computedLink)} — this means rows were altered or deleted after the checkpoint was signed UNLESS explained by a signed AuditRetentionSeal purge in that window (not cross-checked by this verifier version)`,
+        `chain_head_hash_mismatch: checkpoint at ${cp.asOf} claims chainHeadHash ${cp.chainHeadHash} but the bundle's own rows (as of that instant) chain to ${String(computedLink)} — this means rows were altered or deleted after the checkpoint was signed and no verified AuditRetentionSeal in sealed-purges.ndjson.gz accounts for it`,
       );
     }
   }
@@ -1323,7 +1552,51 @@ function verifyIntegrityCheckpoints(
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(sealExemptions.length > 0 ? { sealExemptions } : {}),
   };
+}
+
+/**
+ * FIX01 (audit-verifier2) / `BE-0003` — the reconciliation rule from the
+ * spec's algorithm step 3: collect every VERIFIED sealed-purge entry whose
+ * `deletedAt` falls in `(prevAsOf, curAsOf]` and check whether their summed
+ * `rowCount` accounts for the observed `decrease` between two checkpoints.
+ *
+ * Deliberately requires the collected seal window to be NON-EMPTY before
+ * exempting anything, even though the literal arithmetic
+ * (`decrease <= sum`) is also trivially satisfied by an EMPTY window
+ * whenever `decrease <= 0` (i.e. the count did not actually decrease, but
+ * a `chain_head_hash_mismatch` fired anyway from an unrelated content
+ * alteration that left the count unchanged). Without this guard, a bundle
+ * with NO sealed-purge evidence at all would still have every
+ * non-count-related tampering signal on this check silently downgraded to
+ * a pass by an arithmetic coincidence — that is not evidence of a
+ * legitimate purge, it is the ABSENCE of evidence, and rule 4 of the spec
+ * ("downgrade-only... must never turn an existing pass into a fail") is not
+ * license to turn a real fail into an unevidenced pass either. Requiring at
+ * least one verified seal in the window makes every exemption traceable to
+ * a real, named, independently-signed `AuditRetentionSeal` record.
+ */
+function reconcilePurgeWindow(
+  prevAsOf: string,
+  curAsOf: string,
+  decrease: bigint,
+  verifiedSeals: BundleSealedPurge[],
+): { exempted: boolean; seals: BundleSealedPurge[] } {
+  const prevMs = Date.parse(prevAsOf);
+  const curMs = Date.parse(curAsOf);
+  const windowSeals = verifiedSeals.filter((seal) => {
+    const t = Date.parse(seal.deletedAt);
+    return !Number.isNaN(t) && t > prevMs && t <= curMs;
+  });
+  if (windowSeals.length === 0) {
+    return { exempted: false, seals: [] };
+  }
+  const sumRowCount = windowSeals.reduce(
+    (acc, seal) => acc + BigInt(seal.rowCount),
+    0n,
+  );
+  return { exempted: decrease <= sumRowCount, seals: windowSeals };
 }
 
 /**
@@ -2432,6 +2705,121 @@ function assertIntegrityCheckpointsStructure(
     }
     ids.add(cp.id);
   }
+}
+
+/**
+ * FIX01 (audit-verifier2) — format-sanity check for
+ * `sealed-purges.ndjson.gz`. This file is NEVER part of the signed
+ * manifest preimage (see `BundleSealedPurge`'s doc comment), so unlike
+ * `assertIntegrityCheckpointsStructure` there is no version-gated
+ * presence rule to enforce here — only that whatever IS present is
+ * well-formed enough to parse safely. `rowCount` is validated as a
+ * digit-string and never converted with `Number(...)` anywhere in this
+ * file — see `verifySealedPurgeAuthenticity` / `reconcilePurgeWindow`.
+ */
+function assertSealedPurgesStructure(
+  purges: BundleSealedPurge[],
+  orgId: string,
+): void {
+  const ids = new Set<string>();
+  for (const p of purges) {
+    const authFieldsAllNull =
+      p?.signature === null &&
+      p?.signingKeyVersion === null &&
+      p?.signatureAlgorithm === null;
+    const authFieldsAllPresent =
+      typeof p?.signature === 'string' &&
+      Number.isSafeInteger(p?.signingKeyVersion) &&
+      (p.signatureAlgorithm === 'Ed25519' ||
+        p.signatureAlgorithm === 'ECDSA_P256_SHA256');
+    if (
+      !p ||
+      typeof p !== 'object' ||
+      typeof p.id !== 'string' ||
+      p.id.length === 0 ||
+      ids.has(p.id) ||
+      p.organizationId !== orgId ||
+      !isIsoDate(p.periodStart) ||
+      !isIsoDate(p.periodEnd) ||
+      Date.parse(p.periodStart) >= Date.parse(p.periodEnd) ||
+      typeof p.rowCount !== 'string' ||
+      !/^\d+$/.test(p.rowCount) ||
+      typeof p.rootHash !== 'string' ||
+      p.rootHash.length === 0 ||
+      (p.rekorReceipt !== null &&
+        (typeof p.rekorReceipt !== 'object' || Array.isArray(p.rekorReceipt))) ||
+      !(authFieldsAllNull || authFieldsAllPresent) ||
+      (p.signingKeyVersion !== null && p.signingKeyVersion < 1) ||
+      !isIsoDate(p.deletedAt) ||
+      typeof p.deletedBy !== 'string' ||
+      p.deletedBy.length === 0 ||
+      typeof p.approvalId !== 'string' ||
+      p.approvalId.length === 0
+    ) {
+      throw new Error(
+        `sealed-purges.ndjson.gz has an invalid/duplicate entry: ${String(p?.id)}`,
+      );
+    }
+    ids.add(p.id);
+  }
+}
+
+/**
+ * FIX01 (audit-verifier2) / `FIX01-FIXED-be4.md`'s "FOR AUDIT-VERIFIER"
+ * spec, step 1 ("Authenticity gate"). `sealed-purges.ndjson.gz` is NOT
+ * part of the signed manifest preimage (see `BundleSealedPurge`'s doc
+ * comment for why that is deliberate and safe), so each entry's OWN
+ * signature — over `canonicalJson({organizationId, periodStart, periodEnd,
+ * rowCount, rootHash, rekorReceipt})`, the seal's existing envelope from
+ * `AuditRetentionSealService.purgeWithSeal` — is the ONLY thing standing
+ * between "the tenant's signing key attested to this purge" and "an
+ * attacker with raw DB write access typed some JSON into a purge-shaped
+ * row." A holder of DB write access but not the signing key cannot
+ * produce an entry that survives this gate, so omission-by-suppression
+ * (an attacker who deletes rows AND scrubs the matching seal entry from
+ * the wire) only returns the affected root/checkpoint to today's
+ * conservative fail-closed state — never a forgery of a purge that did not
+ * happen.
+ *
+ * Rejects (excludes from the returned set, WITHOUT affecting `ok` — see
+ * this file's callers) an entry whose `signature`/`signingKeyVersion`/
+ * `signatureAlgorithm` is `null` (legacy backfilled row — explicitly
+ * unverifiable per the wire contract, never treated as evidence), whose
+ * `signingKeyVersion` is not present in `public-keys.json`, or whose key
+ * is `REVOKED` — the same three rejection conditions `verifyRowSignatures`
+ * / `verifyRootSignatures` / the checkpoint authenticity check already
+ * apply, reused here for consistency.
+ */
+function verifySealedPurgeAuthenticity(
+  purges: BundleSealedPurge[],
+  publicKeys: Map<number, PublicKeyRecord>,
+): BundleSealedPurge[] {
+  const verified: BundleSealedPurge[] = [];
+  for (const p of purges) {
+    if (
+      p.signature === null ||
+      p.signingKeyVersion === null ||
+      p.signatureAlgorithm === null
+    ) {
+      continue;
+    }
+    const entry = publicKeys.get(p.signingKeyVersion);
+    if (!entry || entry.status === 'REVOKED') {
+      continue;
+    }
+    const message = canonicalJson({
+      organizationId: p.organizationId,
+      periodStart: p.periodStart,
+      periodEnd: p.periodEnd,
+      rowCount: p.rowCount,
+      rootHash: p.rootHash,
+      rekorReceipt: p.rekorReceipt,
+    });
+    if (verifySignature(p.signatureAlgorithm, message, p.signature, entry.publicKey)) {
+      verified.push(p);
+    }
+  }
+  return verified;
 }
 
 function assertRowsStructure(rows: BundleRow[], orgId: string): void {

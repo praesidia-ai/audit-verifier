@@ -18,6 +18,11 @@
 import { describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   verifyBundle as verifyBundleStrict,
@@ -2537,6 +2542,367 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * FIX01 (audit-verifier2) / `BE-0003` — closes the `rootCoverage`
+   * false-positive on a bundle spanning a LEGITIMATE, signed, two-person
+   * -approval-gated `AuditRetentionSeal` retention purge. See
+   * `FIX01-FIXED-be4.md`'s "FOR AUDIT-VERIFIER" spec for the wire shape
+   * and algorithm this implements.
+   */
+  describe('FIX01 (audit-verifier2) / BE-0003 — sealed-purge exemption for rootCoverage', () => {
+    function reSignManifestV1(opts: {
+      orgId: string;
+      rowCount: number;
+      rootCount: number;
+      from: string;
+      to: string;
+      publicKeyB64: string;
+      keyVersion: number;
+      privateKey: Uint8Array;
+    }): Record<string, unknown> {
+      const manifestSans = {
+        version: 1,
+        orgId: opts.orgId,
+        from: opts.from,
+        to: opts.to,
+        rowCount: opts.rowCount,
+        rootCount: opts.rootCount,
+        keyVersions: [
+          { keyVersion: opts.keyVersion, publicKey: opts.publicKeyB64 },
+        ],
+        generatedAt: opts.to,
+        signatureAlgorithm: 'Ed25519' as const,
+      };
+      const signature = signEd25519(
+        canonicalJson(manifestSans),
+        opts.privateKey,
+      );
+      return {
+        ...manifestSans,
+        signature,
+        signatureKeyVersion: opts.keyVersion,
+      };
+    }
+
+    /**
+     * Mirrors `AuditRetentionSeal`'s wire shape (`BundleSealedPurge`).
+     * Signed preimage: `canonicalJson({organizationId, periodStart,
+     * periodEnd, rowCount, rootHash, rekorReceipt})` — the seal's OWN
+     * envelope, independent of the manifest signature.
+     */
+    function signSeal(opts: {
+      id: string;
+      orgId: string;
+      periodStart: string;
+      periodEnd: string;
+      rowCount: string;
+      rootHash: string;
+      deletedAt: string;
+      approvalId: string;
+      deletedBy: string;
+      keyVersion: number;
+      privateKey: Uint8Array;
+      tamperSignature?: boolean;
+    }): Record<string, unknown> {
+      const rekorReceipt = null;
+      const message = canonicalJson({
+        organizationId: opts.orgId,
+        periodStart: opts.periodStart,
+        periodEnd: opts.periodEnd,
+        rowCount: opts.rowCount,
+        rootHash: opts.rootHash,
+        rekorReceipt,
+      });
+      let signature = signEd25519(message, opts.privateKey);
+      if (opts.tamperSignature) {
+        const bytes = Buffer.from(signature, 'base64');
+        bytes[0] = (bytes[0]! + 1) % 256;
+        signature = bytes.toString('base64');
+      }
+      return {
+        id: opts.id,
+        organizationId: opts.orgId,
+        periodStart: opts.periodStart,
+        periodEnd: opts.periodEnd,
+        rowCount: opts.rowCount,
+        rootHash: opts.rootHash,
+        rekorReceipt,
+        signature,
+        signingKeyVersion: opts.keyVersion,
+        signatureAlgorithm: 'Ed25519',
+        deletedAt: opts.deletedAt,
+        deletedBy: opts.deletedBy,
+        approvalId: opts.approvalId,
+      };
+    }
+
+    function packBundleWithSeals(
+      manifestJson: Record<string, unknown>,
+      rows: FixtureRow[],
+      roots: FixtureRoot[],
+      proofs: FixtureProof[],
+      publicKeys: Record<string, unknown>,
+      seals: Array<Record<string, unknown>>,
+    ): Buffer {
+      const ndjson = (arr: unknown[]): Buffer =>
+        Buffer.from(
+          arr.map((x) => JSON.stringify(x)).join('\n') +
+            (arr.length > 0 ? '\n' : ''),
+          'utf8',
+        );
+      return writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifestJson, null, 2), 'utf8'),
+        },
+        { name: 'rows.ndjson.gz', data: gzipDeterministic(ndjson(rows)) },
+        { name: 'roots.ndjson.gz', data: gzipDeterministic(ndjson(roots)) },
+        { name: 'proofs.ndjson.gz', data: gzipDeterministic(ndjson(proofs)) },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+        {
+          name: 'sealed-purges.ndjson.gz',
+          data: gzipDeterministic(ndjson(seals)),
+        },
+      ]);
+    }
+
+    it("downgrades a rootCoverage suffix-deletion failure to a pass when a verified sealed purge exactly matches the root's period+rootHash", async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const root = base.roots[0]!;
+
+      const survivingRows = base.rows.slice(0, 3);
+      const survivingProofs = base.proofs.filter((p) => p.rowId !== 'row-3');
+      const manifestJson = reSignManifestV1({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1'] as string,
+        keyVersion: 1,
+        privateKey,
+      });
+      const seal = signSeal({
+        id: 'seal-1',
+        orgId: originalManifest.orgId,
+        periodStart: root.periodStart,
+        periodEnd: root.periodEnd,
+        rowCount: '1',
+        rootHash: root.rootHash,
+        deletedAt: '2026-05-01T01:15:00.000Z',
+        approvalId: 'approval-42',
+        deletedBy: 'user-1',
+        keyVersion: 1,
+        privateKey,
+      });
+      const zip = packBundleWithSeals(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeys,
+        [seal],
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      expect(report.rootCoverage.ok).toBe(true);
+      expect(report.rootCoverage.failed).toBe(0);
+      expect(report.rootCoverage.sealExemptions).toBeDefined();
+      expect(report.rootCoverage.sealExemptions![0]).toContain('seal-1');
+      expect(report.rootCoverage.sealExemptions![0]).toContain(
+        'approval-42',
+      );
+      expect(report.bundle.sealedPurgesSeen).toBe(1);
+      expect(report.bundle.sealedPurgesVerified).toBe(1);
+      expect(report.ok).toBe(true);
+    });
+
+    it('keeps failing closed when the sealed-purge signature is tampered — unverifiable evidence is never used', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const root = base.roots[0]!;
+
+      const survivingRows = base.rows.slice(0, 3);
+      const survivingProofs = base.proofs.filter((p) => p.rowId !== 'row-3');
+      const manifestJson = reSignManifestV1({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1'] as string,
+        keyVersion: 1,
+        privateKey,
+      });
+      const seal = signSeal({
+        id: 'seal-tampered',
+        orgId: originalManifest.orgId,
+        periodStart: root.periodStart,
+        periodEnd: root.periodEnd,
+        rowCount: '1',
+        rootHash: root.rootHash,
+        deletedAt: '2026-05-01T01:15:00.000Z',
+        approvalId: 'approval-42',
+        deletedBy: 'user-1',
+        keyVersion: 1,
+        privateKey,
+        tamperSignature: true,
+      });
+      const zip = packBundleWithSeals(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeys,
+        [seal],
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      expect(report.rootCoverage.ok).toBe(false);
+      expect(report.rootCoverage.reason).toContain('root-1');
+      expect(report.rootCoverage.sealExemptions).toBeUndefined();
+      expect(report.bundle.sealedPurgesSeen).toBe(1);
+      expect(report.bundle.sealedPurgesVerified).toBe(0);
+      expect(report.ok).toBe(false);
+    });
+
+    it('keeps failing closed when the sealed-purge names a different period (a validly-signed but non-matching seal is not evidence)', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const root = base.roots[0]!;
+
+      const survivingRows = base.rows.slice(0, 3);
+      const survivingProofs = base.proofs.filter((p) => p.rowId !== 'row-3');
+      const manifestJson = reSignManifestV1({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1'] as string,
+        keyVersion: 1,
+        privateKey,
+      });
+      const seal = signSeal({
+        id: 'seal-wrong-period',
+        orgId: originalManifest.orgId,
+        periodStart: '2020-01-01T00:00:00.000Z', // does not match root-1
+        periodEnd: '2020-01-02T00:00:00.000Z',
+        rowCount: '1',
+        rootHash: root.rootHash,
+        deletedAt: '2026-05-01T01:15:00.000Z',
+        approvalId: 'approval-42',
+        deletedBy: 'user-1',
+        keyVersion: 1,
+        privateKey,
+      });
+      const zip = packBundleWithSeals(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeys,
+        [seal],
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      expect(report.rootCoverage.ok).toBe(false);
+      expect(report.rootCoverage.reason).toContain('root-1');
+      expect(report.bundle.sealedPurgesVerified).toBe(1); // signature IS valid...
+      expect(report.rootCoverage.sealExemptions).toBeUndefined(); // ...just doesn't match
+      expect(report.ok).toBe(false);
+    });
+
+    it('keeps failing closed when the sealed-purge is signed under a REVOKED key', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const { privateKey: revokedPriv, publicKey: revokedPub } =
+        keypairFromSeed(Buffer.alloc(32, 9));
+      const revokedPubB64 = Buffer.from(revokedPub).toString('base64');
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const root = base.roots[0]!;
+
+      const survivingRows = base.rows.slice(0, 3);
+      const survivingProofs = base.proofs.filter((p) => p.rowId !== 'row-3');
+      const manifestJson = reSignManifestV1({
+        orgId: originalManifest.orgId,
+        rowCount: survivingRows.length,
+        rootCount: base.roots.length,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1'] as string,
+        keyVersion: 1,
+        privateKey,
+      });
+      const seal = signSeal({
+        id: 'seal-revoked',
+        orgId: originalManifest.orgId,
+        periodStart: root.periodStart,
+        periodEnd: root.periodEnd,
+        rowCount: '1',
+        rootHash: root.rootHash,
+        deletedAt: '2026-05-01T01:15:00.000Z',
+        approvalId: 'approval-42',
+        deletedBy: 'user-1',
+        keyVersion: 2,
+        privateKey: revokedPriv,
+      });
+      const publicKeysWithRevoked = {
+        ...publicKeys,
+        '2': {
+          publicKey: revokedPubB64,
+          status: 'REVOKED',
+          revokedAt: '2026-01-01T00:00:00.000Z',
+        },
+      };
+      const zip = packBundleWithSeals(
+        manifestJson,
+        survivingRows,
+        base.roots,
+        survivingProofs,
+        publicKeysWithRevoked,
+        [seal],
+      );
+      const report = await verifyBundle(zip, { noRekor: true });
+
+      expect(report.rootCoverage.ok).toBe(false);
+      expect(report.bundle.sealedPurgesVerified).toBe(0);
+      expect(report.ok).toBe(false);
+    });
+  });
+
+  /**
    * PROD16 F10 (be-compliance) — `verifyChain` must not depend on the
    * bundle's on-disk row order. `bundle-exporter.service.ts` orders rows
    * by `(signedAt, id)` while the chain is actually built in `chainSeq`
@@ -3039,13 +3405,97 @@ describe('verifyBundle', () => {
     }
 
     /**
+     * FIX01 (audit-verifier2) / `FIX01-FIXED-be4.md`'s "FOR AUDIT-VERIFIER"
+     * spec — mirrors `AuditRetentionSeal`'s wire shape byte-for-byte
+     * (`BundleSealedPurge`). Signed preimage:
+     * `canonicalJson({organizationId, periodStart, periodEnd, rowCount,
+     * rootHash, rekorReceipt})` — the seal's OWN envelope, independent of
+     * the manifest signature.
+     */
+    interface SealedPurgeDef {
+      id: string;
+      periodStart: string;
+      periodEnd: string;
+      /** Bigint-as-string, per the wire contract. */
+      rowCount: string;
+      rootHash: string;
+      rekorReceipt?: Record<string, unknown> | null;
+      deletedAt: string;
+      deletedBy?: string;
+      approvalId?: string;
+      keyVersion?: number;
+      privateKeyOverride?: Uint8Array;
+      tamperSignature?: boolean;
+      /** Model a legacy backfilled row with no signature at all. */
+      unsigned?: boolean;
+    }
+
+    function signSealedPurge(
+      def: SealedPurgeDef,
+      orgId: string,
+      privateKey: Uint8Array,
+    ): Record<string, unknown> {
+      const rekorReceipt = def.rekorReceipt ?? null;
+      if (def.unsigned) {
+        return {
+          id: def.id,
+          organizationId: orgId,
+          periodStart: def.periodStart,
+          periodEnd: def.periodEnd,
+          rowCount: def.rowCount,
+          rootHash: def.rootHash,
+          rekorReceipt,
+          signature: null,
+          signingKeyVersion: null,
+          signatureAlgorithm: null,
+          deletedAt: def.deletedAt,
+          deletedBy: def.deletedBy ?? 'user-op-1',
+          approvalId: def.approvalId ?? 'approval-1',
+        };
+      }
+      const message = canonicalJson({
+        organizationId: orgId,
+        periodStart: def.periodStart,
+        periodEnd: def.periodEnd,
+        rowCount: def.rowCount,
+        rootHash: def.rootHash,
+        rekorReceipt,
+      });
+      let signature = signEd25519(message, privateKey);
+      if (def.tamperSignature) {
+        const bytes = Buffer.from(signature, 'base64');
+        bytes[0] = (bytes[0]! + 1) % 256;
+        signature = bytes.toString('base64');
+      }
+      return {
+        id: def.id,
+        organizationId: orgId,
+        periodStart: def.periodStart,
+        periodEnd: def.periodEnd,
+        rowCount: def.rowCount,
+        rootHash: def.rootHash,
+        rekorReceipt,
+        signature,
+        signingKeyVersion: def.keyVersion ?? 1,
+        signatureAlgorithm: 'Ed25519',
+        deletedAt: def.deletedAt,
+        deletedBy: def.deletedBy ?? 'user-op-1',
+        approvalId: def.approvalId ?? 'approval-1',
+      };
+    }
+
+    /**
      * Builds a v4 bundle on top of the standard 4-row fixture
      * (`buildFixtureBundle`). `checkpointDefs` are signed with the
      * fixture's primary key (seed 7) unless a def carries its own
-     * `privateKeyOverride`/`keyVersion`.
+     * `privateKeyOverride`/`keyVersion`. `sealedPurgeDefs`, when provided
+     * (even as `[]`), adds a `sealed-purges.ndjson.gz` entry — omitted
+     * entirely means "no sealed-purge evidence in this bundle" (the
+     * entry is wholly optional/unversioned per the spec).
      */
     function buildV4Bundle(opts: {
       checkpointDefs: CheckpointDef[];
+      sealedPurgeDefs?: SealedPurgeDef[];
       integrityCheckpointCountOverride?: number;
       omitCheckpointsFile?: boolean;
       extraPublicKeys?: Record<string, unknown>;
@@ -3068,6 +3518,9 @@ describe('verifyBundle', () => {
           orgId,
           def.privateKeyOverride ?? privateKey,
         ),
+      );
+      const sealedPurges = (opts.sealedPurgeDefs ?? []).map((def) =>
+        signSealedPurge(def, orgId, def.privateKeyOverride ?? privateKey),
       );
 
       const version = opts.versionOverride ?? 4;
@@ -3135,6 +3588,17 @@ describe('verifyBundle', () => {
         zipEntries.push({
           name: 'integrity-checkpoints.ndjson.gz',
           data: gzipDeterministic(checkpointsNdjson),
+        });
+      }
+      if (opts.sealedPurgeDefs !== undefined) {
+        const sealedPurgesNdjson = Buffer.from(
+          sealedPurges.map((p) => JSON.stringify(p)).join('\n') +
+            (sealedPurges.length > 0 ? '\n' : ''),
+          'utf8',
+        );
+        zipEntries.push({
+          name: 'sealed-purges.ndjson.gz',
+          data: gzipDeterministic(sealedPurgesNdjson),
         });
       }
       return { zip: writeZip(zipEntries) };
@@ -3423,6 +3887,300 @@ describe('verifyBundle', () => {
       expect(report.integrityCheckpoints.ok).toBe(true);
       expect(report.integrityCheckpoints.checked).toBe(0);
       expect(report.ok).toBe(true);
+    });
+
+    describe('FIX01 (audit-verifier2) — sealed-purge reconciliation closes the contract residual', () => {
+      it('downgrades a cumulativeRowCount decrease to a pass when a verified sealed purge in the checkpoint window reconciles it', async () => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '5',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              chainHeadHash: tipChainHeadHash(base), // true tip — check 3 passes on its own
+              cumulativeRowCount: '3', // decrease of 2
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-cp-1',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '2', // exactly covers the decrease
+              rootHash: sha256(Buffer.from('irrelevant-root')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-05-01T00:30:00.000Z', // inside (cp-a.asOf, cp-b.asOf]
+              approvalId: 'approval-9',
+            },
+          ],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(true);
+        expect(report.integrityCheckpoints.failed).toBe(0);
+        expect(report.integrityCheckpoints.sealExemptions).toBeDefined();
+        expect(report.integrityCheckpoints.sealExemptions).toHaveLength(1);
+        expect(report.integrityCheckpoints.sealExemptions![0]).toContain(
+          'seal-cp-1',
+        );
+        expect(report.integrityCheckpoints.sealExemptions![0]).toContain(
+          'approval-9',
+        );
+        expect(report.bundle.sealedPurgesSeen).toBe(1);
+        expect(report.bundle.sealedPurgesVerified).toBe(1);
+        expect(report.ok).toBe(true);
+      });
+
+      it('keeps failing closed when the reconciling seal rowCount does not cover the full decrease', async () => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '5',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              chainHeadHash: tipChainHeadHash(base),
+              cumulativeRowCount: '3', // decrease of 2
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-cp-short',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '1', // short of the decrease (2) — must NOT exempt
+              rootHash: sha256(Buffer.from('irrelevant-root')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-05-01T00:30:00.000Z',
+              approvalId: 'approval-9',
+            },
+          ],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(
+          /cumulative_row_count_decreased/,
+        );
+        expect(report.integrityCheckpoints.sealExemptions).toBeUndefined();
+        expect(report.ok).toBe(false);
+      });
+
+      it('keeps failing closed when no sealed-purge entry falls inside the checkpoint window (evidence elsewhere does not count)', async () => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '5',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              chainHeadHash: tipChainHeadHash(base),
+              cumulativeRowCount: '3',
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-outside-window',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '2',
+              rootHash: sha256(Buffer.from('irrelevant-root')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-04-30T20:00:00.000Z', // BEFORE cp-a.asOf — outside (cp-a, cp-b]
+              approvalId: 'approval-9',
+            },
+          ],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(
+          /cumulative_row_count_decreased/,
+        );
+        expect(report.ok).toBe(false);
+      });
+
+      it('keeps failing closed when the sealed-purge signature is tampered — unverifiable evidence is never used for a downgrade', async () => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '5',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              chainHeadHash: tipChainHeadHash(base),
+              cumulativeRowCount: '3',
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-tampered',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '2',
+              rootHash: sha256(Buffer.from('irrelevant-root')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-05-01T00:30:00.000Z',
+              approvalId: 'approval-9',
+              tamperSignature: true,
+            },
+          ],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(
+          /cumulative_row_count_decreased/,
+        );
+        expect(report.bundle.sealedPurgesSeen).toBe(1);
+        expect(report.bundle.sealedPurgesVerified).toBe(0);
+        expect(report.ok).toBe(false);
+      });
+
+      it('downgrades a chain_head_hash_mismatch to a pass when the same seal window reconciles the cumulativeRowCount decrease (closes the contract residual explicitly)', async () => {
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '6',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              // Wrong: true tip after all 4 rows isn't genesis — this
+              // would fail chain_head_hash_mismatch WITHOUT the seal.
+              chainHeadHash: GENESIS_PREV_ROW_HASH,
+              cumulativeRowCount: '4', // decrease of 2
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-cp-2',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '2',
+              rootHash: sha256(Buffer.from('irrelevant-root-2')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-05-01T00:45:00.000Z',
+              approvalId: 'approval-10',
+            },
+          ],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(true);
+        expect(report.integrityCheckpoints.failed).toBe(0);
+        expect(report.integrityCheckpoints.sealExemptions).toBeDefined();
+        // Both the count-decrease (2) and the hash-mismatch (3) checks
+        // reconcile against the SAME window/seal — two distinct exemption
+        // entries, one per check.
+        expect(report.integrityCheckpoints.sealExemptions).toHaveLength(2);
+        expect(
+          report.integrityCheckpoints.sealExemptions!.some((s) =>
+            s.includes('chainHeadHash mismatch'),
+          ),
+        ).toBe(true);
+        expect(
+          report.integrityCheckpoints.sealExemptions!.every((s) =>
+            s.includes('seal-cp-2'),
+          ),
+        ).toBe(true);
+        expect(report.ok).toBe(true);
+      });
+
+      it('real end-to-end round trip: a be-shaped v4 bundle with a genuine sealed-purge reconciling a checkpoint decrease verifies OK via the shipped CLI subprocess', () => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            {
+              id: 'cp-a',
+              asOfIso: '2026-04-30T23:00:00.000Z',
+              chainHeadHash: sha256(Buffer.from('arbitrary-a')).toString(
+                'base64',
+              ),
+              cumulativeRowCount: '5',
+            },
+            {
+              id: 'cp-b',
+              asOfIso: '2026-05-01T01:30:00.000Z',
+              chainHeadHash: tipChainHeadHash(base),
+              cumulativeRowCount: '3',
+            },
+          ],
+          sealedPurgeDefs: [
+            {
+              id: 'seal-e2e-1',
+              periodStart: '2026-04-30T00:00:00.000Z',
+              periodEnd: '2026-05-01T00:00:00.000Z',
+              rowCount: '2',
+              rootHash: sha256(Buffer.from('irrelevant-root-e2e')).toString(
+                'base64',
+              ),
+              deletedAt: '2026-05-01T00:30:00.000Z',
+              approvalId: 'approval-e2e',
+            },
+          ],
+        });
+        const testDir = path.dirname(fileURLToPath(import.meta.url));
+        const cliPath = path.resolve(testDir, '../../dist/cli.js');
+        if (!fs.existsSync(cliPath)) {
+          throw new Error(
+            'dist/cli.js not found — `npm run build` must run before `npm test` ' +
+              '(the standard gate order in .claude/bin/verify.sh already does this).',
+          );
+        }
+        const tmpDir = fs.mkdtempSync(
+          path.join(os.tmpdir(), 'audit-verifier-e2e-'),
+        );
+        const bundlePath = path.join(tmpDir, 'bundle.zip');
+        try {
+          fs.writeFileSync(bundlePath, zip);
+          const stdout = execFileSync(
+            process.execPath,
+            [cliPath, bundlePath, '--no-rekor', '--allow-legacy-unattested'],
+            { encoding: 'utf8' },
+          );
+          expect(stdout).toContain('RESULT: OK');
+          expect(stdout).toContain('seal_exempted');
+          expect(stdout).toContain('seal-e2e-1');
+          expect(stdout).not.toContain('RESULT: FAIL');
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
     });
   });
 });

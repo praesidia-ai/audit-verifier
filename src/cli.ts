@@ -104,6 +104,14 @@ function printReport(report: VerifyReport, quiet: boolean): void {
     `roots:           ${report.bundle.rootsSeen}/${report.bundle.declaredRootCount} (seen/declared)`,
   );
   lines.push(`proofs:          ${report.bundle.proofsSeen}`);
+  // FIX01 (audit-verifier2) — only mentioned when sealed-purge evidence is
+  // actually present; the entry is wholly optional so a bundle without it
+  // prints identically to before this change.
+  if (report.bundle.sealedPurgesSeen > 0) {
+    lines.push(
+      `sealed purges:   ${report.bundle.sealedPurgesVerified}/${report.bundle.sealedPurgesSeen} (verified/seen)`,
+    );
+  }
   lines.push('');
   lines.push(fmtComponent('manifest          ', report.manifest));
   lines.push(fmtComponent('row signatures    ', report.rowSignatures));
@@ -115,7 +123,13 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   lines.push(fmtComponent('completeness      ', report.completeness));
   lines.push(fmtComponent('key binding       ', report.keyBinding));
   lines.push(fmtComponent('root coverage     ', report.rootCoverage));
+  for (const line of report.rootCoverage.sealExemptions ?? []) {
+    lines.push(`             ${line}`);
+  }
   lines.push(fmtComponent('integrity chkpts  ', report.integrityCheckpoints));
+  for (const line of report.integrityCheckpoints.sealExemptions ?? []) {
+    lines.push(`             ${line}`);
+  }
   lines.push('');
   lines.push(report.ok ? 'RESULT: OK' : 'RESULT: FAIL');
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
