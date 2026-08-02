@@ -25,7 +25,7 @@
  * that script uses for `export class *Dto` bodies applies directly to TS
  * `interface` bodies and object-literal return statements here.
  *
- * Four checks, in priority order (signature-critical first — see the
+ * Five checks, in priority order (signature-critical first — see the
  * CD-0002 ticket note: "if the script can only cover one thing well, cover
  * WHICH FIELDS ENTER THE SIGNATURE"):
  *
@@ -43,17 +43,47 @@
  *   D. Manifest WIRE shape — be's manifest builder (`manifestSansSignature`
  *      plus the `signature`/`signatureKeyVersion` fields added on top) vs
  *      `BundleManifest`'s declared fields (`verify.ts:98-183`).
+ *   E. Platform-attestation envelope — be's `attestBundle()` attestation
+ *      body literal (`platform-attestation.service.ts`) vs this verifier's
+ *      `PlatformAttestationBody` interface (`verify.ts:3859-3871`). UNLIKE
+ *      A-D, this check is deliberately asymmetric (see below) — the
+ *      attestation body is signature-safe under additive drift by
+ *      construction (MIL-0003), so [E] must not cry wolf on that case.
  *
- * Every check fails on a field present on only one side, in EITHER
- * direction — a be-only field is unrecognized by every offline consumer; a
- * verifier-only required field is one no producer will ever populate.
+ * A-D fail on a field present on only one side, in EITHER direction — a
+ * be-only field is unrecognized by every offline consumer; a verifier-only
+ * required field is one no producer will ever populate.
+ *
+ * [E] is asymmetric on purpose. `verifyPlatformAttestation` (`verify.ts`)
+ * builds its signature preimage with `canonicalJson(body)` over the PARSED
+ * JSON object, not a typed reconstruction (contrast `signableActionEvent`
+ * in check A, which DOES rebuild a typed object — that's exactly what made
+ * A blind to SEC-PA01-DISCOVERED-01). A field `be` adds that this
+ * verifier's interface doesn't know about still flows into the signed
+ * bytes correctly and the signature still verifies — MIL-0003's
+ * `platformKeyVersion` is exactly this case. So:
+ *   - a `be`-only field (present in the attestation literal, absent from
+ *     `PlatformAttestationBody` in EITHER its required or optional set) is
+ *     a WARNING (interface is stale, but no bundle fails to verify because
+ *     of it) — never a hard failure.
+ *   - a `PlatformAttestationBody` field declared REQUIRED (no `?`) that
+ *     `be` no longer emits IS a hard failure — `verifyPlatformAttestation`'s
+ *     own structural `malformed` check (`verify.ts` ~:3989-3997) rejects
+ *     every bundle missing it, so this is a real, signature-relevant break,
+ *     not merely a stale-interface annoyance. A rename shows up as exactly
+ *     this: the old required field disappears (hard failure) and a new
+ *     field appears on the `be` side (warning).
+ *   - a `PlatformAttestationBody` field declared OPTIONAL (`?`) that `be`
+ *     doesn't emit is unremarkable (forward-declared or legitimately
+ *     dropped) — no message.
  *
  * Usage
  * -----
  *   node scripts/contract-drift.mjs <path-to-be-core-checkout>
  *
- * Exits non-zero, listing every offending field, on any of the four checks
- * disagreeing.
+ * Exits non-zero, listing every offending field, when A-D disagree or when
+ * [E] finds a hard failure. Warnings (safe [E] drift) print but do not
+ * affect the exit code.
  */
 
 import { readFileSync } from 'node:fs';
@@ -117,13 +147,56 @@ function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowSh
   return keys;
 }
 
+/**
+ * Same depth-1 walk as {@link extractDepth1Keys}, but returns
+ * `Map<name, { optional: boolean }>` instead of a bare key set — needed by
+ * check [E], which must distinguish a `PlatformAttestationBody` field
+ * declared `name?: Type` (forward-compat-safe if `be` doesn't emit it) from
+ * one declared `name: Type` (its absence breaks `verifyPlatformAttestation`'s
+ * structural `malformed` check). Only used for TS `interface` bodies, which
+ * never use ES6 object-literal shorthand, so there is no shorthand branch
+ * here (unlike {@link extractDepth1Keys}).
+ */
+function extractDepth1PropertiesWithOptionality(source, openBraceIndex) {
+  const props = new Map();
+  const propertyPattern = /^([A-Za-z_]\w*)\s*(\?)?\s*:/;
+  let depth = 0;
+  let index = openBraceIndex;
+  let atLineStart = true;
+  for (; index < source.length; index++) {
+    const ch = source[index];
+    if (ch === '{') {
+      depth++;
+      atLineStart = false;
+      continue;
+    }
+    if (ch === '}') {
+      depth--;
+      if (depth === 0) break;
+      atLineStart = false;
+      continue;
+    }
+    if (depth === 1 && atLineStart) {
+      const match = propertyPattern.exec(source.slice(index));
+      if (match) props.set(match[1], { optional: match[2] === '?' });
+    }
+    atLineStart = ch === '\n' || ch === ';' || (atLineStart && (ch === ' ' || ch === '\t'));
+  }
+  return props;
+}
+
 /** Finds `anchorRegex`, then the first `{` at/after the match end, and
- * returns the depth-1 keys of that balanced block. */
+ * returns the depth-1 keys of that balanced block — or, with
+ * `{ entries: true }`, the `Map<name, {optional}>` form (see
+ * {@link extractDepth1PropertiesWithOptionality}, used by check [E]). */
 function keysAfterAnchor(source, anchorRegex, opts) {
   const match = anchorRegex.exec(source);
   if (!match) return null;
   const openBrace = source.indexOf('{', match.index + match[0].length - 1);
   if (openBrace === -1) return null;
+  if (opts?.entries) {
+    return extractDepth1PropertiesWithOptionality(source, openBrace);
+  }
   return extractDepth1Keys(source, openBrace, opts);
 }
 
@@ -187,12 +260,17 @@ function main() {
     beRoot,
     'src/protected-actions/utils/protected-action-canonical.helper.ts',
   );
+  const platformAttestationServicePath = path.join(
+    beRoot,
+    'src/common/security/services/platform-attestation.service.ts',
+  );
   const verifyTsPath = path.join(__dirname, '../src/verify.ts');
 
-  let bundleExporterSrc, canonicalHelperSrc, verifyTsSrc;
+  let bundleExporterSrc, canonicalHelperSrc, platformAttestationSrc, verifyTsSrc;
   try {
     bundleExporterSrc = stripComments(readFileSync(bundleExporterPath, 'utf8'));
     canonicalHelperSrc = stripComments(readFileSync(canonicalHelperPath, 'utf8'));
+    platformAttestationSrc = stripComments(readFileSync(platformAttestationServicePath, 'utf8'));
     verifyTsSrc = stripComments(readFileSync(verifyTsPath, 'utf8'));
   } catch (error) {
     console.error(`::error::could not read a required source file: ${error.message}`);
@@ -200,6 +278,7 @@ function main() {
   }
 
   const failures = [];
+  const warnings = [];
 
   // ── A. Action-event SIGNED PREIMAGE (signature-critical) ──────────────
   const signableRowFields = keysAfterAnchor(
@@ -334,16 +413,66 @@ function main() {
     }
   }
 
+  // ── E. Platform-attestation envelope (forward-compat-aware, MIL-0003) ──
+  const attestationFields = keysAfterAnchor(platformAttestationSrc, /\bconst attestation\s*=\s*{/);
+  const attestationBodyEntries = keysAfterAnchor(
+    verifyTsSrc,
+    /\binterface PlatformAttestationBody\b[^{]*{/,
+    { entries: true },
+  );
+  if (!attestationFields) {
+    failures.push(
+      "[E] attestBundle()'s `attestation` literal not found in platform-attestation.service.ts (renamed or moved?)",
+    );
+  } else if (!attestationBodyEntries) {
+    failures.push('[E] PlatformAttestationBody interface not found in verify.ts (renamed or moved?)');
+  } else {
+    const requiredVerifierFields = new Set(
+      [...attestationBodyEntries].filter(([, v]) => !v.optional).map(([k]) => k),
+    );
+    const allVerifierFields = new Set(attestationBodyEntries.keys());
+    // be-only field: signature-safe by construction (canonicalJson(body) is
+    // over the PARSED object, so an unknown-to-the-interface field still
+    // enters the signed bytes correctly) — warn, don't fail.
+    for (const field of [...attestationFields].sort()) {
+      if (!allVerifierFields.has(field)) {
+        warnings.push(
+          `[E] ${field}: present in be's attestBundle() attestation literal, absent from ` +
+            'PlatformAttestationBody (verify.ts) — signature-safe (canonicalized as parsed, ' +
+            'not typed-reconstructed) but the interface should be updated to reflect it',
+        );
+      }
+    }
+    // verifier-required field be no longer emits: hard failure —
+    // `verifyPlatformAttestation`'s own structural `malformed` check
+    // rejects every bundle missing it (verify.ts ~:3989-3997).
+    for (const field of [...requiredVerifierFields].sort()) {
+      if (!attestationFields.has(field)) {
+        failures.push(
+          `[E] ${field}: PlatformAttestationBody (verify.ts) declares this REQUIRED but be's ` +
+            "attestBundle() no longer emits it — verifyPlatformAttestation's structural check " +
+            'will reject every bundle as malformed',
+        );
+      }
+    }
+    // A verifier-OPTIONAL field be doesn't emit is unremarkable — no message.
+  }
+
   if (failures.length > 0) {
     console.error('audit-verifier <-> be bundle-schema contract drift detected:\n');
     for (const failure of failures) {
       console.error(`::error::${failure}`);
     }
+    for (const warning of warnings) {
+      console.error(`::warning::${warning}`);
+    }
     console.error(
       '\nUpdate `be`\'s serializer/manifest builder or this package\'s `BundleActionEvent` / ' +
-        '`BundleManifest` / `signableActionEvent` / `verifyManifest` to match, then re-run. ' +
-        'A field entering the SIGNED preimage on one side only ([A]/[B]) means signatures are ' +
-        'unverifiable offline for the affected rows — see SEC-PA01-DISCOVERED-01.',
+        '`BundleManifest` / `signableActionEvent` / `verifyManifest` / `PlatformAttestationBody` ' +
+        'to match, then re-run. A field entering the SIGNED preimage on one side only ([A]/[B]) ' +
+        'means signatures are unverifiable offline for the affected rows — see ' +
+        'SEC-PA01-DISCOVERED-01. A [E] hard failure means a bundle every genuine producer emits ' +
+        'will be rejected as malformed.',
     );
     return 1;
   }
@@ -352,6 +481,10 @@ function main() {
   console.log('ok  [B] manifest signed-preimage fields match (manifestSansSignature+signatureAlgorithm <-> verifyManifest signable)');
   console.log('ok  [C] action-event wire fields match (serializeActionEvent <-> BundleActionEvent)');
   console.log('ok  [D] manifest wire fields match (manifest builder <-> BundleManifest)');
+  console.log('ok  [E] platform-attestation required fields match (no hard drift); additive fields, if any, warned below');
+  for (const warning of warnings) {
+    console.warn(`::warning::${warning}`);
+  }
   console.log('\nno drift across the audit-verifier <-> be bundle-schema contract');
   return 0;
 }

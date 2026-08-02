@@ -3867,6 +3867,20 @@ interface PlatformAttestationBody {
   }>;
   issuedAt: string;
   platformSigningKeyFingerprint: string;
+  /**
+   * MIL-0003 — additive, optional. Present only when `be`'s
+   * `PLATFORM_ATTESTATION_KEY_VERSION` is configured (reserved for a
+   * future platform-key rotation; unset by default, so omitted entirely
+   * rather than emitted as `null` — see `platform-attestation.service.ts`'s
+   * `attestBundle`). This field is never structurally required by
+   * `verifyPlatformAttestation` — its absence/presence must never gate
+   * verification — and CD-0002's `scripts/contract-drift.mjs` check [E]
+   * enforces that any future `be`-side addition here is signature-safe
+   * (see the load-bearing comment on `canonicalJson(body...)` in
+   * {@link verifyPlatformAttestation} below) before it needs a matching
+   * interface field at all.
+   */
+  platformKeyVersion?: number;
   signatureAlgorithm: 'ECDSA_P256_SHA256';
 }
 
@@ -4017,6 +4031,21 @@ function verifyPlatformAttestation(
   // The verifier re-canonicalizes the attestation body BYTES the
   // same way the writer did (`canonicalJson`); the signature must
   // verify under the pinned pubkey or we fail closed.
+  //
+  // LOAD-BEARING forward-compatibility property (CD-0002 follow-up,
+  // MIL-0003): `body` here is the PARSED JSON object, cast to
+  // `Record<string, unknown>` — deliberately NOT rebuilt field-by-field
+  // into a fresh literal the way `signableActionEvent()` reconstructs its
+  // preimage. Canonicalizing the parsed object means EVERY key `be` put on
+  // the wire — including one this build's `PlatformAttestationBody`
+  // interface has never heard of (e.g. MIL-0003's additive
+  // `platformKeyVersion`) — flows into the signed bytes automatically and
+  // the signature still verifies. This is structurally the OPPOSITE of
+  // SEC-PA01-DISCOVERED-01, where a typed reconstruction silently dropped
+  // fields the real signer included, making the signature unverifiable.
+  // Do not "fix" this into a typed reconstruction (`{orgId: body.orgId,
+  // ...}`) without re-deriving this exact property — that change would
+  // reintroduce the SEC-PA01-DISCOVERED-01 failure mode for this seam.
   const message = canonicalJson(body as unknown as Record<string, unknown>);
   if (
     !verifySignature(
