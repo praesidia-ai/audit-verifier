@@ -184,6 +184,19 @@ function printReport(report: VerifyReport, quiet: boolean): void {
         'This result does not confirm or rule out anchoring.',
     );
   }
+  // MIL-0002 — `--allow-legacy-unattested` is an explicit, loudly-logged
+  // opt-in (mirroring the Rekor-skip NOTE above): a bundle with no
+  // platform-attestation entry at all is NOT platform-attested, and a
+  // "RESULT: OK" must never read as "Praesidia's platform vouched for
+  // this bundle" when that check was explicitly bypassed by the caller.
+  if (report.platformAttestation.reason === 'missing_legacy_explicitly_allowed') {
+    lines.push(
+      'WARNING: --allow-legacy-unattested was passed and this bundle carries NO ' +
+        'platform-attestation entry — platform key-binding was NOT checked. This ' +
+        'result only confirms the tenant-signed chain/Merkle evidence, not that ' +
+        'Praesidia vouches for the signing keys used.',
+    );
+  }
   process.stdout.write(lines.join('\n') + '\n');
 }
 

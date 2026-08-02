@@ -450,6 +450,51 @@ correctly today.
   entirely requires comparing bundle evidence against live system activity,
   which is outside what an offline, single-bundle verifier can ever prove.
 
+## Trust anchor — verifying the CLI's embedded pin out-of-band
+
+The platform public key this build trusts is compiled into `src/platform-pubkey.ts`
+as `PLATFORM_PUBLIC_KEY_DER_B64` / `PLATFORM_PUBLIC_KEY_FINGERPRINT` — **not** fetched
+at verify time (that would reintroduce the exact network dependency this tool exists
+to eliminate). Do not take the embedded bytes on faith: an npm-registry or CI-supply-chain
+compromise of *this package* is exactly the attack a customer's own second channel should
+catch.
+
+- **Confirm the pin against a second, independently-operated channel** before trusting a
+  `RESULT: OK` for anything consequential — never take `PLATFORM_PUBLIC_KEY_FINGERPRINT`
+  on the word of this package alone. **USER-OWED, pending the production key ceremony
+  (MIL-0003):** stand up a publication channel on infrastructure separate from the npm
+  registry and from `be-core`'s deploy pipeline (a static, independently-hosted page and/or
+  the `security.txt` contact response are the two candidates) and put its exact URL here
+  before the real key is pinned — a customer-facing README must never point at a channel
+  that does not yet exist. Once it does, compare that fingerprint, byte-for-byte, against
+  `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the exact tarball/commit you installed — `npm view
+  @praesidia/audit-verifier@<version> --json | jq .dist` lets you confirm the tarball hash
+  independently of `npm install`'s own trust.
+- **`npm publish --provenance`** (MIL-0002 F4) means `npm view @praesidia/audit-verifier
+  provenance` shows a SLSA attestation binding the published tarball to the exact GitHub
+  Actions run, commit, and source repository that built it — a second, cryptographic check
+  that what you installed is what this source tree actually produced, independent of trust
+  in whoever holds the npm publish token.
+- **Rotation does not (yet) avoid a CLI upgrade.** Today, rotating the platform key means
+  cutting a new `@praesidia/audit-verifier` release and every auditor updating before
+  verifying bundles signed under the new key — there is no in-band revocation for a
+  compromised *platform* key (as opposed to a per-tenant signing key, which already has
+  one — see invariant 4). A key-hierarchy design that removes this constraint (an offline
+  root that cross-signs rotating operational keys) is written up, not yet built:
+  `.claude/tickets/DESIGN-platform-key-hierarchy.md`.
+- **Until the production key ceremony lands**, this pin is intentionally empty and the
+  verifier fails closed with `platform_key_not_pinned` on every bundle — see "Platform
+  key-binding attestation" above and `src/platform-pubkey.ts`'s own docblock. That failure
+  is correct; do not work around it with `--platform-key` fetched from anywhere other than
+  the second channel described above, or you have reintroduced the exact trust dependency
+  this tool exists to remove.
+- **The bundle-schema contract this verifier parses is itself gated against drift**:
+  `scripts/contract-drift.mjs` (CI job `contract-drift`) diffs `be-core`'s bundle producer
+  against this package's `BundleActionEvent`/`BundleManifest`/`signableActionEvent`/
+  `verifyManifest` on every PR to either repository, specifically prioritizing the fields
+  that enter the SIGNED preimage — the exact class of bug that made action-event
+  signatures unverifiable for one release (`SEC-PA01-DISCOVERED-01`).
+
 ## Architecture
 
 This package is intentionally **decoupled** from `be-core`:
@@ -471,6 +516,34 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.9.2 (MIL-0002 / CD-0002 — release-integrity hardening, no verification-strictness change)
+
+- **`npm publish --provenance`**, `id-token: write` permission on the (still human-gated,
+  `if: false`) publish workflow — a customer can confirm the exact published tarball corresponds
+  to a specific CI run/commit, not just trust an npm-token holder's say-so.
+- **`npm audit --audit-level=high`** added to CI (previously the only repo in the monorepo
+  without one). The pre-existing critical/high `vitest`→`vite`→`esbuild` devDependency chain
+  advisories are resolved by upgrading `vitest` `2.1.9` → `4.1.10` (all 152 tests still pass
+  unmodified) — no `--omit=dev` scoping needed.
+- **New `contract-drift` CI job** (`scripts/contract-drift.mjs`, CD-0002): diffs `be-core`'s
+  bundle producer (`serializeActionEvent`, the manifest builder, `SignableProtectedActionEventRow`)
+  against this package's consumer types (`BundleActionEvent`, `BundleManifest`,
+  `signableActionEvent`, `verifyManifest`) on every PR, prioritizing the fields that enter the
+  SIGNED preimage — the exact seam that broke once already (`SEC-PA01-DISCOVERED-01`) with no
+  gate to catch it. Verified today: clean against the real `be` tree; fails with a specific
+  field-level message when a field is added/removed on either side (proved against a scratch
+  copy, never the real `be` tree).
+- **`--allow-legacy-unattested` now prints a loud `WARNING:` line** (mirroring the existing
+  `--no-rekor` `NOTE:`) whenever a bundle with no platform-attestation entry was accepted under
+  that explicit opt-in — a skimmed `RESULT: OK` must never read as "Praesidia vouched for this
+  bundle's signing keys" when that check was bypassed. The flag itself and its underlying
+  fail-closed default were already correct and are unchanged.
+- **No verification-strictness change**: every existing pass/fail verdict is unchanged for every
+  existing bundle. `platform-pubkey.ts`'s empty trust-anchor pin and its fail-closed
+  `platform_key_not_pinned` behavior are untouched and remain user-owed (production key
+  ceremony, tracked with MIL-0003). A key-hierarchy design for in-band platform-key rotation is
+  written up (`.claude/tickets/DESIGN-platform-key-hierarchy.md`) but not built.
 
 ### 0.9.1 (PA-0033 — HIGH-1 security re-attack fix, `PA01-SEC-reattack.md`)
 

@@ -33,6 +33,14 @@ jobs:
       - name: Install (reproducible)
         run: npm ci
 
+      # MIL-0002 F4/F12 — every other repo in this monorepo has a
+      # dependency-audit gate (be/ui/mcp/shared/worker/sdk/gateway); this
+      # was the one exception. `vitest`/`vite`/`esbuild` are resolved to
+      # non-vulnerable versions (see package.json) rather than scoped out
+      # with `--omit=dev` — no exception needed today.
+      - name: Dependency audit (npm audit --audit-level=high)
+        run: npm audit --audit-level=high
+
       - name: Build (tsc)
         run: npm run build
 
@@ -44,6 +52,39 @@ jobs:
 
       - name: praesidia-verify --help smoke
         run: node dist/cli.js --help
+
+  contract-drift:
+    # CD-0002 — no CI job anywhere checked `be`'s bundle producer
+    # (`serializeActionEvent`, the manifest builder) against this
+    # package's bundle consumer (`BundleActionEvent`, `BundleManifest`,
+    # `signableActionEvent`, `verifyManifest`). The two sides agreed only
+    # because a human traced every return site by hand — and that already
+    # broke for real once (SEC-PA01-DISCOVERED-01). This is our half of the
+    # two-sided gate; `be-core` carries the mirrored job in its own
+    # `contract-drift.yml` (CD-0002b) so drift is caught from either repo's
+    # PR, not just this one.
+    name: contract drift · bundle-schema (be producer vs this verifier)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout audit-verifier (the PR under test)
+        uses: actions/checkout@v4
+        with:
+          path: audit-verifier
+
+      - name: Checkout be-core (bundle producer, sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: praesidia-ai/be-core
+          path: be-core
+          token: ${{ secrets.BE_CORE_READ_TOKEN || github.token }}
+          persist-credentials: false
+
+      # Dependency-free regex/brace-depth scrape of both TS sources — no
+      # npm install of either project needed (mirrors
+      # `gateway/scripts/contract-drift.py`'s technique).
+      - name: Diff be's bundle producer against BundleActionEvent/BundleManifest
+        run: node audit-verifier/scripts/contract-drift.mjs be-core
 
   image:
     name: Reproducible image smoke

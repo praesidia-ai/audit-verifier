@@ -19,6 +19,11 @@ jobs:
     name: npm publish (@praesidia/audit-verifier)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # MIL-0002 F4 — SLSA/npm provenance requires the OIDC token exchange;
+    # `id-token: write` is scoped to this job only (least privilege).
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +38,12 @@ jobs:
       - run: npx vitest run
 
       - name: Publish to npm
-        run: npm publish --access public
+        # MIL-0002 F4 — `--provenance` publishes a signed SLSA provenance
+        # attestation (build workflow + commit + subject digest) to the npm
+        # registry's transparency log, so a customer can confirm the exact
+        # published tarball corresponds to this exact CI run/commit, not
+        # just trust an npm-token holder's say-so. Requires the `id-token`
+        # permission above; npm's publish tooling handles the OIDC exchange.
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

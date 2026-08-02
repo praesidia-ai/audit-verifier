@@ -225,16 +225,27 @@ interface BundleActionEvent {
   payloadCommitment: string | null;
   /** Hex, 64 chars. Genesis (first event of an actionId) = 64 hex zeros. */
   prevEventCommitment: string;
+  // Signature metadata — NOT part of the signed preimage itself (see
+  // {@link signableActionEvent}, which omits all four of these). CD-0002
+  // audit note: an earlier version of this comment mis-labeled
+  // `organizationId`/`issuerType`/`dispatched`/`producerVersion` below as
+  // "superset, not signed" — they DO enter the signed preimage
+  // (`signableActionEvent` includes all of them); only the four fields
+  // immediately above/below this comment (signature/signatureAlgorithm/
+  // keyVersion/eventCommitment) are genuinely outside it, because they
+  // describe or derive from the signature rather than being covered by it.
   signature: string;
   signatureAlgorithm: BundleSignatureAlgorithm;
   keyVersion: number;
-  // Superset fields `be` already ships (bundle-exporter.service.ts
+  // Part of the signed preimage (see {@link signableActionEvent}) —
+  // `be` already ships these (bundle-exporter.service.ts
   // `serializeActionEvent`):
   organizationId: string;
   issuerType: string;
   dispatched: boolean;
-  /** This event's own commitment. Independently RECOMPUTED and compared, never trusted — see {@link verifyActionEventChain}. */
+  /** This event's own commitment — derived from, not part of, the signed preimage. Independently RECOMPUTED and compared, never trusted — see {@link verifyActionEventChain}. */
   eventCommitment: string;
+  /** Part of the signed preimage (see {@link signableActionEvent}). */
   producerVersion: string;
   // Required for exact signable-preimage reconstruction (see the
   // SEC-PA01-DISCOVERED-01 note above) — not yet shipped by `be` as of
