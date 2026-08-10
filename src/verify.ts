@@ -255,8 +255,8 @@ interface BundleActionEvent {
   /** Part of the signed preimage (see {@link signableActionEvent}). */
   producerVersion: string;
   // Required for exact signable-preimage reconstruction (see the
-  // SEC-PA01-DISCOVERED-01 note above) — not yet shipped by `be` as of
-  // commit `e9e39b88`.
+  // SEC-PA01-DISCOVERED-01 note above) — shipped by `be` commit
+  // `3eb81950` (PA-0027, PA-0031, both state: done).
   timeSource: string;
   permitNonce: string | null;
   edgeVersion: string | null;
