@@ -188,26 +188,33 @@ interface BundleManifest {
  * `(actionId, actionSeq)`. Mirrors `be`'s `serializeActionEvent` wire
  * shape exactly (`bundle-exporter.service.ts`).
  *
- * SEC-PA01-DISCOVERED-01 (found this pass, not silently patched) — `be`
- * commit `e9e39b88`'s `serializeActionEvent` does NOT ship six fields
- * that `protected-action-canonical.helper.ts`'s `SignableProtectedActionEventRow`
- * requires to reconstruct the exact signed preimage: `timeSource`,
- * `permitNonce` (the top-level entity column — distinct from
- * `payload.permitNonce`, which IS present), `edgeVersion`,
- * `adapterVersion`, `externalReceiptRef`, `artifactStorageRef`. Without
- * them this verifier cannot recompute the exact bytes `be` signed, so it
- * cannot independently verify ANY action-event signature against a
- * REAL `be`-produced v5 bundle today. This is a genuine PRODUCER gap
- * (documented in `PA01-CONTRACT-manifest-v5-actions.md`'s amended
- * contract and filed as `.claude/backlog/PA-0026.md` for `backend-dev`),
- * not a verifier defect — per POLICY §1 ("do not fix it yourself and do
- * not silently loosen a check to accommodate it"), the fields below are
- * declared REQUIRED to match the corrected contract, and a bundle
- * missing any of them fails closed as a bundle-format error
- * (`assertActionEventsStructure`), exactly like every other missing
- * required field in this file. This is intentional, fail-closed
- * behavior: an event whose exact signed bytes cannot be reconstructed
- * must never be silently accepted as "probably fine."
+ * SEC-PA01-DISCOVERED-01 (found in an earlier pass, now CLOSED) — `be`
+ * commit `e9e39b88`'s `serializeActionEvent` originally did NOT ship six
+ * fields that `protected-action-canonical.helper.ts`'s
+ * `SignableProtectedActionEventRow` requires to reconstruct the exact
+ * signed preimage: `timeSource`, `permitNonce` (the top-level entity
+ * column — distinct from `payload.permitNonce`, which IS present),
+ * `edgeVersion`, `adapterVersion`, `externalReceiptRef`,
+ * `artifactStorageRef`. That was a genuine PRODUCER gap (documented in
+ * `PA01-CONTRACT-manifest-v5-actions.md`'s amended contract; the backlog
+ * ticket originally filed for it at discovery time has since been
+ * renumbered and repurposed for an unrelated SDK issue, so it is
+ * intentionally not cited here).
+ *
+ * **Fixed** by `be` commit `3eb81950` ("ship the 6 missing action-event
+ * preimage fields + repoint verifier round trip at v5, PA-0027,
+ * PA-0031") — `bundle-exporter.service.ts:2040-2051` now emits all six
+ * fields, plus `organizationId`/`issuerType`/`dispatched`. Tracked to
+ * closure as `.claude/backlog/PA-0027.md` and `.claude/backlog/PA-0031.md`
+ * (both `state: done`). This verifier can independently verify
+ * action-event signatures against a real `be`-produced v5 bundle today.
+ * The fields below remain declared REQUIRED to match the contract — no
+ * behavior change here — so a bundle missing any of them still fails
+ * closed as a bundle-format error (`assertActionEventsStructure`),
+ * exactly like every other missing required field in this file. This
+ * remains intentional, fail-closed behavior: an event whose exact
+ * signed bytes cannot be reconstructed must never be silently accepted
+ * as "probably fine."
  */
 interface BundleActionEvent {
   actionId: string;
