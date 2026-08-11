@@ -349,6 +349,17 @@ interface BundleRow {
    * row-by-row under the correct primitive.
    */
   signatureAlgorithm?: BundleSignatureAlgorithm;
+  /**
+   * DRIFT-0004 — producer-only sort aid (`AuditLog.chainSeq`, monotonic
+   * per-org chain-sequence number). NOT part of the signed preimage and
+   * NEVER read or trusted by verification — chain continuity is proven
+   * by `prevRowHash` walking, not by this field. Declared here only so
+   * the wire contract is explicit instead of silently dropped by
+   * `JSON.parse(...) as BundleRow`, and so a future field cannot collide
+   * with this name unnoticed. Optional because bundles produced before
+   * be started emitting it carry no such key at all.
+   */
+  chainSeq?: number | null;
 }
 
 interface BundleRoot {
