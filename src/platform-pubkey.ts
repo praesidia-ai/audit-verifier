@@ -17,15 +17,20 @@
  * without the corresponding fingerprint update.
  *
  * RELEASE PROCESS:
- *   1. Generate (or rotate) the platform keypair on the ops side:
- *        openssl ecparam -name prime256v1 -genkey -noout -out plat.pem
- *        openssl ec -in plat.pem -pubout -outform DER | base64
+ *   1. Deploy (or deliberately rotate) IAC's production
+ *      ECC_NIST_P256/SIGN_VERIFY platform-attestation KMS key. Read the
+ *      `PlatformAttestationKmsKeyArn` stack output, then fetch its public
+ *      SPKI DER bytes (AWS CLI prints them as base64):
+ *        aws kms get-public-key --key-id <arn> --query PublicKey --output text
  *   2. Replace {@link PLATFORM_PUBLIC_KEY_DER_B64} with the new base64.
- *   3. Compute the sha256 of the DER bytes:
- *        openssl ec -in plat.pem -pubout -outform DER | openssl dgst -sha256 -hex
+ *   3. Compute the sha256-hex fingerprint of the decoded DER bytes and
+ *      verify it through the independent production publication channel.
  *   4. Update {@link PLATFORM_PUBLIC_KEY_FINGERPRINT} to match.
  *   5. Cut a new `@praesidia/audit-verifier` release; auditors update
  *      the CLI before verifying bundles emitted under the new key.
+ *
+ * Never generate or export a private PEM for this release step. Production
+ * private key material stays inside KMS.
  *
  * TODO(AUDIT-2026-05-30 follow-up): replace the placeholder values
  * below with the production platform pubkey before distribution. The

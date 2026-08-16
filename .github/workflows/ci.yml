@@ -23,9 +23,11 @@ jobs:
       matrix:
         node: ['22', '24']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -68,17 +70,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout audit-verifier (the PR under test)
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
           path: audit-verifier
 
       - name: Checkout be-core (bundle producer, sibling repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          persist-credentials: false
           repository: praesidia-ai/be-core
           path: be-core
           token: ${{ secrets.BE_CORE_READ_TOKEN || github.token }}
-          persist-credentials: false
 
       # Dependency-free regex/brace-depth scrape of both TS sources — no
       # npm install of either project needed (mirrors
@@ -92,7 +95,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       # The Dockerfile repeats build + tests and its final stage must execute
       # the compiled zero-dependency CLI as a non-root user.
