@@ -302,7 +302,12 @@ async function main(): Promise<number> {
 }
 
 main().then(
-  (code) => process.exit(code),
+  (code) => {
+    // Let stdout/stderr drain naturally. `process.exit()` can truncate a
+    // large `--json` report when output is piped and the stream is under
+    // backpressure.
+    process.exitCode = code;
+  },
   (err) => {
     // Truly unexpected — the structured paths above already cover the
     // expected error classes. Surface as exit 2 so callers can
@@ -310,6 +315,6 @@ main().then(
     process.stderr.write(
       `fatal: ${err instanceof Error ? err.message : String(err)}\n`,
     );
-    process.exit(2);
+    process.exitCode = 2;
   },
 );

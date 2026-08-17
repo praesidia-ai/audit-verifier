@@ -181,9 +181,13 @@ checks every cryptographic invariant the bundle commits to:
     are never exported). A shrinkage (fewer rows/proofs than the root's
     own signed `rowCount`) is downgraded from a hard failure to a distinct
     `seal_exempted` pass — naming the responsible seal's `id` and
-    `approvalId` — when a VERIFIED entry in `sealed-purges.ndjson.gz`
-    (invariant 12) names the exact same `(periodStart, periodEnd,
-    rootHash)`. This closes `BE-0003`: a bundle spanning a legitimate,
+    `approvalId` — only when a VERIFIED entry in
+    `sealed-purges.ndjson.gz` (invariant 12) names the exact same
+    `(periodStart, periodEnd, rootHash)` and its signed `rowCount` equals
+    both the root's committed count and the number of missing rows/proofs.
+    A retention seal represents a full-period purge, so a partial count can
+    never excuse an unrelated deletion. This closes `BE-0003`: a bundle
+    spanning a legitimate,
     signed, two-person-approval-gated `AuditRetentionSeal` retention purge
     no longer reads as tampering. A shrinkage with no matching VERIFIED
     seal keeps failing exactly as before — this is a narrowing of the
@@ -224,7 +228,10 @@ checks every cryptographic invariant the bundle commits to:
     every other entry, over `canonicalJson({organizationId, periodStart,
     periodEnd, rowCount, rootHash, rekorReceipt})` — the seal's existing
     envelope from `AuditRetentionSealService.purgeWithSeal`, re-emitted
-    onto the bundle wire unchanged. This entry is deliberately **NOT**
+    onto the bundle wire unchanged. Current producers sign `rowCount` as
+    its canonical decimal string, matching the bundle wire; the verifier
+    also accepts the legacy safe-integer numeric preimage emitted by older
+    backend builds. This entry is deliberately **NOT**
     part of the signed manifest preimage (see the "Why this entry is
     unsigned" note below) — its own per-entry signature is what makes it
     trustworthy on its own, without needing a manifest-level count. An
@@ -261,7 +268,8 @@ checks every cryptographic invariant the bundle commits to:
     signature-verified (message = `canonicalJson(signable) ||
     prevEventCommitmentBytes`, mirroring the row-signature binding) and
     chained by an independently RECOMPUTED `sha256(canonical || sigBytes)`
-    per `actionId` — never the wire-declared `eventCommitment`. `actionSeq`
+    per `actionId`; the wire-declared `eventCommitment` must equal that
+    recomputed digest and is never trusted as the chain source. `actionSeq`
     must be monotonic and gapless within the bundle for each `actionId`;
     the first event seen for an `actionId` is accepted as an opaque
     out-of-range anchor unless its `actionSeq` is `1`, in which case it
@@ -270,11 +278,16 @@ checks every cryptographic invariant the bundle commits to:
     skew.
 14. **Permit binding** (`permitBinding`) — `PERMIT_ISSUED`/`PERMIT_CONSUMED`
     within one `actionId` must agree on the request commitment and the
-    permit identifier, and no `permitNonce` may be consumed by two distinct
-    `actionId`s across the whole bundle (the durable single-use gate).
+    permit identifier. Every consumed event must carry the same nonce in
+    its signed top-level `permitNonce` and payload mirror, no nonce may be
+    consumed more than once anywhere in the bundle, and one destination
+    idempotency commitment may not map to distinct action IDs (the durable
+    single-use and double-apply gates).
 15. **Request binding** (`requestBinding`) — `DISPATCH_ATTEMPTED` and
-    `PERMIT_CONSUMED` must agree on `requestCommitment` for the same
-    `actionId` — the authoritative-commitment-substitution defense.
+    `PERMIT_CONSUMED` must agree on a well-formed `requestCommitment` for
+    every dispatch attempt in the same `actionId`; a consumed event found
+    only after dispatch is invalid. Observe-mode dispatches may omit a
+    permit entirely — the authoritative-commitment-substitution defense.
 16. **Dispatch integrity** (`dispatchIntegrity`) — every `DISPATCH_ATTEMPTED`
     event must carry `dispatched: true`; a post-dispatch closure requires
     one such event, a pre-dispatch-only closure must never have one.
@@ -301,9 +314,10 @@ checks every cryptographic invariant the bundle commits to:
     `outcomeClass: 'no_response_received'`, or ambiguous pre-field
     `success: false` — verify as `invalid` or `incomplete`, never `valid`.**
 20. **Evidence grade** (`evidenceGrade`) — derives a grade per closed action
-    from the evidence actually present and flags a declared
-    `evidenceGradeSummary` count that exceeds what the evidence supports,
-    and an `enforcementMode: 'enforce'` declaration contradicted by an
+    from the evidence actually present, requires the four declared grade
+    buckets to total exactly the number of closed action streams, flags a
+    declared strength that exceeds what the evidence supports, and rejects
+    an `enforcementMode: 'enforce'` declaration contradicted by an
     `'observe'`-mode event.
 21. **Action completeness** (`actionCompleteness`) — the signed
     `actionEventCount` must match the rows actually present in
@@ -320,17 +334,6 @@ version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's
 fields in the same change.
-
-**Known producer gap (as of this release):** a real `version: 5` bundle
-with non-empty action-event content, produced by `be` commit `e9e39b88`, is
-currently rejected as a bundle-format error — `be`'s wire row omits six
-fields (`timeSource`, `permitNonce`, `edgeVersion`, `adapterVersion`,
-`externalReceiptRef`, `artifactStorageRef`) this verifier needs to
-reconstruct the exact bytes `be` signed. This is intentional, fail-closed
-behavior for an unverifiable signature, not a defect in this package —
-tracked as `be`'s `PA-0027`. `version: 5` bundles with an EMPTY
-`action-events.ndjson.gz` (no protected-action activity in range) verify
-correctly today.
 
 ## What this verifier does — and does NOT — prove
 

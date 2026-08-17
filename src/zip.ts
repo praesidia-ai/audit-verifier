@@ -146,6 +146,18 @@ export function readZip(
         'ZIP64 EOCD locator points to invalid ZIP64 EOCD record',
       );
     }
+    const zip64RecordSize = safeZip64Number(
+      buffer.readBigUInt64LE(zip64EocdOffset + 4),
+      'EOCD record size',
+    );
+    if (
+      zip64RecordSize < 44 ||
+      zip64EocdOffset + 12 + zip64RecordSize !== locatorOffset
+    ) {
+      throw new ZipReadError(
+        'ZIP64 EOCD record size is invalid or does not end at its locator',
+      );
+    }
     if (
       buffer.readUInt32LE(zip64EocdOffset + 16) !== 0 ||
       buffer.readUInt32LE(zip64EocdOffset + 20) !== 0 ||
@@ -332,6 +344,66 @@ export function readZip(
     }
     if (localName !== name) {
       throw new ZipReadError(`local/central filename mismatch for ${name}`);
+    }
+    // When bit 3 (data descriptor) is clear, APPNOTE requires the local
+    // CRC/sizes to describe the same payload as the central directory.
+    // Ignoring those fields admitted deliberately ambiguous archives that
+    // different ZIP readers could interpret differently. ZIP64 sentinels are
+    // resolved from the local extra field before comparison.
+    if ((localFlags & 0x0008) === 0) {
+      const localCrc = buffer.readUInt32LE(localHeaderOffset + 14);
+      let localCompressedSize = buffer.readUInt32LE(localHeaderOffset + 18);
+      let localUncompressedSize = buffer.readUInt32LE(localHeaderOffset + 22);
+      if (
+        localCompressedSize === ZIP64_U32_LIMIT ||
+        localUncompressedSize === ZIP64_U32_LIMIT
+      ) {
+        const localExtraStart = localHeaderOffset + 30 + lfhNameLen;
+        const localZip64 = findZip64Extra(
+          buffer,
+          localExtraStart,
+          lfhExtraLen,
+        );
+        if (!localZip64) {
+          throw new ZipReadError(
+            `local header for ${name} uses ZIP64 sentinel(s) without a ZIP64 extra field`,
+          );
+        }
+        let lp = localZip64.dataStart;
+        const localZip64End = lp + localZip64.dataSize;
+        if (localUncompressedSize === ZIP64_U32_LIMIT) {
+          if (lp + 8 > localZip64End) {
+            throw new ZipReadError(
+              `local ZIP64 extra for ${name} is truncated reading uncompressedSize`,
+            );
+          }
+          localUncompressedSize = safeZip64Number(
+            buffer.readBigUInt64LE(lp),
+            `local uncompressed size for ${name}`,
+          );
+          lp += 8;
+        }
+        if (localCompressedSize === ZIP64_U32_LIMIT) {
+          if (lp + 8 > localZip64End) {
+            throw new ZipReadError(
+              `local ZIP64 extra for ${name} is truncated reading compressedSize`,
+            );
+          }
+          localCompressedSize = safeZip64Number(
+            buffer.readBigUInt64LE(lp),
+            `local compressed size for ${name}`,
+          );
+        }
+      }
+      if (
+        localCrc !== expectedCrc ||
+        localCompressedSize !== compressedSize ||
+        localUncompressedSize !== uncompressedSize
+      ) {
+        throw new ZipReadError(
+          `local/central CRC or size mismatch for ${name}`,
+        );
+      }
     }
     const dataStart = localHeaderOffset + 30 + lfhNameLen + lfhExtraLen;
     if (dataStart > cdOffset || compressedSize > cdOffset - dataStart) {

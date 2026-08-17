@@ -420,7 +420,7 @@ interface BundleSealedPurge {
   periodStart: string;
   /** Exclusive end of the purged period. ISO 8601. */
   periodEnd: string;
-  /** Bigint-as-string — NEVER re-parse as a number. Rows the seal replaces. */
+  /** Bigint-as-string on the wire. Rows the seal replaces. */
   rowCount: string;
   /** Base64 sha256 — the AuditMerkleRoot.rootHash that covered this period before the purge. */
   rootHash: string;
@@ -428,9 +428,12 @@ interface BundleSealedPurge {
   /**
    * Base64 signature over canonicalJson({organizationId, periodStart,
    * periodEnd, rowCount, rootHash, rekorReceipt}) — the seal's OWN
-   * envelope. `null` only for legacy backfilled rows that predate the
-   * signed-seal path — treated as UNVERIFIABLE, never as evidence of
-   * legitimacy (see `verifySealedPurgeAuthenticity`).
+   * envelope. Current producers sign `rowCount` as the same decimal string
+   * carried on the wire. A legacy producer signed the safe-integer numeric
+   * form before persisting/exporting the string; the verifier accepts that
+   * one historical representation as a compatibility fallback. `null` only
+   * for legacy backfilled rows that predate the signed-seal path — treated
+   * as UNVERIFIABLE, never as evidence of legitimacy.
    */
   signature: string | null;
   signingKeyVersion: number | null;
@@ -710,12 +713,13 @@ export interface VerifyReport {
   actionEventChain: ComponentResult;
   /**
    * PA-0010 — binds `PERMIT_ISSUED`/`PERMIT_CONSUMED` within one
-   * `actionId`'s stream (`payload.permitId` === `payload.permitNonce`,
-   * `payload.requestCommitment` matches across both events — D2's
-   * commitment binding) and asserts NO two `PERMIT_CONSUMED` events across
-   * the WHOLE bundle share the same `payload.permitNonce` (a duplicate
-   * would mean the durable single-use gate, SEC-PA01-01/corrigendum C1,
-   * was bypassed). `unsupported` on `manifest.version < 5`.
+   * `actionId`'s stream (issued permit id, the consumed event's signed
+   * top-level `permitNonce`, its payload mirror, and request commitment all
+   * agree). It asserts NO two `PERMIT_CONSUMED` rows in the whole bundle
+   * reuse the signed top-level nonce — including two rows under the same
+   * actionId, exactly matching the database unique index — and no two
+   * distinct actions reuse a non-null destination-idempotency commitment.
+   * `unsupported` on `manifest.version < 5`.
    */
   permitBinding: ComponentResult;
   /**
@@ -1783,7 +1787,7 @@ function verifyRootCoverage(
       // unconditionally regardless of any matching seal.
       const seal =
         rowsInPeriod < root.rowCount
-          ? findMatchingSeal(verifiedSeals, root)
+          ? findMatchingSeal(verifiedSeals, root, root.rowCount - rowsInPeriod)
           : null;
       if (seal) {
         sealExemptions.push(
@@ -1802,7 +1806,7 @@ function verifyRootCoverage(
     if (proofsForRoot !== root.rowCount) {
       const seal =
         proofsForRoot < root.rowCount
-          ? findMatchingSeal(verifiedSeals, root)
+          ? findMatchingSeal(verifiedSeals, root, root.rowCount - proofsForRoot)
           : null;
       if (seal) {
         sealExemptions.push(
@@ -1839,13 +1843,20 @@ function verifyRootCoverage(
 function findMatchingSeal(
   verifiedSeals: BundleSealedPurge[],
   root: BundleRoot,
+  missingCount: number,
 ): BundleSealedPurge | null {
   return (
     verifiedSeals.find(
       (seal) =>
         seal.periodStart === root.periodStart &&
         seal.periodEnd === root.periodEnd &&
-        seal.rootHash === root.rootHash,
+        seal.rootHash === root.rootHash &&
+        // A retention seal records exactly how many rows the purge replaced.
+        // Matching only period+root let a valid seal for one removed row
+        // excuse an arbitrary suffix deletion. Require arithmetic coverage,
+        // not merely a nearby signed artifact.
+        BigInt(seal.rowCount) === BigInt(root.rowCount) &&
+        BigInt(seal.rowCount) === BigInt(missingCount),
     ) ?? null
   );
 }
@@ -2177,6 +2188,31 @@ const RECONCILABLE_TO = new Set([
   'EVIDENCE_INCOMPLETE',
   'DUPLICATE_SUPPRESSED',
 ]);
+const FIXED_ACTION_EVENT_TYPES = new Set([
+  'ACTION_PROPOSED',
+  'AUTHORITY_RESOLVED',
+  'POLICY_DECIDED',
+  'PERMIT_ISSUED',
+  'PERMIT_CONSUMED',
+  'DISPATCH_ATTEMPTED',
+  'TARGET_ACKNOWLEDGED',
+  'CALLER_RESULT_OBSERVED',
+  'OUTCOME_RECONCILED',
+  'ACTION_CLOSED',
+]);
+
+/** D9's fixed vocabulary plus its deliberately open compensation family. */
+function isSupportedActionEventType(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    (FIXED_ACTION_EVENT_TYPES.has(value) ||
+      // The producer intentionally defines `COMPENSATION_${string}` as an
+      // open family and its database constraint accepts every literal
+      // `COMPENSATION_` prefix. Match that contract byte-for-byte so a valid
+      // future compensation subtype does not become unverifiable here.
+      value.startsWith('COMPENSATION_'))
+  );
+}
 
 /**
  * PA-0033 (HIGH-1 fix, `PA01-CONTRACT-manifest-v5-actions.md`) —
@@ -2374,6 +2410,12 @@ function verifyActionEventChain(
         prevComputed = null;
         continue;
       }
+      if (e.eventCommitment !== sigResult.computedCommitment) {
+        fail(
+          id,
+          'event_commitment_mismatch: wire eventCommitment does not match sha256(canonical event bytes || signature bytes)',
+        );
+      }
 
       if (i === 0) {
         // First event of this actionId present in the bundle. A genuine
@@ -2443,59 +2485,129 @@ function verifyPermitBinding(events: BundleActionEvent[]): RawComponentResult {
     }
   };
 
-  const nonceToActionIds = new Map<string, Set<string>>();
+  const consumedNonceToEvent = new Map<string, string>();
+  const destinationCommitmentToActionIds = new Map<string, Set<string>>();
   const byAction = groupActionEvents(events);
   for (const [actionId, stream] of byAction) {
-    const issued = stream.find((e) => e.eventType === 'PERMIT_ISSUED');
-    const consumed = stream.find((e) => e.eventType === 'PERMIT_CONSUMED');
-    if (!consumed) continue;
-    checked += 1;
-    const id = `${actionId}#${consumed.actionSeq}`;
-    const nonce = payloadStr(consumed.payload, 'permitNonce');
-    if (!nonce) {
-      fail(id, 'PERMIT_CONSUMED.payload.permitNonce is missing or empty');
-    } else {
-      const set = nonceToActionIds.get(nonce) ?? new Set<string>();
-      set.add(actionId);
-      nonceToActionIds.set(nonce, set);
-    }
-    if (issued) {
-      const issuedPermitId = payloadStr(issued.payload, 'permitId');
-      if (nonce && issuedPermitId && issuedPermitId !== nonce) {
+    const issuedEvents = stream.filter((e) => e.eventType === 'PERMIT_ISSUED');
+    const consumedEvents = stream.filter(
+      (e) => e.eventType === 'PERMIT_CONSUMED',
+    );
+    for (const consumed of consumedEvents) {
+      checked += 1;
+      const id = `${actionId}#${consumed.actionSeq}`;
+      const signedNonce =
+        typeof consumed.permitNonce === 'string' &&
+        consumed.permitNonce.length > 0
+          ? consumed.permitNonce
+          : null;
+      const payloadNonce = payloadStr(consumed.payload, 'permitNonce');
+      if (!signedNonce) {
         fail(
           id,
-          'permit_binding_mismatch: PERMIT_CONSUMED.payload.permitNonce does not match this actionId\'s PERMIT_ISSUED.payload.permitId',
+          'PERMIT_CONSUMED.permitNonce is missing or empty — the signed top-level field is the durable single-use key',
         );
       }
-      const issuedCommitment = payloadStr(issued.payload, 'requestCommitment');
+      if (!payloadNonce) {
+        fail(id, 'PERMIT_CONSUMED.payload.permitNonce is missing or empty');
+      }
+      if (signedNonce && payloadNonce && signedNonce !== payloadNonce) {
+        fail(
+          id,
+          'permit_nonce_mirror_mismatch: PERMIT_CONSUMED.permitNonce does not match payload.permitNonce',
+        );
+      }
+
+      if (signedNonce) {
+        const prior = consumedNonceToEvent.get(signedNonce);
+        if (prior) {
+          fail(
+            id,
+            `permit_nonce_reused: permitNonce "${signedNonce}" is consumed more than once (${prior}, ${id}) — the durable unique gate permits exactly one PERMIT_CONSUMED row per nonce`,
+          );
+        } else {
+          consumedNonceToEvent.set(signedNonce, id);
+        }
+      }
+
       const consumedCommitment = payloadStr(
         consumed.payload,
         'requestCommitment',
       );
-      if (
-        issuedCommitment &&
-        consumedCommitment &&
-        issuedCommitment !== consumedCommitment
-      ) {
+      if (!isSha256HexDigest(consumedCommitment ?? undefined)) {
         fail(
           id,
-          'permit_request_commitment_mismatch: PERMIT_ISSUED and PERMIT_CONSUMED disagree on requestCommitment for the same actionId — D2 commitment substitution',
+          'PERMIT_CONSUMED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
         );
+      }
+
+      const issued = [...issuedEvents]
+        .reverse()
+        .find((candidate) => candidate.actionSeq < consumed.actionSeq);
+      if (issued) {
+        const issuedPermitId = payloadStr(issued.payload, 'permitId');
+        if (!issuedPermitId) {
+          fail(id, 'PERMIT_ISSUED.payload.permitId is missing or empty');
+        } else if (signedNonce && issuedPermitId !== signedNonce) {
+          fail(
+            id,
+            'permit_binding_mismatch: PERMIT_CONSUMED.permitNonce does not match the most recent preceding PERMIT_ISSUED.payload.permitId',
+          );
+        }
+        const issuedCommitment = payloadStr(
+          issued.payload,
+          'requestCommitment',
+        );
+        if (!isSha256HexDigest(issuedCommitment ?? undefined)) {
+          fail(
+            id,
+            'PERMIT_ISSUED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
+          );
+        } else if (
+          consumedCommitment &&
+          issuedCommitment !== consumedCommitment
+        ) {
+          fail(
+            id,
+            'permit_request_commitment_mismatch: PERMIT_ISSUED and PERMIT_CONSUMED disagree on requestCommitment for the same actionId — D2 commitment substitution',
+          );
+        }
+      }
+
+      const destinationCommitment =
+        consumed.payload?.destinationIdempotencyCommitment;
+      if (
+        destinationCommitment !== undefined &&
+        destinationCommitment !== null
+      ) {
+        if (!isSha256HexDigest(destinationCommitment)) {
+          fail(
+            id,
+            'PERMIT_CONSUMED.payload.destinationIdempotencyCommitment is present but not a well-formed sha256 hex digest',
+          );
+        } else {
+          const actionIds =
+            destinationCommitmentToActionIds.get(destinationCommitment) ??
+            new Set<string>();
+          actionIds.add(actionId);
+          destinationCommitmentToActionIds.set(
+            destinationCommitment,
+            actionIds,
+          );
+        }
       }
     }
   }
 
-  // SEC-PA01-01/corrigendum C1 — the durable single-use gate. A genuine
-  // `be` bundle NEVER ships two PERMIT_CONSUMED events sharing the same
-  // permitNonce (the second insert fails with a 23505 unique violation
-  // and is never persisted) — a duplicate here means the durable
-  // uniqueness constraint was bypassed or the bundle was forged.
-  for (const [nonce, actionIds] of nonceToActionIds) {
+  // CLOSE-005 — the projection's tenant-scoped unique index permits a
+  // commitment to map to at most one actionId. Repeated attempts under the
+  // SAME actionId are legitimate; a second distinct actionId is not.
+  for (const [commitment, actionIds] of destinationCommitmentToActionIds) {
     if (actionIds.size > 1) {
       checked += 1;
       fail(
-        nonce,
-        `permit_nonce_reused: permitNonce "${nonce}" was consumed by ${actionIds.size} distinct actionIds (${[...actionIds].join(', ')}) — the durable single-use gate must admit exactly one PERMIT_CONSUMED per nonce`,
+        commitment,
+        `destination_idempotency_reused: destinationIdempotencyCommitment "${commitment}" was consumed by ${actionIds.size} distinct actionIds (${[...actionIds].join(', ')}) — the durable double-apply gate maps one commitment to at most one actionId`,
       );
     }
   }
@@ -2525,27 +2637,52 @@ function verifyRequestBinding(events: BundleActionEvent[]): RawComponentResult {
 
   const byAction = groupActionEvents(events);
   for (const [actionId, stream] of byAction) {
-    const dispatched = stream.find((e) => e.eventType === 'DISPATCH_ATTEMPTED');
-    if (!dispatched) continue;
-    checked += 1;
-    const id = `${actionId}#${dispatched.actionSeq}`;
-    const dispatchCommitment = payloadStr(dispatched.payload, 'requestCommitment');
-    if (!isSha256HexDigest(dispatchCommitment ?? undefined)) {
-      fail(
-        id,
-        'DISPATCH_ATTEMPTED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
+    const consumedEvents = stream.filter(
+      (e) => e.eventType === 'PERMIT_CONSUMED',
+    );
+    for (const dispatched of stream.filter(
+      (e) => e.eventType === 'DISPATCH_ATTEMPTED',
+    )) {
+      checked += 1;
+      const id = `${actionId}#${dispatched.actionSeq}`;
+      const dispatchCommitment = payloadStr(
+        dispatched.payload,
+        'requestCommitment',
       );
-      continue;
-    }
-    const consumed = stream.find((e) => e.eventType === 'PERMIT_CONSUMED');
-    const consumedCommitment = consumed
-      ? payloadStr(consumed.payload, 'requestCommitment')
-      : null;
-    if (consumedCommitment && consumedCommitment !== dispatchCommitment) {
-      fail(
-        id,
-        'commitment_mismatch: DISPATCH_ATTEMPTED and PERMIT_CONSUMED disagree on requestCommitment for the same actionId — request substitution (threat-model row #2)',
+      if (!isSha256HexDigest(dispatchCommitment ?? undefined)) {
+        fail(
+          id,
+          'DISPATCH_ATTEMPTED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
+        );
+        continue;
+      }
+      const consumed = [...consumedEvents]
+        .reverse()
+        .find((candidate) => candidate.actionSeq < dispatched.actionSeq);
+      if (!consumed) {
+        if (consumedEvents.length > 0) {
+          fail(
+            id,
+            'permit_consumed_after_dispatch: this action has PERMIT_CONSUMED evidence, but none precedes DISPATCH_ATTEMPTED',
+          );
+        }
+        continue; // observe-mode dispatches legitimately have no permit.
+      }
+      const consumedCommitment = payloadStr(
+        consumed.payload,
+        'requestCommitment',
       );
+      if (!isSha256HexDigest(consumedCommitment ?? undefined)) {
+        fail(
+          id,
+          'PERMIT_CONSUMED.payload.requestCommitment is missing or not a well-formed sha256 hex digest',
+        );
+      } else if (consumedCommitment !== dispatchCommitment) {
+        fail(
+          id,
+          'commitment_mismatch: DISPATCH_ATTEMPTED and the preceding PERMIT_CONSUMED disagree on requestCommitment for the same actionId — request substitution (threat-model row #2)',
+        );
+      }
     }
   }
 
@@ -3103,13 +3240,15 @@ function verifyEvidenceGrade(
     }
   }
 
-  checked += 3; // the three cumulative-from-strongest bucket checks below
+  checked += 4; // three strength checks plus exact total closed-action count.
   const declaredCumA = declared.A;
   const declaredCumAB = declared.A + declared.B;
   const declaredCumABC = declared.A + declared.B + declared.C;
   const derivedCumA = derived.A;
   const derivedCumAB = derived.A + derived.B;
   const derivedCumABC = derived.A + derived.B + derived.C;
+  const declaredTotal = declaredCumABC + declared.D;
+  const derivedTotal = derivedCumABC + derived.D;
   if (declaredCumA > derivedCumA) {
     fail(
       'evidenceGradeSummary.A',
@@ -3124,6 +3263,11 @@ function verifyEvidenceGrade(
     fail(
       'evidenceGradeSummary.C',
       `declared_grade_exceeds_derived_evidence: manifest declares ${declaredCumABC} grade-A/B/C actions but only ${derivedCumABC} action(s) in the shipped event stream support at least grade C`,
+    );
+  } else if (declaredTotal !== derivedTotal) {
+    fail(
+      'evidenceGradeSummary.total',
+      `declared_grade_summary_count_mismatch: manifest grade buckets total ${declaredTotal} closed action(s), but the shipped event stream contains ${derivedTotal} ACTION_CLOSED stream(s)`,
     );
   }
 
@@ -3180,16 +3324,19 @@ function assertActionEventsStructure(
       e.actionId.length === 0 ||
       !Number.isSafeInteger(e.actionSeq) ||
       e.actionSeq < 1 ||
-      typeof e.eventType !== 'string' ||
-      e.eventType.length === 0 ||
+      !isSupportedActionEventType(e.eventType) ||
       typeof e.schemaVersion !== 'number' ||
+      !Number.isFinite(e.schemaVersion) ||
+      e.schemaVersion <= 0 ||
       !isIsoDate(e.observedAt) ||
       !isIsoDate(e.receivedAt) ||
       typeof e.issuer !== 'string' ||
       typeof e.trustDomain !== 'string' ||
-      (e.payload !== null && typeof e.payload !== 'object') ||
+      (e.payload !== null &&
+        (typeof e.payload !== 'object' || Array.isArray(e.payload))) ||
       (e.payload === null && !e.payloadCommitment) ||
-      (e.payloadCommitment !== null && typeof e.payloadCommitment !== 'string') ||
+      (e.payloadCommitment !== null &&
+        !isSha256HexDigest(e.payloadCommitment)) ||
       typeof e.prevEventCommitment !== 'string' ||
       !/^[0-9a-f]{64}$/.test(e.prevEventCommitment) ||
       typeof e.signature !== 'string' ||
@@ -3200,7 +3347,7 @@ function assertActionEventsStructure(
       e.organizationId !== orgId ||
       typeof e.issuerType !== 'string' ||
       typeof e.dispatched !== 'boolean' ||
-      typeof e.eventCommitment !== 'string' ||
+      !isSha256HexDigest(e.eventCommitment) ||
       typeof e.producerVersion !== 'string' ||
       // SEC-PA01-DISCOVERED-01 — required for exact signable-preimage
       // reconstruction; see BundleActionEvent's doc comment.
@@ -4303,9 +4450,11 @@ function assertManifestStructure(manifest: BundleManifest): void {
   }
   if (
     'captureScopeDigest' in manifest &&
-    typeof manifest.captureScopeDigest !== 'string'
+    !isSha256HexDigest(manifest.captureScopeDigest)
   ) {
-    throw new Error('manifest.json has an invalid structure');
+    throw new Error(
+      'manifest.captureScopeDigest must be a lowercase sha256 hex digest',
+    );
   }
   if ('evidenceGradeSummary' in manifest) {
     const s = manifest.evidenceGradeSummary;
@@ -4340,7 +4489,7 @@ function assertIntegrityCheckpointsStructure(
       cp.id.length === 0 ||
       ids.has(cp.id) ||
       cp.organizationId !== orgId ||
-      typeof cp.chainHeadHash !== 'string' ||
+      decodeBase64Strict(cp.chainHeadHash, 32) === null ||
       typeof cp.cumulativeRowCount !== 'string' ||
       !/^\d+$/.test(cp.cumulativeRowCount) ||
       !isIsoDate(cp.asOf) ||
@@ -4394,9 +4543,8 @@ function assertSealedPurgesStructure(
       !isIsoDate(p.periodEnd) ||
       Date.parse(p.periodStart) >= Date.parse(p.periodEnd) ||
       typeof p.rowCount !== 'string' ||
-      !/^\d+$/.test(p.rowCount) ||
-      typeof p.rootHash !== 'string' ||
-      p.rootHash.length === 0 ||
+      !/^[1-9]\d*$/.test(p.rowCount) ||
+      decodeBase64Strict(p.rootHash, 32) === null ||
       (p.rekorReceipt !== null &&
         (typeof p.rekorReceipt !== 'object' || Array.isArray(p.rekorReceipt))) ||
       !(authFieldsAllNull || authFieldsAllPresent) ||
@@ -4458,15 +4606,36 @@ function verifySealedPurgeAuthenticity(
     if (!entry || entry.status === 'REVOKED') {
       continue;
     }
-    const message = canonicalJson({
+    const envelope = {
       organizationId: p.organizationId,
       periodStart: p.periodStart,
       periodEnd: p.periodEnd,
       rowCount: p.rowCount,
       rootHash: p.rootHash,
       rekorReceipt: p.rekorReceipt,
-    });
-    if (verifySignature(p.signatureAlgorithm, message, p.signature, entry.publicKey)) {
+    };
+    const currentMessage = canonicalJson(envelope);
+    let authentic = verifySignature(
+      p.signatureAlgorithm,
+      currentMessage,
+      p.signature,
+      entry.publicKey,
+    );
+    // Compatibility for seals emitted before the producer aligned its signed
+    // representation with the bigint-as-string persistence/wire contract.
+    // Those seals signed a JSON number, then stored/exported the same value as
+    // a string. The source Merkle root uses a SQL integer, so only a canonical,
+    // safely representable decimal is eligible for this exact legacy fallback.
+    const legacyRowCount = Number(p.rowCount);
+    if (!authentic && Number.isSafeInteger(legacyRowCount)) {
+      authentic = verifySignature(
+        p.signatureAlgorithm,
+        canonicalJson({ ...envelope, rowCount: legacyRowCount }),
+        p.signature,
+        entry.publicKey,
+      );
+    }
+    if (authentic) {
       verified.push(p);
     }
   }
@@ -4486,6 +4655,7 @@ function assertRowsStructure(rows: BundleRow[], orgId: string): void {
       typeof row.action !== 'string' ||
       typeof row.actorType !== 'string' ||
       !isIsoDate(row.createdAt) ||
+      !isIsoDate(row.signedAt) ||
       typeof row.signature !== 'string' ||
       !Number.isSafeInteger(row.keyVersion) ||
       row.keyVersion < 1
@@ -4512,7 +4682,7 @@ function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
       Date.parse(root.periodStart) >= Date.parse(root.periodEnd) ||
       !Number.isSafeInteger(root.rowCount) ||
       root.rowCount < 1 ||
-      typeof root.rootHash !== 'string' ||
+      decodeBase64Strict(root.rootHash, 32) === null ||
       hashes.has(root.rootHash) ||
       typeof root.signature !== 'string' ||
       !Number.isSafeInteger(root.keyVersion) ||
@@ -4520,7 +4690,21 @@ function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
       !isIsoDate(root.signedAt) ||
       (root.anchoredAt !== null && !isIsoDate(root.anchoredAt)) ||
       (root.anchorReceipt !== null && typeof root.anchorReceipt !== 'string') ||
-      (root.anchorReceipts !== undefined && !Array.isArray(root.anchorReceipts))
+      (root.anchorReceipts !== undefined &&
+        (!Array.isArray(root.anchorReceipts) ||
+          !root.anchorReceipts.every(
+            (entry) =>
+              entry &&
+              typeof entry === 'object' &&
+              typeof entry.provider === 'string' &&
+              entry.provider.length > 0 &&
+              typeof entry.receipt === 'string' &&
+              entry.receipt.length > 0 &&
+              isIsoDate(entry.anchoredAt),
+          ))) ||
+      (root.signatureAlgorithm !== undefined &&
+        root.signatureAlgorithm !== 'Ed25519' &&
+        root.signatureAlgorithm !== 'ECDSA_P256_SHA256')
     ) {
       throw new Error(`roots.ndjson.gz has an invalid/duplicate root: ${String(root?.id)}`);
     }

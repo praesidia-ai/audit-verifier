@@ -91,6 +91,22 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     expect(zip.readUInt16LE(4)).toBe(45);
   });
 
+  it('rejects a ZIP64 EOCD whose declared record size does not end at the locator', () => {
+    const zip = writeZip(
+      [{ name: 'f', data: Buffer.from('x', 'utf8') }],
+      { forceZip64: true },
+    );
+    const corrupted = Buffer.from(zip);
+    const eocdOffset = corrupted.length - 22;
+    const zip64EocdOffset = Number(
+      corrupted.readBigUInt64LE(eocdOffset - 20 + 8),
+    );
+    corrupted.writeBigUInt64LE(45n, zip64EocdOffset + 4);
+    expect(() => readZip(corrupted)).toThrow(
+      /ZIP64 EOCD record size is invalid or does not end at its locator/,
+    );
+  });
+
   it('reader rejects classic EOCD with sentinel but missing ZIP64 locator', () => {
     // Build a valid small archive then corrupt its classic EOCD so
     // it falsely claims ZIP64 sentinels without a locator. This is
@@ -189,6 +205,27 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     const nameLength = corrupted.readUInt16LE(26);
     corrupted[30 + nameLength] = corrupted[30 + nameLength]! ^ 0xff;
     expect(() => readZip(corrupted)).toThrow(/CRC-32 mismatch/);
+  });
+
+  it('rejects a local CRC that disagrees with the central directory', () => {
+    const zip = writeZip([{ name: 'a.txt', data: Buffer.from('hello') }]);
+    const corrupted = Buffer.from(zip);
+    corrupted.writeUInt32LE(
+      (corrupted.readUInt32LE(14) ^ 0xffffffff) >>> 0,
+      14,
+    );
+    expect(() => readZip(corrupted)).toThrow(
+      /local\/central CRC or size mismatch/,
+    );
+  });
+
+  it('rejects local sizes that disagree with the central directory', () => {
+    const zip = writeZip([{ name: 'a.txt', data: Buffer.from('hello') }]);
+    const corrupted = Buffer.from(zip);
+    corrupted.writeUInt32LE(corrupted.readUInt32LE(18) + 1, 18);
+    expect(() => readZip(corrupted)).toThrow(
+      /local\/central CRC or size mismatch/,
+    );
   });
 
   it('rejects a local/central filename mismatch', () => {
