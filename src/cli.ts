@@ -115,7 +115,11 @@ function statusWord(status: VerifyReport['status'] | ComponentResult['status']):
   }
 }
 
-function printReport(report: VerifyReport, quiet: boolean): void {
+function printReport(
+  report: VerifyReport,
+  quiet: boolean,
+  noRekor: boolean,
+): void {
   if (quiet) {
     process.stdout.write(`${statusWord(report.status)}\n`);
     return;
@@ -178,10 +182,10 @@ function printReport(report: VerifyReport, quiet: boolean): void {
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
   // Rekor witness was verified" when the caller explicitly skipped that
   // check. Repeat the caveat as its own line so it survives a skim.
-  if (report.rekor.reason?.startsWith('rekor_check_skipped_by_caller')) {
+  if (noRekor) {
     lines.push(
       'NOTE: --no-rekor was passed — the external Rekor witness was NOT checked. ' +
-        'This result does not confirm or rule out anchoring.',
+        'Non-Rekor anchors were still evaluated when present.',
     );
   }
   // MIL-0002 — `--allow-legacy-unattested` is an explicit, loudly-logged
@@ -286,7 +290,7 @@ async function main(): Promise<number> {
     // parser. `--quiet` is ignored when `--json` is also passed.
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    printReport(report, args.quiet);
+    printReport(report, args.quiet, args.noRekor);
   }
   // PA-0009 (D15) — exit code is a function of `report.status`, not `ok`:
   // 0 valid, 1 invalid, 3 incomplete. `unsupported` never appears at the

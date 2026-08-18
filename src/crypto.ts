@@ -172,6 +172,8 @@ export function decodeBase64Strict(
   if (
     typeof value !== 'string' ||
     value.length === 0 ||
+    (expectedLength !== undefined &&
+      value.length !== Math.ceil(expectedLength / 3) * 4) ||
     value.length % 4 !== 0 ||
     !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
       value,
@@ -290,7 +292,15 @@ export function verifyEcdsaP256(
   publicKey: Uint8Array,
 ): boolean {
   try {
-    if (typeof signatureB64 !== 'string' || signatureB64.length === 0) {
+    // A canonical DER-encoded P-256 signature is at most 72 bytes, hence
+    // exactly at most 96 base64 characters. Bound the input before decoding
+    // so a hostile bundle cannot turn a signature field into an avoidable
+    // large allocation.
+    if (
+      typeof signatureB64 !== 'string' ||
+      signatureB64.length === 0 ||
+      signatureB64.length > 96
+    ) {
       return false;
     }
     if (publicKey.length === 0) {
@@ -314,6 +324,16 @@ export function verifyEcdsaP256(
       format: 'der',
       type: 'spki',
     });
+    // `crypto.verify('sha256', ...)` also accepts other EC curves. The wire
+    // algorithm, however, promises P-256 specifically; accepting a P-384
+    // key under that label is algorithm confusion and diverges from the KMS
+    // producer contract (`ECC_NIST_P256`).
+    if (
+      keyObject.asymmetricKeyType !== 'ec' ||
+      keyObject.asymmetricKeyDetails?.namedCurve !== 'prime256v1'
+    ) {
+      return false;
+    }
     return crypto.verify('sha256', Buffer.from(message), keyObject, sig);
   } catch {
     return false;

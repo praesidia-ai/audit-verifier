@@ -196,6 +196,34 @@ describe('audit-verifier ECDSA-P256 low-s gate (AUDIT-2026-05/21)', () => {
     ).toBe(false);
   });
 
+  it('rejects a valid P-384 signature mislabeled as ECDSA-P256', () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
+      namedCurve: 'P-384',
+    });
+    const message = Buffer.from('wrong curve', 'utf8');
+    const signature = crypto.sign('sha256', message, privateKey);
+    const spki = new Uint8Array(
+      publicKey.export({ format: 'der', type: 'spki' }),
+    );
+
+    expect(crypto.verify('sha256', message, publicKey, signature)).toBe(true);
+    expect(
+      verifyEcdsaP256(message, signature.toString('base64'), spki),
+    ).toBe(false);
+  });
+
+  it('rejects oversized signature text before base64 decoding', () => {
+    const { publicKey } = crypto.generateKeyPairSync('ec', {
+      namedCurve: 'P-256',
+    });
+    const spki = new Uint8Array(
+      publicKey.export({ format: 'der', type: 'spki' }),
+    );
+    expect(verifyEcdsaP256(Buffer.from('m'), 'A'.repeat(100), spki)).toBe(
+      false,
+    );
+  });
+
   it('rejects non-canonical base64 instead of ignoring junk', () => {
     const canonical = Buffer.from('strict byte').toString('base64');
     expect(decodeBase64Strict(canonical)?.toString()).toBe('strict byte');

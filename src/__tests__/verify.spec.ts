@@ -40,6 +40,7 @@ import {
   GENESIS_PREV_ROW_HASH,
 } from '../crypto.js';
 import { writeZip, gzipDeterministic, readZip } from '../zip.js';
+import { verifyRekorReceipt } from '../rekor.js';
 
 // Most fixtures intentionally model pre-attestation legacy bundles. Their
 // crypto assertions opt in explicitly; dedicated trust-boundary tests below
@@ -445,6 +446,20 @@ function readBundleEntries(zip: Buffer): Map<string, Buffer> {
   const out = new Map<string, Buffer>();
   for (const e of readZip(zip)) out.set(e.name, e.data);
   return out;
+}
+
+/** Repack a fixture while replacing exactly one named entry. */
+function replaceBundleEntry(
+  zip: Buffer,
+  name: string,
+  data: Buffer,
+): Buffer {
+  return writeZip(
+    readZip(zip).map((entry) => ({
+      name: entry.name,
+      data: entry.name === name ? data : entry.data,
+    })),
+  );
 }
 
 function rebuildWithProofs(proofs: FixtureProof[]): Buffer {
@@ -890,6 +905,82 @@ describe('verifyBundle', () => {
    * in the signed set) must fail the `keyBinding` component.
    */
   describe('BUG-AUDIT-03 — key binding cross-check', () => {
+    it('rejects non-canonical public-key version names before verification', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const key = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const zip = replaceBundleEntry(
+        base.zip,
+        'public-keys.json',
+        Buffer.from(JSON.stringify({ '01': key['1'] }), 'utf8'),
+      );
+
+      await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
+        /non-canonical positive key version: 01/,
+      );
+    });
+
+    it('rejects identical key material reused under multiple versions', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const keys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const zip = replaceBundleEntry(
+        base.zip,
+        'public-keys.json',
+        Buffer.from(
+          JSON.stringify({ '1': keys['1'], '2': keys['1'] }),
+          'utf8',
+        ),
+      );
+
+      await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
+        /reuses identical key material for key versions 1 and 2/,
+      );
+    });
+
+    it('fails when a signed manifest key is suppressed from public-keys.json', async () => {
+      const base = buildFixtureBundle();
+      const entries = readBundleEntries(base.zip);
+      const manifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as {
+        keyVersions: Array<{ keyVersion: number; publicKey: string }>;
+        signature: string;
+        signatureKeyVersion: number;
+        [key: string]: unknown;
+      };
+      const extraKey = keypairFromSeed(Buffer.alloc(32, 8));
+      manifest.keyVersions.push({
+        keyVersion: 2,
+        publicKey: Buffer.from(extraKey.publicKey).toString('base64'),
+      });
+      const {
+        signature: _oldSignature,
+        signatureKeyVersion: _signatureKeyVersion,
+        ...signable
+      } = manifest;
+      manifest.signature = signEd25519(
+        canonicalJson(signable),
+        Buffer.alloc(32, 7),
+      );
+      const zip = replaceBundleEntry(
+        base.zip,
+        'manifest.json',
+        Buffer.from(JSON.stringify(manifest), 'utf8'),
+      );
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.manifest.ok).toBe(true);
+      expect(report.keyBinding.ok).toBe(false);
+      expect(report.keyBinding.reason).toContain(
+        'signed_key_missing_from_public_keys',
+      );
+    });
+
     it('fails when public-keys.json is swapped for a key not in the signed manifest', async () => {
       const base = buildFixtureBundle();
       const entries = readBundleEntries(base.zip);
@@ -1456,7 +1547,12 @@ describe('verifyBundle', () => {
 
       // BUGHUNT-SDK-05 — dispatch/counting test; stub the rekor crypto.
       const report = await verifyBundle(zip, {
-        rekorFetcher: async () => true,
+        rekorFetcher: async (_receipt, expectedRoot) => {
+          expect(expectedRoot.rootHash).toBe(
+            buildFixtureBundle().roots[0]!.rootHash,
+          );
+          return true;
+        },
       });
       expect(report.ok).toBe(true);
       expect(report.rekor.ok).toBe(true);
@@ -1570,6 +1666,23 @@ describe('verifyBundle', () => {
       expect(report.rekor.reason).toContain('malformed');
     });
 
+    it('rejects oversized receipt metadata before verification', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 'rekor',
+          receipt: 'x'.repeat(1024 * 1024 + 1),
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+      ]);
+      await expect(verifyBundle(zip)).rejects.toThrow(
+        /roots\.ndjson\.gz has an invalid\/duplicate root/,
+      );
+      expect(verifyRekorReceipt('x'.repeat(1024 * 1024 + 1))).toEqual({
+        ok: false,
+        reason: 'receipt_too_large',
+      });
+    });
+
     it('fails closed for a well-formed s3 receipt without an online verifier', async () => {
       const zip = rebuildWithReceipts([
         {
@@ -1583,8 +1696,61 @@ describe('verifyBundle', () => {
       expect(report.rekor.reason).toContain('unverifiable_offline');
     });
 
+    it('--no-rekor does not bypass a present S3 receipt', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 's3',
+          receipt: 's3:my-bucket:audit-roots/period.json:v123',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+      ]);
+
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.ok).toBe(false);
+      expect(report.rekor.checked).toBe(1);
+      expect(report.rekor.failed).toBe(1);
+      expect(report.rekor.reason).toContain('s3');
+      expect(report.rekor.reason).toContain('unverifiable_offline');
+    });
+
+    it('--no-rekor skips only Rekor while still verifying another provider', async () => {
+      const zip = rebuildWithReceipts([
+        {
+          provider: 'rekor',
+          receipt: '{"logIndex":9001}',
+          anchoredAt: '2026-05-01T01:00:00.000Z',
+        },
+        {
+          provider: 's3',
+          receipt: 's3:my-bucket:audit-roots/period.json:v123',
+          anchoredAt: '2026-05-01T01:00:05.000Z',
+        },
+      ]);
+      const calls: string[] = [];
+
+      const report = await verifyBundle(zip, {
+        noRekor: true,
+        anchorReceiptVerifier: async (entry, expectedRoot) => {
+          calls.push(entry.provider);
+          expect(expectedRoot.rootHash).toBe(buildFixtureBundle().roots[0]!.rootHash);
+          return { ok: true };
+        },
+      });
+
+      expect(report.ok).toBe(true);
+      expect(report.rekor.checked).toBe(1);
+      expect(report.rekor.failed).toBe(0);
+      expect(report.rekor.reason).toContain('rekor_check_skipped_by_caller');
+      expect(calls).toEqual(['s3']);
+    });
+
     it('honours a caller-supplied anchorReceiptVerifier for ALL providers (overrides defaults)', async () => {
-      const calls: Array<{ provider: string; receipt: string }> = [];
+      const calls: Array<{
+        provider: string;
+        receipt: string;
+        rootHash: string;
+        signature: string;
+      }> = [];
       const zip = rebuildWithReceipts([
         {
           provider: 'rekor',
@@ -1599,18 +1765,29 @@ describe('verifyBundle', () => {
       ]);
 
       const report = await verifyBundle(zip, {
-        anchorReceiptVerifier: async (entry) => {
-          calls.push({ provider: entry.provider, receipt: entry.receipt });
+        anchorReceiptVerifier: async (entry, expectedRoot) => {
+          calls.push({
+            provider: entry.provider,
+            receipt: entry.receipt,
+            rootHash: expectedRoot.rootHash,
+            signature: expectedRoot.signature,
+          });
           return { ok: true };
         },
       });
 
       expect(report.ok).toBe(true);
       expect(report.rekor.ok).toBe(true);
-      expect(calls).toEqual([
-        { provider: 'rekor', receipt: 'rekor:9001' },
-        { provider: 's3', receipt: 's3:b:k:v' },
-      ]);
+      expect(calls).toEqual(
+        [
+          { provider: 'rekor', receipt: 'rekor:9001' },
+          { provider: 's3', receipt: 's3:b:k:v' },
+        ].map((entry) => ({
+          ...entry,
+          rootHash: buildFixtureBundle().roots[0]!.rootHash,
+          signature: buildFixtureBundle().roots[0]!.signature,
+        })),
+      );
     });
   });
 

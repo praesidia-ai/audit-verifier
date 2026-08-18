@@ -138,11 +138,13 @@ checks every cryptographic invariant the bundle commits to:
      means only SOME roots lack a receipt while others have one — a much
      narrower, more concerning gap (e.g. an anchoring outage or a deleted
      receipt). These are different findings; do not treat them the same.
-   - `--no-rekor` skips the check entirely (`reason:
+   - `--no-rekor` skips Rekor receipts (`reason:
      'rekor_check_skipped_by_caller: ...'`) — this is a CALLER opt-out, not
-     a verdict about whether anchoring exists. `praesidia-verify`'s output
-     prints an explicit `NOTE:` line whenever this flag was used, so a
-     skimmed `RESULT: OK` cannot be mistaken for "anchoring was verified".
+     a verdict about whether Rekor anchoring exists. Other receipt providers
+     (including S3) remain in scope and still fail closed unless their own
+     verifier succeeds. `praesidia-verify` prints an explicit `NOTE:` line
+     whenever this flag was used, so a skimmed `RESULT: OK` cannot be
+     mistaken for "Rekor anchoring was verified".
 7. **Completeness** — the number of rows / roots actually present must
    equal the SIGNED `manifest.rowCount` / `manifest.rootCount`. This
    fails closed on a whole-bundle trailing-truncation attack, where an
@@ -325,8 +327,10 @@ checks every cryptographic invariant the bundle commits to:
 
 S3 anchor receipts cannot be proven offline from their locator string alone.
 The library therefore fails closed for S3 by default; callers can provide an
-`anchorReceiptVerifier` that validates the object/version against their S3
-trust boundary.
+`anchorReceiptVerifier`. The hook receives the exact expected bundle root as
+its second argument and must GET the immutable object version, compare the
+stored root hash/signature and other available fields to that expected root,
+and validate retention. A HEAD-only existence/lock check is insufficient.
 
 `manifest.version` is checked against an explicit ceiling
 (`MAX_SUPPORTED_MANIFEST_VERSION`, currently 5) — a bundle declaring a newer
@@ -359,9 +363,11 @@ fields in the same change.
   entry naming the exact same period+root (invariant 12) is reported as a
   distinct, named `seal_exempted` pass instead — an UNEXPLAINED shrinkage
   (no matching verified seal) still fails closed exactly as before.
-- If Rekor/S3 anchoring is present and not skipped via `--no-rekor`, that
-  the anchor receipt is a genuine, cryptographically valid transparency-log
-  entry bound to the exact root hash in the bundle.
+- For Rekor, unless skipped via `--no-rekor`, that the receipt is a genuine,
+  cryptographically valid transparency-log entry bound to the exact root hash
+  and signature in the bundle. For S3 or another provider, that the explicitly
+  trusted caller hook accepted the receipt after receiving the expected root
+  it must bind to.
 - If `platform-attestation.json` is present (or `--allow-legacy-unattested`
   is NOT passed), that Praesidia's platform — not just the tenant — vouched
   for the key-to-org binding.
@@ -408,12 +414,10 @@ fields in the same change.
   fails closed exactly as before — this closes the false-positive ONLY
   when the producer actually ships the matching evidence, it does not
   weaken the check for bundles that don't.
-- **That Rekor/S3 anchoring exists at all**, unless you read the `rekor`
-  component specifically. A bundle can report overall `ok: true` while
-  `rekor.reason` says `no_external_witness` (this deployment has anchoring
-  off) — that is a materially weaker guarantee than an anchored bundle, and
-  `--no-rekor` weakens it further by not checking at all. Read the `rekor`
-  component, not just the top-level `ok`, before treating a bundle as
+- **That Rekor anchoring exists at all when `--no-rekor` is used.** That flag
+  permits roots without Rekor evidence but no longer bypasses S3 or other
+  provider receipts that are present. Read the `rekor` component and the
+  explicit CLI note, not just top-level `ok`, before treating a bundle as
   Rekor-witnessed.
 - **That a REVOKED key's pre-revocation signatures are trustworthy.** This
   verifier rejects EVERY signature made under a revoked key, including ones

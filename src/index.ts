@@ -13,4 +13,6 @@ export type {
   ComponentResult,
   ComponentStatus,
   VerifyOptions,
+  AnchorReceiptEntry,
+  ExpectedAnchorRoot,
 } from './verify.js';

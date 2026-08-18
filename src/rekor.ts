@@ -28,6 +28,11 @@
 
 import * as crypto from 'node:crypto';
 
+// Public Rekor v1 limits uploaded attestations to 100 KiB. Leave ample room
+// for the SET, inclusion proof, and private-instance metadata while still
+// bounding direct library calls before JSON/base64 processing.
+const MAX_REKOR_RECEIPT_BYTES = 1024 * 1024;
+
 // ── Pinned Sigstore Rekor signing key ────────────────────────────────────
 //
 // Vendored verbatim from be-core `rekor-public-keys.ts`
@@ -401,6 +406,12 @@ export function verifyRekorReceipt(
   overridePem?: string,
   expectedRoot?: ExpectedRekorRoot,
 ): RekorVerifyResult {
+  if (
+    typeof receiptJson !== 'string' ||
+    Buffer.byteLength(receiptJson, 'utf8') > MAX_REKOR_RECEIPT_BYTES
+  ) {
+    return { ok: false, reason: 'receipt_too_large' };
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(receiptJson);

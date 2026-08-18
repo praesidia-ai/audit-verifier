@@ -861,7 +861,10 @@ export interface VerifyOptions {
    * default that returned `true` for any valid JSON. Receives the raw
    * receipt string; returns `true` on success.
    */
-  rekorFetcher?: (anchorReceipt: string) => Promise<boolean>;
+  rekorFetcher?: (
+    anchorReceipt: string,
+    expectedRoot: ExpectedAnchorRoot,
+  ) => Promise<boolean>;
   /**
    * BUGHUNT-SDK-05 — Override the pinned Rekor signing public key (PEM
    * SPKI, EC P-256) used to verify the SET. Defaults to the Sigstore
@@ -883,15 +886,19 @@ export interface VerifyOptions {
    *   - other       → reported as
    *                   `{ ok: false, reason: 'unknown_provider' }` and
    *                   counted as a failure in `report.rekor`. The
-   *                   overall bundle still verifies if every other
-   *                   anchor passes; the unknown entry surfaces in
-   *                   `firstFailure` so the auditor can investigate.
+   *                   overall bundle fails closed; the unknown entry
+   *                   surfaces in `firstFailure` so the auditor can
+   *                   investigate.
+   *
+   * The second argument is the exact bundle root the receipt must bind to.
+   * An S3 implementation must GET the immutable object version, compare its
+   * root hash/signature and other available fields to `expectedRoot`, and
+   * validate retention. A HEAD-only existence check is not sufficient.
    */
-  anchorReceiptVerifier?: (entry: {
-    provider: string;
-    receipt: string;
-    anchoredAt: string;
-  }) => Promise<{ ok: boolean; reason?: string }>;
+  anchorReceiptVerifier?: (
+    entry: AnchorReceiptEntry,
+    expectedRoot: ExpectedAnchorRoot,
+  ) => Promise<{ ok: boolean; reason?: string }>;
   /**
    * AUDIT-2026-05-30 — Override the pinned platform public key. The
    * default is the bytes baked into the CLI release (see
@@ -908,6 +915,26 @@ export interface VerifyOptions {
    * self-signed bundle cannot pass without an external platform trust anchor.
    */
   allowLegacyUnattested?: boolean;
+}
+
+export interface AnchorReceiptEntry {
+  provider: string;
+  receipt: string;
+  anchoredAt: string;
+}
+
+/** Root values an online receipt verifier must bind its evidence to. */
+export interface ExpectedAnchorRoot {
+  id: string;
+  organizationId: string;
+  rootHash: string;
+  signature: string;
+  keyVersion: number;
+  signatureAlgorithm?: BundleSignatureAlgorithm;
+  periodStart: string;
+  periodEnd: string;
+  rowCount: number;
+  signedAt: string;
 }
 
 /**
@@ -1020,14 +1047,31 @@ export async function verifyBundle(
   }
   const publicKeysRaw = publicKeysParsed as Record<string, unknown>;
   const publicKeys = new Map<number, PublicKeyRecord>();
+  const keyMaterialOwners = new Map<string, string>();
   for (const [k, v] of Object.entries(publicKeysRaw)) {
     const ver = Number(k);
-    if (!Number.isInteger(ver)) {
+    if (!/^[1-9]\d*$/.test(k) || !Number.isSafeInteger(ver) || ver < 1) {
       throw new Error(
-        `public-keys.json contains non-integer key version: ${k}`,
+        `public-keys.json contains a non-canonical positive key version: ${k}`,
       );
     }
-    publicKeys.set(ver, parsePublicKeyEntry(v, k));
+    const record = parsePublicKeyEntry(v, k);
+    const fingerprint = crypto
+      .createHash('sha256')
+      .update(record.publicKey)
+      .digest('hex');
+    const priorOwner = keyMaterialOwners.get(fingerprint);
+    if (priorOwner !== undefined) {
+      // keyVersion is unsigned signature metadata on rows, roots, and the
+      // manifest. Reusing the same key bytes under two lifecycle records
+      // would let an attacker relabel a REVOKED signature as the ACTIVE
+      // alias without changing the signature itself.
+      throw new Error(
+        `public-keys.json reuses identical key material for key versions ${priorOwner} and ${k}`,
+      );
+    }
+    keyMaterialOwners.set(fingerprint, k);
+    publicKeys.set(ver, record);
   }
 
   // 3) Verify manifest signature.
@@ -1681,6 +1725,20 @@ function verifyKeyBinding(
           reason = `key_revoked_at_mismatch: public-keys.json[${k}] revokedAt differs from the signed manifest.keyVersions[${k}]`;
         }
       }
+    }
+  }
+
+  // Exact-set binding in the other direction: a signed manifest key must
+  // not disappear from the unsigned lookup file merely because no surviving
+  // row happens to reference it. Suppression is still a bundle-integrity
+  // mismatch and can otherwise hide lifecycle history from an auditor.
+  for (const ver of signed.keys()) {
+    if (publicKeys.has(ver)) continue;
+    checked += 1;
+    failed += 1;
+    if (firstFailure === undefined) {
+      firstFailure = String(ver);
+      reason = `signed_key_missing_from_public_keys: manifest.keyVersions declares keyVersion ${ver} which is absent from public-keys.json`;
     }
   }
 
@@ -3826,25 +3884,18 @@ async function verifyRekorReceipts(
   roots: BundleRoot[],
   options: VerifyOptions,
 ): Promise<RawComponentResult> {
-  if (options.noRekor) {
+  if (roots.length === 0) {
     return {
       ok: true,
       checked: 0,
       failed: 0,
-      // PROD16 F8 (be-compliance) — `ok:true` here must NEVER be read as
-      // "anchoring was verified". The caller explicitly chose not to
-      // check the external Sigstore/S3 witness at all; this bundle's
-      // pass/fail rests entirely on the tenant + platform signatures
-      // above, with no independent bound on how long ago the roots could
-      // have been forged. Distinct, on purpose, from `no_external_witness`
-      // below (a PRODUCER configuration fact) — this one is a CALLER
-      // choice.
-      reason:
-        'rekor_check_skipped_by_caller: --no-rekor was passed — the external Sigstore witness was NOT checked. This does not mean anchoring is absent or present; it means this run did not look.',
+      ...(options.noRekor
+        ? {
+            reason:
+              'rekor_check_skipped_by_caller: --no-rekor was passed — Rekor receipts were NOT checked; non-Rekor anchors, if present, remain in scope.',
+          }
+        : {}),
     };
-  }
-  if (roots.length === 0) {
-    return { ok: true, checked: 0, failed: 0 };
   }
 
   const perRoot = roots.map((root) => ({
@@ -3855,10 +3906,19 @@ async function verifyRekorReceipts(
 
   let checked = 0;
   let failed = 0;
+  let skippedRekor = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
   for (const { root, entries } of perRoot) {
     if (entries.length === 0) {
+      if (options.noRekor) {
+        // Historical `--no-rekor` semantics allow roots without a Rekor
+        // receipt. This opt-out must not also bypass an S3/private-notary
+        // receipt that is actually present, so non-Rekor entries continue
+        // through the normal verifier below.
+        skippedRekor += 1;
+        continue;
+      }
       checked += 1;
       failed += 1;
       if (!firstFailure) {
@@ -3882,6 +3942,10 @@ async function verifyRekorReceipts(
       continue;
     }
     for (const entry of entries) {
+      if (options.noRekor && entry.provider === 'rekor') {
+        skippedRekor += 1;
+        continue;
+      }
       checked += 1;
       let result: { ok: boolean; reason?: string };
       try {
@@ -3910,7 +3974,14 @@ async function verifyRekorReceipts(
     checked,
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
-    ...(reason !== undefined ? { reason } : {}),
+    ...(reason !== undefined
+      ? { reason }
+      : options.noRekor && skippedRekor > 0
+        ? {
+            reason:
+              'rekor_check_skipped_by_caller: --no-rekor was passed — Rekor receipts were NOT checked; non-Rekor anchors, if present, were still evaluated.',
+          }
+        : {}),
   };
 }
 
@@ -3922,7 +3993,7 @@ async function verifyRekorReceipts(
  */
 function collectAnchorEntries(
   root: BundleRoot,
-): Array<{ provider: string; receipt: string; anchoredAt: string }> {
+): AnchorReceiptEntry[] {
   if (Array.isArray(root.anchorReceipts) && root.anchorReceipts.length > 0) {
     return root.anchorReceipts;
   }
@@ -3954,14 +4025,28 @@ function collectAnchorEntries(
  */
 async function verifyAnchorReceipt(
   root: BundleRoot,
-  entry: { provider: string; receipt: string; anchoredAt: string },
+  entry: AnchorReceiptEntry,
   options: VerifyOptions,
 ): Promise<{ ok: boolean; reason?: string }> {
   if (typeof entry.receipt !== 'string' || entry.receipt.length === 0) {
     return { ok: false, reason: 'empty_receipt' };
   }
+  const expectedRoot: ExpectedAnchorRoot = {
+    id: root.id,
+    organizationId: root.organizationId,
+    rootHash: root.rootHash,
+    signature: root.signature,
+    keyVersion: root.keyVersion,
+    ...(root.signatureAlgorithm !== undefined
+      ? { signatureAlgorithm: root.signatureAlgorithm }
+      : {}),
+    periodStart: root.periodStart,
+    periodEnd: root.periodEnd,
+    rowCount: root.rowCount,
+    signedAt: root.signedAt,
+  };
   if (options.anchorReceiptVerifier) {
-    return options.anchorReceiptVerifier(entry);
+    return options.anchorReceiptVerifier(entry, expectedRoot);
   }
   if (entry.provider === 'rekor') {
     // BUGHUNT-SDK-05 — a caller-supplied `rekorFetcher` is still honoured
@@ -3969,7 +4054,7 @@ async function verifyAnchorReceipt(
     // real offline cryptographic verification (SET + inclusion proof),
     // not the old `JSON.parse`-and-return-true false assurance.
     if (options.rekorFetcher) {
-      const ok = await options.rekorFetcher(entry.receipt);
+      const ok = await options.rekorFetcher(entry.receipt, expectedRoot);
       return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
     }
     return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem, {
@@ -4119,7 +4204,8 @@ function verifyPlatformAttestation(
       reason: 'platform_key_not_pinned',
     };
   }
-  const pinnedDer = decodeBase64Strict(pinnedB64);
+  const pinnedDer =
+    pinnedB64.length <= 512 ? decodeBase64Strict(pinnedB64) : null;
   if (pinnedDer === null) {
     return {
       ok: false,
@@ -4397,18 +4483,34 @@ function assertManifestStructure(manifest: BundleManifest): void {
     throw new Error('manifest.json has an invalid structure');
   }
   const versions = new Set<number>();
+  const keyFingerprints = new Set<string>();
   for (const key of manifest.keyVersions) {
+    const decodedPublicKey =
+      typeof key?.publicKey === 'string' && key.publicKey.length <= 512
+        ? decodeBase64Strict(key.publicKey)
+        : null;
+    const fingerprint =
+      decodedPublicKey === null
+        ? null
+        : crypto
+            .createHash('sha256')
+            .update(decodedPublicKey)
+            .digest('hex');
     if (
       !key ||
       typeof key !== 'object' ||
       !Number.isSafeInteger(key.keyVersion) ||
       key.keyVersion < 1 ||
-      typeof key.publicKey !== 'string' ||
-      versions.has(key.keyVersion)
+      decodedPublicKey === null ||
+      decodedPublicKey.length === 0 ||
+      fingerprint === null ||
+      versions.has(key.keyVersion) ||
+      keyFingerprints.has(fingerprint)
     ) {
       throw new Error('manifest.json contains an invalid/duplicate keyVersion');
     }
     versions.add(key.keyVersion);
+    keyFingerprints.add(fingerprint);
   }
   // PROD16 §1b — basic type sanity for the two v3-only fields, IF present
   // at all (their presence-vs-absence relative to `manifest.version` is a
@@ -4689,17 +4791,23 @@ function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
       root.keyVersion < 1 ||
       !isIsoDate(root.signedAt) ||
       (root.anchoredAt !== null && !isIsoDate(root.anchoredAt)) ||
-      (root.anchorReceipt !== null && typeof root.anchorReceipt !== 'string') ||
+      (root.anchorReceipt !== null &&
+        (typeof root.anchorReceipt !== 'string' ||
+          root.anchorReceipt.length === 0 ||
+          Buffer.byteLength(root.anchorReceipt, 'utf8') > 1024 * 1024)) ||
       (root.anchorReceipts !== undefined &&
         (!Array.isArray(root.anchorReceipts) ||
+          root.anchorReceipts.length > 64 ||
           !root.anchorReceipts.every(
             (entry) =>
               entry &&
               typeof entry === 'object' &&
               typeof entry.provider === 'string' &&
               entry.provider.length > 0 &&
+              entry.provider.length <= 64 &&
               typeof entry.receipt === 'string' &&
               entry.receipt.length > 0 &&
+              Buffer.byteLength(entry.receipt, 'utf8') <= 1024 * 1024 &&
               isIsoDate(entry.anchoredAt),
           ))) ||
       (root.signatureAlgorithm !== undefined &&
@@ -4773,6 +4881,9 @@ function signableRow(row: BundleRow): Record<string, unknown> {
  */
 function computeLeaf(row: BundleRow): Uint8Array | null {
   const canonical = canonicalJson(signableRow(row));
+  if (typeof row.signature !== 'string' || row.signature.length > 96) {
+    return null;
+  }
   const sigBytes = decodeBase64Strict(row.signature);
   if (sigBytes === null) return null;
   return new Uint8Array(Buffer.concat([canonical, sigBytes]));
@@ -4785,6 +4896,9 @@ function computeLeaf(row: BundleRow): Uint8Array | null {
  */
 function computeChainLink(prev: BundleRow): string | null {
   const canonical = canonicalJson(signableRow(prev));
+  if (typeof prev.signature !== 'string' || prev.signature.length > 96) {
+    return null;
+  }
   const sigBytes = decodeBase64Strict(prev.signature);
   if (sigBytes === null) return null;
   return sha256(Buffer.concat([canonical, sigBytes])).toString('base64');
@@ -4817,7 +4931,7 @@ function parsePublicKeyEntry(
   versionKey: string,
 ): PublicKeyRecord {
   if (typeof raw === 'string') {
-    const publicKey = decodeBase64Strict(raw);
+    const publicKey = raw.length <= 512 ? decodeBase64Strict(raw) : null;
     if (publicKey === null || publicKey.length === 0) {
       throw new Error(
         `public-keys.json[${versionKey}] is not canonical base64`,
@@ -4861,7 +4975,10 @@ function parsePublicKeyEntry(
       }
       revokedAt = parsed;
     }
-    const publicKey = decodeBase64Strict(obj.publicKey);
+    const publicKey =
+      obj.publicKey.length <= 512
+        ? decodeBase64Strict(obj.publicKey)
+        : null;
     if (publicKey === null || publicKey.length === 0) {
       throw new Error(
         `public-keys.json[${versionKey}].publicKey is not canonical base64`,
