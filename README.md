@@ -526,9 +526,13 @@ This package is intentionally **decoupled** from `be-core`:
 
 ### 0.9.2 (MIL-0002 / CD-0002 — release-integrity hardening, no verification-strictness change)
 
-- **`npm publish --provenance`**, `id-token: write` permission on the (still human-gated,
-  `if: false`) publish workflow — a customer can confirm the exact published tarball corresponds
-  to a specific CI run/commit, not just trust an npm-token holder's say-so.
+- **`npm publish --provenance`**, `id-token: write` permission on the publish workflow — a
+  customer can confirm the exact published tarball corresponds to a specific CI run/commit, not
+  just trust an npm-token holder's say-so. The workflow's human gate is no longer a static
+  `if: false`: it now triggers only on an immutable `v*` tag whose value is checked against
+  `package.json` (a human still has to cut and push that tag), and `npm pack --dry-run` runs the
+  `prepack` hook — `scripts/assert-release-trust-anchor.mjs` — before the publish step, so the
+  job still cannot ship a tarball while `PLATFORM_PUBLIC_KEY_DER_B64`/`_FINGERPRINT` are empty.
 - **`npm audit --audit-level=high`** added to CI (previously the only repo in the monorepo
   without one). The pre-existing critical/high `vitest`→`vite`→`esbuild` devDependency chain
   advisories are resolved by upgrading `vitest` `2.1.9` → `4.1.10` (all 152 tests still pass
