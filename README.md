@@ -468,15 +468,14 @@ catch.
 
 - **Confirm the pin against a second, independently-operated channel** before trusting a
   `RESULT: OK` for anything consequential — never take `PLATFORM_PUBLIC_KEY_FINGERPRINT`
-  on the word of this package alone. **USER-OWED, pending the production key ceremony
-  (MIL-0003):** stand up a publication channel on infrastructure separate from the npm
-  registry and from `be-core`'s deploy pipeline (a static, independently-hosted page and/or
-  the `security.txt` contact response are the two candidates) and put its exact URL here
-  before the real key is pinned — a customer-facing README must never point at a channel
-  that does not yet exist. Once it does, compare that fingerprint, byte-for-byte, against
-  `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the exact tarball/commit you installed — `npm view
-  @praesidia/audit-verifier@<version> --json | jq .dist` lets you confirm the tarball hash
-  independently of `npm install`'s own trust.
+  on the word of this package alone. Full detail on where the fingerprint lives, what the
+  second channel must and must not share infrastructure with, and what to compare:
+  `docs/trust-anchor-verification.md`. **USER-OWED, pending the production key ceremony
+  (MIL-0003):** that document intentionally has no live channel URL yet — a customer-facing
+  document must never point at a channel that does not exist. Once the ceremony lands, compare
+  the published fingerprint, byte-for-byte, against `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the
+  exact tarball/commit you installed — `npm view @praesidia/audit-verifier@<version> --json |
+  jq .dist` lets you confirm the tarball hash independently of `npm install`'s own trust.
 - **`npm publish --provenance`** (MIL-0002 F4) means `npm view @praesidia/audit-verifier
   provenance` shows a SLSA attestation binding the published tarball to the exact GitHub
   Actions run, commit, and source repository that built it — a second, cryptographic check
@@ -488,7 +487,9 @@ catch.
   compromised *platform* key (as opposed to a per-tenant signing key, which already has
   one — see invariant 4). A key-hierarchy design that removes this constraint (an offline
   root that cross-signs rotating operational keys) is written up, not yet built:
-  `.claude/tickets/DESIGN-platform-key-hierarchy.md`.
+  `docs/design/platform-key-hierarchy.md` — including the concrete, stated limit that an
+  already-installed offline CLI cannot learn of a revocation before its next upgrade, which
+  no purely offline design can avoid.
 - **Until the production key ceremony lands**, this pin is intentionally empty and the
   verifier fails closed with `platform_key_not_pinned` on every bundle — see "Platform
   key-binding attestation" above and `src/platform-pubkey.ts`'s own docblock. That failure
@@ -554,7 +555,7 @@ This package is intentionally **decoupled** from `be-core`:
   existing bundle. `platform-pubkey.ts`'s empty trust-anchor pin and its fail-closed
   `platform_key_not_pinned` behavior are untouched and remain user-owed (production key
   ceremony, tracked with MIL-0003). A key-hierarchy design for in-band platform-key rotation is
-  written up (`.claude/tickets/DESIGN-platform-key-hierarchy.md`) but not built.
+  written up (`docs/design/platform-key-hierarchy.md`) but not built.
 
 ### 0.9.1 (PA-0033 — HIGH-1 security re-attack fix, `PA01-SEC-reattack.md`)
 
