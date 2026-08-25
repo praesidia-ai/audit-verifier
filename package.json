@@ -1,6 +1,6 @@
 {
   "name": "@praesidia/audit-verifier",
-  "version": "0.9.2",
+  "version": "0.10.0",
   "description": "Offline verifier CLI for Praesidia compliance bundles. Zero runtime dependencies.",
   "license": "Apache-2.0",
   "type": "module",

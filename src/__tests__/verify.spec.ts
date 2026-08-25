@@ -3479,6 +3479,257 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * SCAN-AV-01 (be-audit N1) — `detailsCommitment` REPLACES `summary`/
+   * `details` on the signed row (not additive alongside them, unlike
+   * `ipAddress`) for rows produced at/after be's own
+   * `AUDIT_DETAILS_COMMITMENT_CUTOVER_AT` activation
+   * (`be/src/config/audit-details-commitment-cutover.config.ts`). The
+   * verifier must include the key in the canonical preimage IFF the wire
+   * row carries it, with no cutover-date knowledge of its own — same
+   * discipline as PROD16 F6's `ipAddress` immediately above.
+   */
+  describe('SCAN-AV-01 — detailsCommitment signable field (exporter/verifier version skew)', () => {
+    /**
+     * Ground truth captured by executing be-core's REAL, unmodified
+     * `AuditCanonicalHelper.buildSignableRow` + `canonicalJson`
+     * (`be/src/audit/audit-canonical.helper.ts`,
+     * `be/src/common/security/utils/canonical-json.ts`) against a
+     * representative post-cutover row — NOT re-derived from this package's
+     * own `canonicalJson`. Signing over bytes this test computed with the
+     * same helper under test would prove nothing about producer/consumer
+     * agreement; this is the producer's actual output for:
+     *   organizationId=00000000-0000-0000-0000-000000000002,
+     *   action=agent.created, agentId=agent-0, createdAt=2026-07-01T00:00:00.000Z,
+     *   detailsCommitment=k2j9F3q7ZC1lM8n0pQdR5sTuVwXyZaBcDeFgHiJkLm=
+     * — captured once via a one-off script invoking be's plain (non-DI)
+     * helper directly, pinned here byte-for-byte.
+     */
+    const BE_REAL_CANONICAL_UTF8 =
+      '{"action":"agent.created","actorId":null,"actorType":"agent","agentId":"agent-0","createdAt":"2026-07-01T00:00:00.000Z","detailsCommitment":"k2j9F3q7ZC1lM8n0pQdR5sTuVwXyZaBcDeFgHiJkLm=","organizationId":"00000000-0000-0000-0000-000000000002","resourceId":null,"resourceType":"agent","teamId":null}';
+
+    function buildDetailsCommitmentFixtureBundle(opts: {
+      includeDetailsCommitment?: boolean;
+      detailsCommitment?: string | null;
+      tamperDetailsCommitmentPostSign?: boolean;
+    }): Buffer {
+      const seed = Buffer.alloc(32, 11);
+      const { publicKey, privateKey } = keypairFromSeed(seed);
+      const keyVersion = 1;
+      const orgId = '00000000-0000-0000-0000-000000000002';
+      const createdAt = '2026-07-01T00:00:00.000Z';
+
+      let basePartial: Record<string, unknown>;
+      let canonical: Buffer;
+      if (opts.includeDetailsCommitment) {
+        // Post-cutover shape: summary/details ABSENT, detailsCommitment
+        // present. Sign over be's REAL canonical bytes captured above, not
+        // bytes this package's own canonicalJson computes.
+        basePartial = {
+          organizationId: orgId,
+          action: 'agent.created',
+          actorId: null,
+          actorType: 'agent',
+          resourceType: 'agent',
+          resourceId: null,
+          teamId: null,
+          agentId: 'agent-0',
+          createdAt,
+          detailsCommitment:
+            opts.detailsCommitment ??
+            'k2j9F3q7ZC1lM8n0pQdR5sTuVwXyZaBcDeFgHiJkLm=',
+        };
+        canonical = Buffer.from(BE_REAL_CANONICAL_UTF8, 'utf8');
+      } else {
+        // Legacy/pre-cutover shape (mirrors the PROD16 F6 ipAddress
+        // fixture's own legacy base): summary/details present, no
+        // detailsCommitment key at all.
+        basePartial = {
+          organizationId: orgId,
+          action: 'agent.created',
+          actorId: null,
+          actorType: 'agent',
+          resourceType: 'agent',
+          resourceId: null,
+          teamId: null,
+          agentId: 'agent-0',
+          summary: 'Created agent',
+          details: null,
+          createdAt,
+        };
+        canonical = canonicalJson(basePartial);
+      }
+      const prevRowHash = GENESIS_PREV_ROW_HASH;
+      const rowMessage = Buffer.concat([
+        canonical,
+        Buffer.from(prevRowHash, 'base64'),
+      ]);
+      const signatureBase64 = signEd25519(rowMessage, privateKey);
+
+      const row: Record<string, unknown> = {
+        id: 'row-0',
+        ...basePartial,
+        signature: signatureBase64,
+        keyVersion,
+        signedAt: createdAt,
+        prevRowHash,
+      };
+      if (opts.tamperDetailsCommitmentPostSign) {
+        // Mutate AFTER signing — the signature must no longer verify.
+        row.detailsCommitment = 'tampered-commitment-value-not-signed==';
+      }
+
+      const leaf = new Uint8Array(
+        Buffer.concat([canonical, Buffer.from(signatureBase64, 'base64')]),
+      );
+      const tree = merkleBuild([leaf]);
+      const rootHashB64 = Buffer.from(tree.root).toString('base64');
+      const periodStart = createdAt;
+      const periodEnd = new Date(
+        Date.parse(createdAt) + 3600_000,
+      ).toISOString();
+      const rootMessage = canonicalJson({
+        rootHash: rootHashB64,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+      });
+      const rootSignature = signEd25519(rootMessage, privateKey);
+      const rootSignedAt = new Date(
+        Date.parse(periodEnd) + 5000,
+      ).toISOString();
+      const root = {
+        id: 'root-0',
+        organizationId: orgId,
+        periodStart,
+        periodEnd,
+        rowCount: 1,
+        rootHash: rootHashB64,
+        signature: rootSignature,
+        keyVersion,
+        signedAt: rootSignedAt,
+        anchoredAt: null,
+        anchorReceipt: null,
+      };
+      const proof = merkleProof([leaf], 0);
+      const proofEntry = {
+        rowId: 'row-0',
+        index: proof.index,
+        proof: proof.siblings.map((s) => Buffer.from(s).toString('base64')),
+        rootHash: rootHashB64,
+      };
+
+      const publicKeyB64 = Buffer.from(publicKey).toString('base64');
+      const generatedAt = new Date(
+        Date.parse(rootSignedAt) + 1000,
+      ).toISOString();
+      const manifestSans = {
+        version: 1,
+        orgId,
+        from: periodStart,
+        to: periodEnd,
+        rowCount: 1,
+        rootCount: 1,
+        keyVersions: [{ keyVersion, publicKey: publicKeyB64 }],
+        generatedAt,
+        signatureAlgorithm: 'Ed25519' as const,
+      };
+      const manifestSignature = signEd25519(
+        canonicalJson(manifestSans),
+        privateKey,
+      );
+      const manifest = {
+        ...manifestSans,
+        signature: manifestSignature,
+        signatureKeyVersion: keyVersion,
+      };
+
+      const publicKeys = { [String(keyVersion)]: publicKeyB64 };
+      return writeZip([
+        {
+          name: 'manifest.json',
+          data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+        },
+        {
+          name: 'rows.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(row) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'roots.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(root) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'proofs.ndjson.gz',
+          data: gzipDeterministic(
+            Buffer.from(JSON.stringify(proofEntry) + '\n', 'utf8'),
+          ),
+        },
+        {
+          name: 'public-keys.json',
+          data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
+        },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+      ]);
+    }
+
+    it('verifies a row signed with detailsCommitment present, using be-core\'s REAL captured canonical bytes (post-cutover shape)', async () => {
+      const zip = buildDetailsCommitmentFixtureBundle({
+        includeDetailsCommitment: true,
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.chain.ok).toBe(true);
+      expect(report.inclusionProofs.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('verifies a legacy row that never carries detailsCommitment (pre-cutover shape unaffected)', async () => {
+      const zip = buildDetailsCommitmentFixtureBundle({
+        includeDetailsCommitment: false,
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(true);
+      expect(report.ok).toBe(true);
+    });
+
+    it('rejects a row whose detailsCommitment is tampered after signing', async () => {
+      const zip = buildDetailsCommitmentFixtureBundle({
+        includeDetailsCommitment: true,
+        tamperDetailsCommitmentPostSign: true,
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.rowSignatures.ok).toBe(false);
+      expect(report.ok).toBe(false);
+    });
+  });
+
+  /**
+   * SCAN-AV-01 — this package's `canonicalJson` claims (crypto.ts docblock)
+   * to be "byte-for-byte identical to be-core's `canonicalJson`". Confirmed
+   * divergence found while adding `detailsCommitment` support: an object
+   * property whose value is `undefined` must be OMITTED entirely (matching
+   * be-core's `FT-DEFECT-be-audit-chain-signature-invalid-after-first-row`
+   * fix, `be/src/common/security/utils/canonical-json.ts`), not
+   * canonicalized as `"key":null`. Ground truth captured by executing
+   * be-core's REAL `canonicalJson({ a: undefined, b: 1, z: null })`.
+   * Without this fix, `signableRow()`'s unconditional `summary: row.summary,
+   * details: row.details` assignment (both `undefined` on a post-cutover
+   * wire row that omits those keys) would inject a spurious
+   * `"summary":null,"details":null` into the reconstructed preimage even
+   * after `detailsCommitment` support is added above, so this fix is
+   * necessary — not incidental — to SCAN-AV-01.
+   */
+  describe('SCAN-AV-01 — canonicalJson matches be-core\'s undefined-omission rule', () => {
+    it('omits an object key whose value is undefined; preserves an explicit null', () => {
+      const result = canonicalJson({ a: undefined, b: 1, z: null });
+      expect(result.toString('utf8')).toBe('{"b":1,"z":null}');
+    });
+  });
+
+  /**
    * PROD16 F6 (be-compliance) — explicit, non-positional manifest version
    * negotiation: a version this build does not implement must fail loudly
    * as a bundle-format error rather than being verified under the wrong

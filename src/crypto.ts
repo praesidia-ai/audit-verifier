@@ -488,6 +488,19 @@ export function merkleVerify(
  * Deterministic JSON byte encoding. Byte-for-byte identical to be-core's
  * `canonicalJson` (AGV-030). Object keys are sorted in
  * `Array.prototype.sort` order (lexicographic UTF-16 code-unit order).
+ *
+ * SCAN-AV-01 — an OBJECT PROPERTY whose value is `undefined` is OMITTED
+ * entirely (key not emitted), NOT canonicalized as `"key":null`, mirroring
+ * be-core's `FT-DEFECT-be-audit-chain-signature-invalid-after-first-row`
+ * fix (`be/src/common/security/utils/canonical-json.ts`). A top-level or
+ * array-element `undefined` is still `null` (matching `JSON.stringify`'s
+ * array behavior) — only object-key omission differs. Found while adding
+ * `detailsCommitment` support: `signableRow()` assigns `summary`/`details`
+ * unconditionally, which is `undefined` (not present at all) on a
+ * post-cutover wire row — without this fix that unconditional assignment
+ * would inject a spurious `"summary":null,"details":null` into the
+ * reconstructed preimage, breaking byte-for-byte agreement with be-core
+ * even after `detailsCommitment` itself is understood.
  */
 export function canonicalJson(value: unknown): Buffer {
   return Buffer.from(canonicalize(value), 'utf8');
@@ -523,7 +536,9 @@ function canonicalize(v: unknown): string {
       return JSON.stringify(v.toString('base64'));
     }
     const obj = v as Record<string, unknown>;
-    const keys = Object.keys(obj).sort();
+    const keys = Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort();
     const parts = keys.map(
       (k) => JSON.stringify(k) + ':' + canonicalize(obj[k]),
     );

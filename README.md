@@ -94,7 +94,12 @@ checks every cryptographic invariant the bundle commits to:
    present) — this mirrors `be-core`'s own conditional signing of
    `ipAddress` only for rows produced at/after its
    `IP_ADDRESS_SIGNABLE_CUTOVER_AT` activation, with no cutover-date
-   knowledge required in this verifier.
+   knowledge required in this verifier. `detailsCommitment` is handled the
+   same presence-guarded way, but REPLACES `summary`/`details` rather than
+   joining them: rows produced at/after `be-core`'s
+   `AUDIT_DETAILS_COMMITMENT_CUTOVER_AT` activation sign `detailsCommitment`
+   instead of raw `summary`/`details`, and this verifier reconstructs
+   whichever shape the wire row actually carries.
 3. **Chain integrity** — the true chain order is reconstructed from the
    cryptographic links themselves (each row's forward link vs. the next
    row's declared `prev_row_hash`), **not** from the bundle's on-disk row
@@ -524,6 +529,32 @@ This package is intentionally **decoupled** from `be-core`:
   per-component pass/fail counts and the id of the first offending row.
 
 ## Changelog
+
+### 0.10.0 (SCAN-AV-01 — `detailsCommitment` signable row field)
+
+- **`detailsCommitment` is now a recognized (optional) signable row field**, the same additive,
+  presence-guarded treatment `ipAddress` got in `0.4.0`: included in the canonical preimage IFF the
+  wire row carries that key at all, with no cutover-date knowledge in this verifier. Unlike
+  `ipAddress`, it REPLACES `summary`/`details` on the rows that carry it (`be-core`'s
+  `AUDIT_DETAILS_COMMITMENT_CUTOVER_AT`), rather than joining them — rows produced today (the
+  cutover is far-future by default in every known `be` deployment) are byte-for-byte unaffected.
+  `MAX_SUPPORTED_MANIFEST_VERSION` is unchanged (still `5`): this is a row-level, self-describing
+  field, not a manifest-level one, same as `ipAddress` never claiming its own manifest version.
+- **Correctness fix: `canonicalJson` now omits an object key whose value is `undefined`**, instead
+  of canonicalizing it as `"key":null`, matching `be-core`'s FROZEN, documented
+  `canonical-json.ts` behavior byte-for-byte (confirmed by independently executing `be-core`'s real
+  implementation, not by re-deriving the rule from this package's own code). This was a genuine,
+  if previously unreachable-in-practice, divergence from this file's own "byte-for-byte identical
+  to be-core's `canonicalJson`" claim — reachable the moment any signed object legitimately omits a
+  key (exactly the shape `detailsCommitment` rows introduce for `summary`/`details`).
+- **Verification-strictness change: none for any existing bundle.** Both changes are additive/
+  corrective on a code path (an object key that is genuinely absent from the wire) no bundle
+  produced by any shipped `be` version can exercise today; the full pre-existing 173-test suite
+  passes unmodified alongside 4 new tests.
+- **Known producer gap** (not a defect in this package, filed as `SCAN-BE-17` for `be-core`):
+  `bundle-exporter.service.ts`'s `serializeRow` does not yet copy `detailsCommitment` onto the wire
+  at all, so activating the cutover is still unsafe until that lands — this release is a
+  prerequisite for activation, not by itself sufficient to make activation safe.
 
 ### 0.9.2 (MIL-0002 / CD-0002 — release-integrity hardening, no verification-strictness change)
 

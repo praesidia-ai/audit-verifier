@@ -340,6 +340,19 @@ interface BundleRow {
    */
   ipAddress?: string | null;
   /**
+   * SCAN-AV-01 (be-audit N1) — Signed IN PLACE OF `summary`/`details` (not
+   * additive alongside them, unlike `ipAddress` above) for rows produced
+   * at/after the be-side `AUDIT_DETAILS_COMMITMENT_CUTOVER_AT` activation.
+   * Optional/absent on the wire for every row signed before that cutover
+   * (and for all pre-PROD16-F1 bundles). See {@link signableRow} — the
+   * verifier includes this key in the canonical preimage IFF the wire row
+   * actually carries it, mirroring `audit-canonical.helper.ts`'s own
+   * conditional shape (`buildSignableRow`'s `detailsCommitment`/
+   * `summary`+`details` branch) without needing to know the cutover
+   * instant.
+   */
+  detailsCommitment?: string | null;
+  /**
    * AUDIT-2026-05-01 — Per-row signature algorithm tag. Optional so
    * pre-AUDIT-01 bundles (which only carried `manifest.signatureAlgorithm`)
    * continue to verify; in that case the verifier falls back to the
@@ -4852,6 +4865,19 @@ function assertProofsStructure(proofs: BundleProofEntry[]): void {
  * the verifier ever needing to know the cutover instant. Rows signed
  * before the cutover (and every pre-AUDIT-14 row) simply never carry the
  * key on the wire, so the 11-field preimage is unchanged for them.
+ *
+ * SCAN-AV-01 (be-audit N1) — `detailsCommitment` follows the identical
+ * presence-guarded pattern, but REPLACES `summary`/`details` rather than
+ * sitting alongside them: a post-cutover wire row omits `summary`/
+ * `details` entirely and carries `detailsCommitment` instead. The
+ * unconditional `summary: row.summary, details: row.details` assignment
+ * below still correctly OMITS both from the canonical bytes for such a
+ * row (their value is `undefined` — the keys are absent on the wire
+ * object — and `canonicalJson` omits, never `null`-ifies, an
+ * undefined-valued object property; see `crypto.ts`), so no extra guard
+ * is needed for them. `detailsCommitment` itself needs the same `in`
+ * guard as `ipAddress` (not just `?? null`) so an absent key is never
+ * coalesced into an explicit signed `null`.
  */
 function signableRow(row: BundleRow): Record<string, unknown> {
   const signable: Record<string, unknown> = {
@@ -4869,6 +4895,9 @@ function signableRow(row: BundleRow): Record<string, unknown> {
   };
   if ('ipAddress' in row) {
     signable.ipAddress = row.ipAddress ?? null;
+  }
+  if ('detailsCommitment' in row) {
+    signable.detailsCommitment = row.detailsCommitment ?? null;
   }
   return signable;
 }
