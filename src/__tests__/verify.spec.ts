@@ -3730,6 +3730,89 @@ describe('verifyBundle', () => {
   });
 
   /**
+   * SCAN-AV-02 — investigated as a suspected `__proto__`-key hazard in
+   * `canonicalize`'s object branch (this package indexes the raw parsed
+   * object directly; be-core's FROZEN `canonical-json.ts`, TICKET-213,
+   * first copies into `Object.assign(Object.create(null), v)` before
+   * indexing). Traced against the ECMAScript spec and CONFIRMED by
+   * executing both sides for real (be-core via `ts-node`, this package via
+   * this test): **neither divergence nor pollution is reachable.**
+   * `[[Get]]`/`Object.keys` always resolve an object's OWN enumerable
+   * property named `__proto__` (however constructed — `JSON.parse`,
+   * `Object.defineProperty`, `Object.fromEntries`, spread — all use
+   * `CreateDataProperty`, never the exotic literal-syntax special case)
+   * in preference to the inherited `Object.prototype.__proto__` accessor,
+   * for BOTH reading and enumeration; own properties always shadow
+   * inherited ones. The accessor is reachable only via `[[Set]]`-style
+   * assignment onto a target that does not already own that key (e.g.
+   * `Object.assign({}, source)`, `target.__proto__ = value`) — a pattern
+   * neither this file's cast-only object branch, nor be-core's read half
+   * of its own null-prototype copy, ever exercises. be-core's copy is
+   * therefore harmless-but-inert for this operation, not load-bearing;
+   * mirroring it here would change zero bytes for any reachable input.
+   * Ground truth for every case below captured by executing be-core's
+   * REAL, unmodified `canonicalJson` via `node -r ts-node/register`
+   * against `be/src/common/security/utils/canonical-json.ts` — not
+   * re-derived by reading it, not re-derived from this package's own copy.
+   * Closed `resolved-no-change` (`.claude/backlog/SCAN-AV-02.md`); this
+   * test locks the now-verified-safe behavior in against regression.
+   */
+  describe('SCAN-AV-02 — __proto__-keyed object is not a canonicalization divergence or a pollution vector', () => {
+    it('canonicalizes a __proto__ key created via JSON.parse to its own value (realistic path: jsonb/bundle round-trip)', () => {
+      const parsed = JSON.parse('{"__proto__":"legit-value","a":1}') as Record<
+        string,
+        unknown
+      >;
+      expect(canonicalJson(parsed).toString('utf8')).toBe(
+        '{"__proto__":"legit-value","a":1}',
+      );
+    });
+
+    it('canonicalizes a __proto__ key forced onto a normal object via Object.defineProperty to its own value, not Object.prototype', () => {
+      // Object literal syntax `{ __proto__: 'x' }` is special-cased by the
+      // grammar to set [[Prototype]] instead of creating a property (and
+      // is a no-op here since 'x' isn't Object|null) — Object.defineProperty
+      // is the only way to force a genuine OWN, enumerable, normal-object
+      // property literally named "__proto__" for this test to be meaningful.
+      const obj: Record<string, unknown> = {};
+      Object.defineProperty(obj, '__proto__', {
+        value: 'x',
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      obj.a = 1;
+      expect(canonicalJson(obj).toString('utf8')).toBe('{"__proto__":"x","a":1}');
+    });
+
+    it('treats a bare __proto__ object-literal key as prototype syntax (no own key created), matching be-core', () => {
+      const lit = { __proto__: 'literal', a: 1 } as Record<string, unknown>;
+      expect(canonicalJson(lit).toString('utf8')).toBe('{"a":1}');
+    });
+
+    it('preserves an object-valued __proto__ key faithfully, including nested contents', () => {
+      const parsed = JSON.parse(
+        '{"__proto__":{"nested":true},"a":1}',
+      ) as Record<string, unknown>;
+      expect(canonicalJson(parsed).toString('utf8')).toBe(
+        '{"__proto__":{"nested":true},"a":1}',
+      );
+    });
+
+    it('omits an undefined-valued __proto__ key, same as any other undefined-valued key', () => {
+      const obj: Record<string, unknown> = {};
+      Object.defineProperty(obj, '__proto__', {
+        value: undefined,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+      obj.a = 1;
+      expect(canonicalJson(obj).toString('utf8')).toBe('{"a":1}');
+    });
+  });
+
+  /**
    * PROD16 F6 (be-compliance) — explicit, non-positional manifest version
    * negotiation: a version this build does not implement must fail loudly
    * as a bundle-format error rather than being verified under the wrong
