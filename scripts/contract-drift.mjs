@@ -25,7 +25,7 @@
  * that script uses for `export class *Dto` bodies applies directly to TS
  * `interface` bodies and object-literal return statements here.
  *
- * Five checks, in priority order (signature-critical first — see the
+ * Seven checks, in priority order (signature-critical first — see the
  * CD-0002 ticket note: "if the script can only cover one thing well, cover
  * WHICH FIELDS ENTER THE SIGNATURE"):
  *
@@ -49,19 +49,34 @@
  *      A-D, this check is deliberately asymmetric (see below) — the
  *      attestation body is signature-safe under additive drift by
  *      construction (MIL-0003), so [E] must not cry wolf on that case.
+ *   F. Audit-row SIGNED PREIMAGE — be's `SignableAuditRow`
+ *      (`audit-canonical.helper.ts`, the interface `buildSignableRow`
+ *      actually signs) vs this verifier's `signableRow()` reconstruction
+ *      (`verify.ts`). SCAN-AV-03 — the row-level sibling of check A: this
+ *      is the exact seam SCAN-AV-01 found silently drifted (missing
+ *      `detailsCommitment` entirely), caught by a security-audit pass, not
+ *      a gate, before this check existed.
+ *   G. Audit-row WIRE shape — be's `serializeRow` emitted fields
+ *      (`bundle-exporter.service.ts`) vs `BundleRow`'s declared fields
+ *      (`verify.ts`). Optionality-aware like [E] (see below) — NOT a plain
+ *      A-D-style symmetric diff.
  *
- * A-D fail on a field present on only one side, in EITHER direction — a
- * be-only field is unrecognized by every offline consumer; a verifier-only
- * required field is one no producer will ever populate.
+ * A-D and F fail on a field present on only one side, in EITHER direction —
+ * a be-only field is unrecognized by every offline consumer (both
+ * `signableActionEvent` and `signableRow` are TYPED reconstructions, unsafe
+ * by omission on either side); a verifier-only required field is one no
+ * producer will ever populate.
  *
- * [E] is asymmetric on purpose. `verifyPlatformAttestation` (`verify.ts`)
- * builds its signature preimage with `canonicalJson(body)` over the PARSED
- * JSON object, not a typed reconstruction (contrast `signableActionEvent`
- * in check A, which DOES rebuild a typed object — that's exactly what made
- * A blind to SEC-PA01-DISCOVERED-01). A field `be` adds that this
- * verifier's interface doesn't know about still flows into the signed
- * bytes correctly and the signature still verifies — MIL-0003's
- * `platformKeyVersion` is exactly this case. So:
+ * [E] and [G] are asymmetric on purpose, for two DIFFERENT reasons:
+ *
+ * [E]: `verifyPlatformAttestation` (`verify.ts`) builds its signature
+ * preimage with `canonicalJson(body)` over the PARSED JSON object, not a
+ * typed reconstruction (contrast `signableActionEvent` in check A, which
+ * DOES rebuild a typed object — that's exactly what made A blind to
+ * SEC-PA01-DISCOVERED-01). A field `be` adds that this verifier's interface
+ * doesn't know about still flows into the signed bytes correctly and the
+ * signature still verifies — MIL-0003's `platformKeyVersion` is exactly
+ * this case. So:
  *   - a `be`-only field (present in the attestation literal, absent from
  *     `PlatformAttestationBody` in EITHER its required or optional set) is
  *     a WARNING (interface is stale, but no bundle fails to verify because
@@ -76,6 +91,27 @@
  *   - a `PlatformAttestationBody` field declared OPTIONAL (`?`) that `be`
  *     doesn't emit is unremarkable (forward-declared or legitimately
  *     dropped) — no message.
+ *
+ * [G]: `BundleRow` is the CONSUMING declaration `signableRow()`'s
+ * `'x' in row` guards are written against (unlike [E], the risk direction
+ * is reversed: `serializeRow` is the typed PRODUCER, `BundleRow` the typed
+ * CONSUMER, so an undeclared-on-BundleRow field `be` emits is real drift,
+ * not signature-safe-by-construction the way [E]'s wholesale
+ * canonicalization is — hard failure, both directions, EXCEPT one
+ * deliberately safe case): `ipAddress` and `detailsCommitment` are each
+ * declared OPTIONAL on `BundleRow` specifically so `signableRow()`'s guard
+ * can tolerate a producer that has not started emitting them yet — the
+ * verifier upgraded AHEAD of the producer on purpose (SCAN-AV-01, awaiting
+ * SCAN-BE-17). So for [G] only:
+ *   - a `BundleRow` field declared REQUIRED (no `?`) that `be`'s
+ *     `serializeRow` never emits (unconditionally or guarded) IS a hard
+ *     failure.
+ *   - a `BundleRow` field declared OPTIONAL (`?`) that `be` doesn't emit at
+ *     all yet is unremarkable (the intentional, coordinated-rollout state)
+ *     — no message.
+ *   - a field `be` emits (unconditionally or guarded) that `BundleRow`
+ *     does not declare in EITHER category is a hard failure — unlike [E],
+ *     there is no wholesale-canonicalization safety net here.
  *
  * Usage
  * -----
@@ -264,13 +300,27 @@ function main() {
     beRoot,
     'src/common/security/services/platform-attestation.service.ts',
   );
+  // SCAN-AV-03 — the row-level signed contract (`SignableAuditRow`,
+  // `buildSignableRow`), distinct from `protected-action-canonical.helper.ts`'s
+  // action-event contract already covered by check A.
+  const auditCanonicalHelperPath = path.join(
+    beRoot,
+    'src/audit/audit-canonical.helper.ts',
+  );
   const verifyTsPath = path.join(__dirname, '../src/verify.ts');
 
-  let bundleExporterSrc, canonicalHelperSrc, platformAttestationSrc, verifyTsSrc;
+  let bundleExporterSrc,
+    canonicalHelperSrc,
+    platformAttestationSrc,
+    auditCanonicalHelperSrc,
+    verifyTsSrc;
   try {
     bundleExporterSrc = stripComments(readFileSync(bundleExporterPath, 'utf8'));
     canonicalHelperSrc = stripComments(readFileSync(canonicalHelperPath, 'utf8'));
     platformAttestationSrc = stripComments(readFileSync(platformAttestationServicePath, 'utf8'));
+    auditCanonicalHelperSrc = stripComments(
+      readFileSync(auditCanonicalHelperPath, 'utf8'),
+    );
     verifyTsSrc = stripComments(readFileSync(verifyTsPath, 'utf8'));
   } catch (error) {
     console.error(`::error::could not read a required source file: ${error.message}`);
@@ -458,6 +508,125 @@ function main() {
     // A verifier-OPTIONAL field be doesn't emit is unremarkable — no message.
   }
 
+  // ── F. Audit-row SIGNED PREIMAGE (signature-critical) ──────────────────
+  // SCAN-AV-03 — the exact seam SCAN-AV-01 found silently drifted
+  // (`detailsCommitment` missing entirely from `signableRow()`). Plain
+  // symmetric diff, same philosophy as [A]/[B]: `signableRow()` is a TYPED
+  // rebuild, not a wholesale canonicalize like [E], so an unhandled field
+  // on EITHER side is unsafe by omission — a be field marked optional
+  // (cutover-gated) can start appearing in real signed bytes the moment an
+  // operator flips the switch, and the verifier must already have a code
+  // path for it (unconditional or `in`-guarded) or every such row fails
+  // verification from that moment on.
+  const signableAuditRowFields = keysAfterAnchor(
+    auditCanonicalHelperSrc,
+    /\binterface SignableAuditRow\b[^{]*{/,
+  );
+  const signableRowFn = extractFunctionBody(
+    verifyTsSrc,
+    /function signableRow\([^)]*\)[^{]*{/,
+  );
+  if (!signableAuditRowFields) {
+    failures.push(
+      '[F] SignableAuditRow interface not found in audit-canonical.helper.ts (renamed or moved?)',
+    );
+  } else if (!signableRowFn) {
+    failures.push('[F] signableRow() not found in verify.ts (renamed or moved?)');
+  } else {
+    const signableDeclMatch = /const signable:\s*Record<string,\s*unknown>\s*=\s*{/.exec(
+      signableRowFn,
+    );
+    if (!signableDeclMatch) {
+      failures.push("[F] signableRow()'s `signable` reconstruction object not found");
+    } else {
+      const openBrace = signableRowFn.indexOf(
+        '{',
+        signableDeclMatch.index + signableDeclMatch[0].length - 1,
+      );
+      const baseSignableRowFields = extractDepth1Keys(signableRowFn, openBrace);
+      const gatedSignableRowFields = extractDottedAssignments(signableRowFn, 'signable');
+      const verifierRowFields = new Set([
+        ...baseSignableRowFields,
+        ...gatedSignableRowFields,
+      ]);
+      for (const failure of diffSets(
+        "be's SignableAuditRow (the SIGNED audit-row fields)",
+        signableAuditRowFields,
+        "verify.ts's signableRow() reconstruction",
+        verifierRowFields,
+      )) {
+        failures.push(`[F] ${failure}`);
+      }
+    }
+  }
+
+  // ── G. Audit-row WIRE shape (optionality-aware, mirrors [E]) ───────────
+  // SCAN-AV-03 — unlike [F], `BundleRow` is the CONSUMING declaration
+  // `signableRow()`'s `'x' in row` guards are written against, so a
+  // `BundleRow`-OPTIONAL field be doesn't emit YET is the intentional,
+  // coordinated-rollout state `ipAddress`/`detailsCommitment` are in right
+  // now (verifier upgraded ahead of the producer — SCAN-AV-01, awaiting
+  // SCAN-BE-17) — safe, not a failure. Everything else is a hard failure:
+  // there is no [E]-style wholesale-canonicalization safety net for an
+  // undeclared wire field here.
+  const serializeRowFn = extractFunctionBody(
+    bundleExporterSrc,
+    /private serializeRow\([^)]*\)\s*:\s*Record<string,\s*unknown>\s*{/,
+  );
+  const bundleRowEntries = keysAfterAnchor(
+    verifyTsSrc,
+    /\binterface BundleRow\b[^{]*{/,
+    { entries: true },
+  );
+  if (!serializeRowFn) {
+    failures.push(
+      '[G] serializeRow() not found in bundle-exporter.service.ts (renamed or moved?)',
+    );
+  } else if (!bundleRowEntries) {
+    failures.push('[G] BundleRow interface not found in verify.ts (renamed or moved?)');
+  } else {
+    const wireDeclMatch = /const wire:\s*Record<string,\s*unknown>\s*=\s*{/.exec(
+      serializeRowFn,
+    );
+    if (!wireDeclMatch) {
+      failures.push("[G] serializeRow()'s `wire` object literal not found");
+    } else {
+      const openBrace = serializeRowFn.indexOf(
+        '{',
+        wireDeclMatch.index + wireDeclMatch[0].length - 1,
+      );
+      const baseWireFields = extractDepth1Keys(serializeRowFn, openBrace);
+      const gatedWireFields = extractDottedAssignments(serializeRowFn, 'wire');
+      const producerRowFields = new Set([...baseWireFields, ...gatedWireFields]);
+      const requiredBundleRowFields = new Set(
+        [...bundleRowEntries].filter(([, v]) => !v.optional).map(([k]) => k),
+      );
+      const allBundleRowFields = new Set(bundleRowEntries.keys());
+
+      // be emits a field BundleRow doesn't declare in EITHER category —
+      // undeclared wire drift, hard fail (no [E]-style safety net here).
+      for (const field of [...producerRowFields].sort()) {
+        if (!allBundleRowFields.has(field)) {
+          failures.push(
+            `[G] ${field}: present in be's serializeRow() wire output, absent from BundleRow (verify.ts)`,
+          );
+        }
+      }
+      // BundleRow requires a field be never emits (unconditionally or
+      // guarded): hard failure.
+      for (const field of [...requiredBundleRowFields].sort()) {
+        if (!producerRowFields.has(field)) {
+          failures.push(
+            `[G] ${field}: BundleRow (verify.ts) declares this REQUIRED, but be's serializeRow() ` +
+              'does not emit it under any condition',
+          );
+        }
+      }
+      // A BundleRow-OPTIONAL field be doesn't emit yet is unremarkable —
+      // the intentional coordinated-rollout state — no message.
+    }
+  }
+
   if (failures.length > 0) {
     console.error('audit-verifier <-> be bundle-schema contract drift detected:\n');
     for (const failure of failures) {
@@ -468,11 +637,11 @@ function main() {
     }
     console.error(
       '\nUpdate `be`\'s serializer/manifest builder or this package\'s `BundleActionEvent` / ' +
-        '`BundleManifest` / `signableActionEvent` / `verifyManifest` / `PlatformAttestationBody` ' +
-        'to match, then re-run. A field entering the SIGNED preimage on one side only ([A]/[B]) ' +
-        'means signatures are unverifiable offline for the affected rows — see ' +
-        'SEC-PA01-DISCOVERED-01. A [E] hard failure means a bundle every genuine producer emits ' +
-        'will be rejected as malformed.',
+        '`BundleManifest` / `signableActionEvent` / `verifyManifest` / `PlatformAttestationBody` / ' +
+        '`BundleRow` / `signableRow` to match, then re-run. A field entering the SIGNED preimage ' +
+        'on one side only ([A]/[B]/[F]) means signatures are unverifiable offline for the affected ' +
+        'rows — see SEC-PA01-DISCOVERED-01 (action-events) and SCAN-AV-01 (audit rows). A [E]/[G] ' +
+        'hard failure means a bundle every genuine producer emits will be rejected or mis-signed.',
     );
     return 1;
   }
@@ -482,6 +651,8 @@ function main() {
   console.log('ok  [C] action-event wire fields match (serializeActionEvent <-> BundleActionEvent)');
   console.log('ok  [D] manifest wire fields match (manifest builder <-> BundleManifest)');
   console.log('ok  [E] platform-attestation required fields match (no hard drift); additive fields, if any, warned below');
+  console.log('ok  [F] audit-row signed-preimage fields match (SignableAuditRow <-> signableRow)');
+  console.log('ok  [G] audit-row wire fields match (serializeRow <-> BundleRow); optional not-yet-emitted fields are not drift');
   for (const warning of warnings) {
     console.warn(`::warning::${warning}`);
   }
