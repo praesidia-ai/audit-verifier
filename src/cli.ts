@@ -22,6 +22,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport, type ComponentResult } from './verify.js';
+import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 
 interface CliArgs {
   bundlePath: string | null;
@@ -37,6 +38,18 @@ const HELP = `praesidia-verify — offline verifier for Praesidia compliance bun
 
 USAGE
   praesidia-verify <bundle.zip> [options]
+  praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
+
+  SCAN2-004 — \`verify-set\` checks that TWO OR MORE bundles for the same
+  org form one continuous history: it sorts them by manifest \`from\`,
+  requires the earliest bundle's chain head to be a true genesis anchor
+  (not an opaque range start — closes AUDIT-03), and for every adjacent
+  pair asserts BOTH the date range is exactly contiguous (no gap, no
+  overlap) AND the left bundle's newest-row hash-chain link equals the
+  right bundle's declared head anchor (an adjacent-but-forged boundary is
+  caught, not just a date gap). Every discontinuity is a NAMED finding —
+  never silence. Does not change the single-bundle command above in any
+  way.
 
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
@@ -57,14 +70,28 @@ EXIT CODES
   2   I/O or bundle-format error.
   3   status: incomplete — evidence present is insufficient to decide.
 
+EXIT CODES (verify-set)
+  0   status: continuous      — every bundle valid, no gap/overlap/mismatch.
+  1   status: bundle_invalid  — at least one bundle itself fails verification
+      (checked before continuity — a broken bundle is reported as broken,
+      never downgraded to a mere gap).
+  2   I/O or bundle-format error (including: fewer than 2 bundles supplied,
+      or bundles that do not share one organizationId).
+  3   status: bundle_incomplete — no bundle invalid, no discontinuity found,
+      but at least one bundle's own evidence was insufficient to decide.
+  4   status: discontinuous   — every bundle individually verifies, but the
+      set has a named gap, overlap, forged boundary, or non-genesis first
+      bundle (AUDIT-03).
+
 The bundle is verified entirely offline — the verifier makes NO network
 calls. The Rekor receipt is verified against a PINNED Sigstore public key
 (SET signature + inclusion proof); pass --no-rekor to skip that step.
 `;
 
-function parseArgs(argv: string[]): CliArgs {
-  const out: CliArgs = {
-    bundlePath: null,
+type CommonFlags = Omit<CliArgs, 'bundlePath'>;
+
+function newCommonFlags(): CommonFlags {
+  return {
     noRekor: false,
     quiet: false,
     json: false,
@@ -72,33 +99,69 @@ function parseArgs(argv: string[]): CliArgs {
     platformKeyPath: null,
     allowLegacyUnattested: false,
   };
+}
+
+/**
+ * SCAN2-004 — flag parsing shared by single-bundle mode and `verify-set`.
+ * Every non-flag token is appended to `positionals`; this function itself
+ * enforces no arity rule on them — each caller (`parseArgs`,
+ * `parseVerifySetArgs`) owns its own positional-count contract, since
+ * single-bundle mode wants exactly one and `verify-set` wants two or more.
+ */
+function parseCommonArgs(
+  argv: string[],
+  flags: CommonFlags,
+  positionals: string[],
+): void {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
-    if (arg === '--no-rekor') out.noRekor = true;
-    else if (arg === '--quiet') out.quiet = true;
-    else if (arg === '--json') out.json = true;
-    else if (arg === '--help' || arg === '-h') out.help = true;
+    if (arg === '--no-rekor') flags.noRekor = true;
+    else if (arg === '--quiet') flags.quiet = true;
+    else if (arg === '--json') flags.json = true;
+    else if (arg === '--help' || arg === '-h') flags.help = true;
     else if (arg === '--allow-legacy-unattested') {
-      out.allowLegacyUnattested = true;
+      flags.allowLegacyUnattested = true;
     } else if (arg === '--platform-key') {
       const value = argv[i + 1];
       if (!value || value.startsWith('-')) {
         throw new Error('--platform-key requires a file path');
       }
-      out.platformKeyPath = value;
+      flags.platformKeyPath = value;
       i += 1;
-    }
-    else if (arg.startsWith('-')) {
+    } else if (arg.startsWith('-')) {
       // Unknown flag — surface as format error (exit 2) so silent
       // typos don't get treated as success.
       throw new Error(`unknown option: ${arg}`);
-    } else if (out.bundlePath === null) {
-      out.bundlePath = arg;
     } else {
-      throw new Error('only one bundle path may be supplied');
+      positionals.push(arg);
     }
   }
-  return out;
+}
+
+function parseArgs(argv: string[]): CliArgs {
+  const flags = newCommonFlags();
+  const positionals: string[] = [];
+  parseCommonArgs(argv, flags, positionals);
+  if (positionals.length > 1) {
+    throw new Error('only one bundle path may be supplied');
+  }
+  return { ...flags, bundlePath: positionals[0] ?? null };
+}
+
+interface VerifySetArgs extends CommonFlags {
+  bundlePaths: string[];
+}
+
+function parseVerifySetArgs(argv: string[]): VerifySetArgs {
+  const flags = newCommonFlags();
+  const positionals: string[] = [];
+  parseCommonArgs(argv, flags, positionals);
+  if (!flags.help && positionals.length < 2) {
+    throw new Error(
+      `verify-set requires at least two bundle paths, got ${positionals.length}`,
+    );
+  }
+  return { ...flags, bundlePaths: positionals };
 }
 
 /** `status` → the one-word summary token used by `--quiet` and `RESULT:`. */
@@ -220,6 +283,320 @@ function fmtComponent(label: string, c: ComponentResult): string {
   return `[${tag}] ${label}  ${counts}${extra}`;
 }
 
+/** Shared by single-bundle mode and `verify-set` — loads/validates `--platform-key`. */
+async function resolvePlatformPublicKeyDerB64(platformKeyPath: string): Promise<string> {
+  const keyBytes = await fs.readFile(path.resolve(platformKeyPath));
+  let key: crypto.KeyObject;
+  try {
+    key = crypto.createPublicKey(keyBytes.toString('utf8'));
+  } catch {
+    key = crypto.createPublicKey({ key: keyBytes, format: 'der', type: 'spki' });
+  }
+  if (key.asymmetricKeyType !== 'ec') {
+    throw new Error('platform key must be an EC P-256 public key');
+  }
+  const details = key.asymmetricKeyDetails;
+  if (details?.namedCurve !== 'prime256v1') {
+    throw new Error('platform key must use the P-256 curve');
+  }
+  return Buffer.from(key.export({ type: 'spki', format: 'der' })).toString('base64');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// SCAN2-004 — `verify-set`: cross-bundle continuity.
+//
+// `be`'s bundle-exporter caps a single export at 90 days
+// (`MAX_RANGE_DAYS`), so any org history longer than that is necessarily
+// several bundles. Before this, `praesidia-verify` only ever looked at one
+// bundle at a time — a set with a bundle silently missing from the middle
+// verified as two independent "OK"s, with nothing naming the hole
+// (AUDIT-01). This section adds a mode; it never changes what a single
+// `praesidia-verify <bundle.zip>` invocation does or returns.
+// ════════════════════════════════════════════════════════════════════════
+
+interface ContinuityFinding {
+  kind: 'date_gap' | 'date_overlap' | 'boundary_chain_mismatch' | 'chain_head_not_genesis';
+  /** Index into the SORTED bundle list this finding concerns (or the pair either side of it). */
+  leftIndex?: number;
+  rightIndex?: number;
+  reason: string;
+}
+
+interface VerifySetBundleSummary {
+  path: string;
+  status: VerifyReport['status'];
+  orgId: string;
+  from: string;
+  to: string;
+  rowsSeen: number;
+}
+
+interface VerifySetReport {
+  ok: boolean;
+  /**
+   * `bundle_invalid` beats `discontinuous` beats `bundle_incomplete` beats
+   * `continuous` — a bundle that is itself tampered is a strictly worse
+   * signal than a mere gap between otherwise-good bundles, and is never
+   * downgraded to one. Drives the exit code (`verifySetExitCode`), which
+   * is what lets a script tell "set is continuous" / "set has a gap" /
+   * "a bundle is invalid" apart, per the item's Definition of Done.
+   */
+  status: 'continuous' | 'discontinuous' | 'bundle_invalid' | 'bundle_incomplete';
+  orgId: string;
+  bundles: VerifySetBundleSummary[];
+  findings: ContinuityFinding[];
+}
+
+/**
+ * Sorts the given bundles' reports by manifest `from` and cross-checks
+ * every adjacent pair. Pure function over already-computed `VerifyReport`s
+ * so it is trivially testable and never re-parses a bundle.
+ */
+function buildVerifySetReport(
+  entries: ReadonlyArray<{ path: string; report: VerifyReport }>,
+): VerifySetReport {
+  const sorted = [...entries].sort(
+    (a, b) => Date.parse(a.report.bundle.from) - Date.parse(b.report.bundle.from),
+  );
+  const orgId = sorted[0]!.report.bundle.orgId;
+  const findings: ContinuityFinding[] = [];
+
+  const bundleInvalid = sorted.some((e) => e.report.status === 'invalid');
+  const bundleIncomplete = sorted.some((e) => e.report.status === 'incomplete');
+
+  // AUDIT-03 — the earliest bundle in a set an auditor is treating as the
+  // complete history must be genesis-rooted. An opaque anchor there means
+  // either an earlier bundle is missing from this set, or the chain has
+  // been tampered with; single-bundle verification cannot tell those
+  // apart from a legitimate ranged export (BUGHUNT-SDK-02) and must keep
+  // accepting it — but `verify-set`, which claims to see the whole set,
+  // can and must. Skipped only when the earliest bundle has zero rows
+  // (nothing to anchor) or is itself invalid (already counted above).
+  const first = sorted[0]!.report;
+  if (first.status !== 'invalid' && first.bundle.rowsSeen > 0) {
+    if (first.bundle.chainHeadAnchor !== GENESIS_PREV_ROW_HASH) {
+      findings.push({
+        kind: 'chain_head_not_genesis',
+        rightIndex: 0,
+        reason:
+          `earliest bundle in this set (${sorted[0]!.path}) is not genesis-rooted — ` +
+          'its chain head is an opaque anchor, not GENESIS_PREV_ROW_HASH. Either an ' +
+          'earlier bundle is missing from this set, or the chain has been tampered with.',
+      });
+    }
+  }
+
+  for (let i = 0; i + 1 < sorted.length; i++) {
+    const left = sorted[i]!;
+    const right = sorted[i + 1]!;
+    // Each bundle's own validity is already reflected in `bundleInvalid`
+    // above; a broken bundle has no trustworthy `to`/chain endpoint to
+    // stitch against, so skip pairing it into a continuity finding here
+    // rather than reporting a confusing secondary symptom.
+    if (left.report.status === 'invalid' || right.report.status === 'invalid') continue;
+
+    const leftToMs = Date.parse(left.report.bundle.to);
+    const rightFromMs = Date.parse(right.report.bundle.from);
+    if (rightFromMs < leftToMs) {
+      findings.push({
+        kind: 'date_overlap',
+        leftIndex: i,
+        rightIndex: i + 1,
+        reason:
+          `${left.path} [${left.report.bundle.from}, ${left.report.bundle.to}) overlaps ` +
+          `${right.path} [${right.report.bundle.from}, ${right.report.bundle.to})`,
+      });
+      continue; // an overlapping pair has no well-defined boundary to chain-link check
+    }
+    if (rightFromMs > leftToMs) {
+      findings.push({
+        kind: 'date_gap',
+        leftIndex: i,
+        rightIndex: i + 1,
+        reason:
+          `missing window [${left.report.bundle.to}, ${right.report.bundle.from}) — ` +
+          `${left.path} ends at ${left.report.bundle.to}, ${right.path} does not start ` +
+          `until ${right.report.bundle.from}`,
+      });
+      continue;
+    }
+    // Dates are exactly adjacent — AUDIT-01 also requires binding the
+    // CRYPTOGRAPHIC boundary, not just the date match, so a forged
+    // replacement bundle with a convenient `from` cannot pass as
+    // continuous.
+    if (left.report.bundle.rowsSeen > 0 && right.report.bundle.rowsSeen > 0) {
+      if (left.report.bundle.chainTailLinkHash !== right.report.bundle.chainHeadAnchor) {
+        findings.push({
+          kind: 'boundary_chain_mismatch',
+          leftIndex: i,
+          rightIndex: i + 1,
+          reason:
+            `${left.path}'s newest-row hash-chain link does not equal ${right.path}'s ` +
+            'declared chain-head anchor — the boundary is date-adjacent but not ' +
+            'cryptographically continuous (adjacent-but-forged boundary)',
+        });
+      }
+    }
+    // Both/either side genuinely empty (a quiet window, zero rows): there
+    // is no chain link to assert; the date-adjacency check above is the
+    // full assertion available and it already passed for this pair.
+  }
+
+  const status: VerifySetReport['status'] = bundleInvalid
+    ? 'bundle_invalid'
+    : findings.length > 0
+      ? 'discontinuous'
+      : bundleIncomplete
+        ? 'bundle_incomplete'
+        : 'continuous';
+
+  return {
+    ok: status === 'continuous',
+    status,
+    orgId,
+    bundles: sorted.map((e) => ({
+      path: e.path,
+      status: e.report.status,
+      orgId: e.report.bundle.orgId,
+      from: e.report.bundle.from,
+      to: e.report.bundle.to,
+      rowsSeen: e.report.bundle.rowsSeen,
+    })),
+    findings,
+  };
+}
+
+function verifySetStatusWord(status: VerifySetReport['status']): string {
+  switch (status) {
+    case 'continuous':
+      return 'OK';
+    case 'discontinuous':
+      return 'GAP';
+    case 'bundle_invalid':
+      return 'FAIL';
+    case 'bundle_incomplete':
+      return 'INCOMPLETE';
+  }
+}
+
+/** Exit code contract for `verify-set` — see the HELP text's "EXIT CODES (verify-set)" block. */
+function verifySetExitCode(status: VerifySetReport['status']): number {
+  switch (status) {
+    case 'continuous':
+      return 0;
+    case 'bundle_invalid':
+      return 1;
+    case 'bundle_incomplete':
+      return 3;
+    case 'discontinuous':
+      return 4;
+  }
+}
+
+function printVerifySetReport(report: VerifySetReport, quiet: boolean, noRekor: boolean): void {
+  if (quiet) {
+    process.stdout.write(`${verifySetStatusWord(report.status)}\n`);
+    return;
+  }
+  const lines: string[] = [];
+  lines.push('Praesidia compliance bundle SET verification (continuity)');
+  lines.push('───────────────────────────────────────────────────────');
+  lines.push(`org:      ${report.orgId}`);
+  lines.push(`bundles:  ${report.bundles.length}`);
+  lines.push('');
+  for (const b of report.bundles) {
+    lines.push(
+      `  [${b.status.toUpperCase().padEnd(11, ' ')}] ${b.path}  [${b.from}, ${b.to})  rows=${b.rowsSeen}`,
+    );
+  }
+  lines.push('');
+  if (report.findings.length === 0) {
+    lines.push('continuity: no gap, overlap, or boundary mismatch found');
+  } else {
+    lines.push(`continuity: ${report.findings.length} finding(s)`);
+    for (const f of report.findings) {
+      lines.push(`  - [${f.kind}] ${f.reason}`);
+    }
+  }
+  lines.push('');
+  lines.push(`RESULT: ${verifySetStatusWord(report.status)}`);
+  if (noRekor) {
+    lines.push('NOTE: --no-rekor was passed — the external Rekor witness was NOT checked for any bundle in this set.');
+  }
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+async function mainVerifySet(argv: string[]): Promise<number> {
+  let args: VerifySetArgs;
+  try {
+    args = parseVerifySetArgs(argv);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n\n${HELP}`);
+    return 2;
+  }
+  if (args.help) {
+    process.stdout.write(HELP);
+    return 0;
+  }
+
+  let platformPublicKeyDerB64: string | undefined;
+  if (args.platformKeyPath) {
+    try {
+      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(args.platformKeyPath);
+    } catch (err) {
+      process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
+      return 2;
+    }
+  }
+
+  const entries: Array<{ path: string; report: VerifyReport }> = [];
+  for (const bundlePath of args.bundlePaths) {
+    let buffer: Buffer;
+    try {
+      buffer = await fs.readFile(path.resolve(bundlePath));
+    } catch (err) {
+      process.stderr.write(
+        `error: cannot read bundle ${bundlePath}: ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+    try {
+      const report = await verifyBundle(buffer, {
+        noRekor: args.noRekor,
+        allowLegacyUnattested: args.allowLegacyUnattested,
+        ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
+      });
+      entries.push({ path: bundlePath, report });
+    } catch (err) {
+      process.stderr.write(
+        `error: bundle format error in ${bundlePath}: ${(err as Error).message}\n`,
+      );
+      return 2;
+    }
+  }
+
+  // A gap/overlap/boundary comparison across two different orgs is
+  // meaningless and would silently produce nonsense findings — reject it
+  // as a usage error before computing anything, same class of failure as
+  // "fewer than two bundles supplied".
+  const orgIds = new Set(entries.map((e) => e.report.bundle.orgId));
+  if (orgIds.size > 1) {
+    process.stderr.write(
+      `error: bundles do not share one organizationId: ${[...orgIds].join(', ')}\n`,
+    );
+    return 2;
+  }
+
+  const setReport = buildVerifySetReport(entries);
+
+  if (args.json) {
+    process.stdout.write(`${JSON.stringify(setReport, null, 2)}\n`);
+  } else {
+    printVerifySetReport(setReport, args.quiet, args.noRekor);
+  }
+  return verifySetExitCode(setReport.status);
+}
+
 async function main(): Promise<number> {
   let args: CliArgs;
   try {
@@ -246,23 +623,7 @@ async function main(): Promise<number> {
   let platformPublicKeyDerB64: string | undefined;
   if (args.platformKeyPath) {
     try {
-      const keyBytes = await fs.readFile(path.resolve(args.platformKeyPath));
-      let key: crypto.KeyObject;
-      try {
-        key = crypto.createPublicKey(keyBytes.toString('utf8'));
-      } catch {
-        key = crypto.createPublicKey({ key: keyBytes, format: 'der', type: 'spki' });
-      }
-      if (key.asymmetricKeyType !== 'ec') {
-        throw new Error('platform key must be an EC P-256 public key');
-      }
-      const details = key.asymmetricKeyDetails;
-      if (details?.namedCurve !== 'prime256v1') {
-        throw new Error('platform key must use the P-256 curve');
-      }
-      platformPublicKeyDerB64 = Buffer.from(
-        key.export({ type: 'spki', format: 'der' }),
-      ).toString('base64');
+      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(args.platformKeyPath);
     } catch (err) {
       process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
       return 2;
@@ -305,7 +666,19 @@ async function main(): Promise<number> {
   }
 }
 
-main().then(
+/**
+ * SCAN2-004 — `verify-set` is a subcommand, dispatched on a literal first
+ * argument, exactly like `npm <command>` / `git <command>`. Any other
+ * first argument (including none) is unaffected and reaches the ORIGINAL
+ * single-bundle `main()` unchanged.
+ */
+function runCli(): Promise<number> {
+  return process.argv[2] === 'verify-set'
+    ? mainVerifySet(process.argv.slice(3))
+    : main();
+}
+
+runCli().then(
   (code) => {
     // Let stdout/stderr drain naturally. `process.exit()` can truncate a
     // large `--json` report when output is piped and the stream is under

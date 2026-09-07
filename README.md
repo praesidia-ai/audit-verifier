@@ -48,6 +48,54 @@ Exit codes:
       illegitimately stripped — see "Verdict shape" below.
 ```
 
+## Cross-bundle continuity (`verify-set`)
+
+`be`'s exporter caps a single bundle at 90 days, so any org history longer
+than that is necessarily several bundles. Verifying one bundle at a time
+cannot tell you whether a whole bundle — an entire quarter — was left out
+of the set an auditor was handed. `verify-set` closes that gap:
+
+```bash
+praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
+```
+
+It sorts the given bundles by their manifest `from`, then asserts:
+
+- the earliest bundle's chain head is a true genesis anchor (not an opaque
+  range start) — otherwise either an earlier bundle is missing from the
+  set, or the chain has been tampered with;
+- every adjacent pair's date range is exactly contiguous — a gap or an
+  overlap is reported as a named finding, never silently accepted;
+- every adjacent pair's boundary is cryptographically continuous — the
+  left bundle's newest-row hash-chain link must equal the right bundle's
+  declared chain-head anchor, so a date-adjacent but forged/replaced
+  bundle is still caught, not just a date gap.
+
+A bundle that is itself invalid is reported as such and never downgraded
+to "just a gap". Exit codes let a script tell the three outcomes apart:
+
+```
+0   status: continuous      — every bundle valid, no gap/overlap/mismatch.
+1   status: bundle_invalid  — at least one bundle itself fails verification.
+2   I/O or bundle-format error (including fewer than 2 bundles, or bundles
+    that do not share one organizationId).
+3   status: bundle_incomplete — no bundle invalid, no discontinuity found,
+    but at least one bundle's own evidence was insufficient to decide.
+4   status: discontinuous   — every bundle individually verifies, but the
+    set has a named gap, overlap, forged boundary, or non-genesis first
+    bundle.
+```
+
+`verify-set` accepts the same `--no-rekor` / `--platform-key` /
+`--allow-legacy-unattested` / `--json` / `--quiet` options as single-bundle
+mode, applied identically to every bundle in the set. It does not change
+the single-bundle command's behaviour or exit codes in any way.
+
+Detecting a **withheld** bundle (one never handed to the auditor at all,
+as opposed to a gap visible across two bundles the auditor does have) is
+out of scope for this mode — it needs a platform-side signed export ledger
+to reconcile against, which is a separate, larger design.
+
 ## Verdict shape
 
 Every component result (`report.manifest`, `report.rowSignatures`, ...) and

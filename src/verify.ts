@@ -859,6 +859,25 @@ export interface VerifyReport {
     sealedPurgesVerified: number;
     /** PA-0010 — count of lines in `action-events.ndjson.gz` (0 when `manifest.version < 5` — the entry does not exist). */
     actionEventsSeen: number;
+    /**
+     * SCAN2-004 — chain endpoints, present only when `rowsSeen > 0` AND
+     * `chain.status !== 'invalid'` (an unhealthy in-bundle chain has no
+     * trustworthy endpoint to stitch against — `verify-set` already fails
+     * that bundle outright via its own `report.ok`). `chainHeadAnchor` is
+     * the bundle's leading row's own declared `prevRowHash`
+     * (`GENESIS_PREV_ROW_HASH` for a true history start, an opaque
+     * out-of-bundle value for a legitimate ranged export). `chainTailLinkHash`
+     * is the hash-chain value ({@link computeChainLink}) the row
+     * immediately following this bundle's newest row must declare as ITS
+     * `prevRowHash` — this package never trusted `manifest.from`/`to` alone
+     * to prove one bundle picks up where a sibling left off; these two
+     * fields are what let `verify-set` do that cryptographically instead of
+     * by date alone.
+     */
+    chainHeadRowId?: string;
+    chainHeadAnchor?: string;
+    chainTailRowId?: string;
+    chainTailLinkHash?: string | null;
   };
 }
 
@@ -1102,7 +1121,19 @@ export async function verifyBundle(
   const rowSigResult = withStatus(
     verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm),
   );
-  const chainResult = withStatus(verifyChain(rows));
+  // SCAN2-004 — `chainRaw` carries the head/tail endpoint fields
+  // `ChainVerification` adds on top of `RawComponentResult`; narrow
+  // explicitly before `withStatus` so those extra fields never leak into
+  // the public `chain: ComponentResult` surface. They are surfaced
+  // separately, on `bundle`, for `verify-set` to consume.
+  const chainRaw = verifyChain(rows);
+  const chainResult = withStatus({
+    ok: chainRaw.ok,
+    checked: chainRaw.checked,
+    failed: chainRaw.failed,
+    firstFailure: chainRaw.firstFailure,
+    reason: chainRaw.reason,
+  });
 
   // 5) Parse + verify roots.
   const rootsNdjson = gunzip(byName.get('roots.ndjson.gz')!.data);
@@ -1297,6 +1328,14 @@ export async function verifyBundle(
       sealedPurgesSeen: sealedPurges.length,
       sealedPurgesVerified: verifiedSeals.length,
       actionEventsSeen: actionEvents.length,
+      ...(rows.length > 0 && chainResult.status !== 'invalid'
+        ? {
+            chainHeadRowId: chainRaw.headRowId,
+            chainHeadAnchor: chainRaw.headAnchor,
+            chainTailRowId: chainRaw.tailRowId,
+            chainTailLinkHash: chainRaw.tailChainLink,
+          }
+        : {}),
     },
   };
 }
@@ -3572,7 +3611,27 @@ function verifyRowSignatures(
  * Two rows ever declaring the identical `prevRowHash` (a fork — two rows
  * both claiming to succeed the same predecessor) fails closed immediately.
  */
-function verifyChain(rows: BundleRow[]): RawComponentResult {
+/**
+ * SCAN2-004 — chain endpoints, exposed ONLY when the walk fully succeeds.
+ * `headAnchor` is the unique head row's own declared `prevRowHash` — either
+ * `GENESIS_PREV_ROW_HASH` or an opaque out-of-bundle anchor (legitimate for
+ * a ranged export, BUGHUNT-SDK-02). `tailChainLink` is the hash-chain value
+ * `computeChainLink` says the row immediately AFTER the newest row in this
+ * bundle must declare as ITS `prevRowHash`. Neither value is asserted by
+ * `verifyChain` itself (a single bundle has no sibling to compare against);
+ * `verify-set` (`cli.ts`) is the sole consumer, using `headAnchor` to close
+ * AUDIT-03 (the earliest bundle in a claimed-complete set must be
+ * genesis-rooted) and `tailChainLink` to bind adjacent bundles' boundary
+ * (AUDIT-01) instead of trusting a mere date match.
+ */
+interface ChainVerification extends RawComponentResult {
+  headRowId?: string;
+  headAnchor?: string;
+  tailRowId?: string;
+  tailChainLink?: string | null;
+}
+
+function verifyChain(rows: BundleRow[]): ChainVerification {
   if (rows.length === 0) {
     return { ok: true, checked: 0, failed: 0 };
   }
@@ -3638,10 +3697,12 @@ function verifyChain(rows: BundleRow[]): RawComponentResult {
   // Walk forward from the unique head; a fork or an unreachable row would
   // otherwise slip past the checks above.
   let current: BundleRow | undefined = headCandidates[0];
+  let tailRow: BundleRow = headCandidates[0]!;
   const visited = new Set<string>();
   let steps = 0;
   while (current) {
     visited.add(current.id);
+    tailRow = current;
     steps += 1;
     const link = computeChainLink(current);
     current = link !== null ? byDeclaredPrev.get(link)?.[0] : undefined;
@@ -3658,6 +3719,7 @@ function verifyChain(rows: BundleRow[]): RawComponentResult {
     };
   }
 
+  const head = headCandidates[0]!;
   return {
     ok: true,
     // Number of inter-row link assertions actually made: nodes visited
@@ -3665,6 +3727,10 @@ function verifyChain(rows: BundleRow[]): RawComponentResult {
     // single-row bundle, matching the pre-fix semantics.
     checked: Math.max(0, steps - 1),
     failed: 0,
+    headRowId: head.id,
+    headAnchor: typeof head.prevRowHash === 'string' ? head.prevRowHash : undefined,
+    tailRowId: tailRow.id,
+    tailChainLink: computeChainLink(tailRow),
   };
 }
 
