@@ -102,7 +102,7 @@ function buildRangeBundle(opts: {
   from?: string;
   to?: string;
   /** Mutate row content AFTER signing (breaks that row's signature deterministically, mirrors `buildBundleWithTamper`'s `postSignRowByte` in `verify.spec.ts`). */
-  postSignRowMutate?: (rows: Array<{ action: string }>) => void;
+  postSignRowMutate?: (rows: Array<{ action: string; prevRowHash: string }>) => void;
 }): { zip: Buffer; tailChainLink: string; from: string; to: string } {
   const { orgId, keyVersion, privateKey, publicKey, baseTs, rowCount } = opts;
   const periodStart = opts.from ?? isoSecond(baseTs, 0);
@@ -513,6 +513,79 @@ describe('SCAN2-004 — green: `verify-set` names the gap and closes AUDIT-03', 
       // set is ALSO not continuous by definition — an invalid bundle is a
       // strictly worse signal than a mere gap and must not be silently
       // downgraded to it.
+      expect(result.status).toBe(1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when the four new VerifyReport.bundle chain fields are ABSENT — never silently skips the boundary check and reports continuous', () => {
+    const bundleA = buildRangeBundle({
+      orgId: ORG_ID, keyVersion: KEY_VERSION, privateKey, publicKey,
+      baseTs: Date.UTC(2026, 0, 1, 0, 0, 0), rowCount: 3,
+      firstRowPrevRowHash: GENESIS_PREV_ROW_HASH,
+      from: '2026-01-01T00:00:00.000Z', to: '2026-04-01T00:00:00.000Z',
+    });
+    // Bundle B is date-adjacent to A, but its OWN chain is broken: row 1's
+    // prevRowHash is tampered AFTER signing (same technique as
+    // verify.spec.ts's BUGHUNT-SDK-02 "still catches a MIDDLE-row chain
+    // break" test) — this breaks row 1's signature AND its chain link
+    // simultaneously, since both derive from the same signed preimage.
+    const bundleB = buildRangeBundle({
+      orgId: ORG_ID, keyVersion: KEY_VERSION, privateKey, publicKey,
+      baseTs: Date.UTC(2026, 3, 1, 0, 0, 0), rowCount: 3,
+      firstRowPrevRowHash: bundleA.tailChainLink,
+      from: '2026-04-01T00:00:00.000Z', to: '2026-07-01T00:00:00.000Z',
+      postSignRowMutate: (rows) => {
+        rows[1]!.prevRowHash = GENESIS_PREV_ROW_HASH;
+      },
+    });
+
+    // Precondition, asserted directly: bundle B's OWN single-bundle report
+    // has an invalid chain and the four new fields ARE absent — this is
+    // the exact state the coordinator asked to see proven, not assumed.
+    {
+      const cliPath = cliPathOrThrow();
+      const { tmpDir, paths } = writeTempBundles([bundleB.zip]);
+      try {
+        let stdout: string;
+        try {
+          // A single-bundle `status: invalid` verdict exits 1 — execFileSync
+          // throws on any non-zero exit, same as the PA-0009 CLI tests in
+          // verify.spec.ts; the report JSON is still on `err.stdout`.
+          stdout = execFileSync(
+            process.execPath,
+            [cliPath, paths[0]!, '--no-rekor', '--allow-legacy-unattested', '--json'],
+            { encoding: 'utf8' },
+          );
+        } catch (err) {
+          stdout = (err as { stdout?: string }).stdout ?? '';
+        }
+        const report = JSON.parse(stdout) as VerifyReport;
+        expect(report.status).toBe('invalid');
+        expect(report.chain.status).toBe('invalid');
+        expect('chainHeadAnchor' in report.bundle).toBe(false);
+        expect('chainTailLinkHash' in report.bundle).toBe(false);
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+
+    // With the precondition confirmed, verify-set on [A, B] must fail
+    // closed: `bundle_invalid`, never `continuous` and never
+    // `discontinuous` — an absent chain endpoint must never be read as "no
+    // finding" and silently pass the pair through.
+    const { tmpDir, paths } = writeTempBundles([bundleA.zip, bundleB.zip]);
+    try {
+      const result = runVerifySet(paths);
+      const report = JSON.parse(result.stdout) as {
+        ok: boolean;
+        status: string;
+        findings: unknown[];
+      };
+      expect(report.ok).toBe(false);
+      expect(report.status).toBe('bundle_invalid');
+      expect(report.status).not.toBe('continuous');
       expect(result.status).toBe(1);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
