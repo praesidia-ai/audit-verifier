@@ -19,9 +19,11 @@
  */
 
 import * as fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport, type ComponentResult } from './verify.js';
+import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 
 interface CliArgs {
@@ -31,8 +33,12 @@ interface CliArgs {
   json: boolean;
   help: boolean;
   platformKeyPath: string | null;
+  targetKeysPath: string | null;
   allowLegacyUnattested: boolean;
 }
+
+/** A PEM/SPKI public key is tiny; leave ample room for comments/cert wrappers. */
+const MAX_PLATFORM_KEY_BYTES = 64 * 1024;
 
 const HELP = `praesidia-verify — offline verifier for Praesidia compliance bundles
 
@@ -53,6 +59,8 @@ USAGE
 
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
+  --target-keys <file>
+               JSON map of organizationId:targetId:keyId to trusted Ed25519 PEM.
   --platform-key <file>
                Trust this PEM or SPKI-DER platform attestation public key.
   --allow-legacy-unattested
@@ -85,7 +93,8 @@ EXIT CODES (verify-set)
 
 The bundle is verified entirely offline — the verifier makes NO network
 calls. The Rekor receipt is verified against a PINNED Sigstore public key
-(SET signature + inclusion proof); pass --no-rekor to skip that step.
+(SET signature + signed checkpoint + inclusion proof); pass --no-rekor to
+skip that step.
 `;
 
 type CommonFlags = Omit<CliArgs, 'bundlePath'>;
@@ -97,6 +106,7 @@ function newCommonFlags(): CommonFlags {
     json: false,
     help: false,
     platformKeyPath: null,
+    targetKeysPath: null,
     allowLegacyUnattested: false,
   };
 }
@@ -121,6 +131,11 @@ function parseCommonArgs(
     else if (arg === '--help' || arg === '-h') flags.help = true;
     else if (arg === '--allow-legacy-unattested') {
       flags.allowLegacyUnattested = true;
+    } else if (arg === '--target-keys') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) throw new Error('--target-keys requires a file path');
+      flags.targetKeysPath = value;
+      i += 1;
     } else if (arg === '--platform-key') {
       const value = argv[i + 1];
       if (!value || value.startsWith('-')) {
@@ -162,6 +177,80 @@ function parseVerifySetArgs(argv: string[]): VerifySetArgs {
     );
   }
   return { ...flags, bundlePaths: positionals };
+}
+
+/**
+ * Read one regular file without permitting a FIFO/device to block before the
+ * file-type check, and without allocating beyond the caller's explicit cap.
+ *
+ * `O_NONBLOCK` is inert for regular files but makes opening a FIFO/device return
+ * promptly. The descriptor is then authoritative: `stat` + reads happen on the
+ * same open object, closing path-swap races.
+ */
+async function readRegularFileBounded(
+  filePath: string,
+  maxBytes: number,
+  label: string,
+): Promise<Buffer> {
+  const handle = await fs.open(
+    filePath,
+    fsConstants.O_RDONLY | fsConstants.O_NONBLOCK,
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) {
+      throw new Error(`${label} path is not a regular file`);
+    }
+    if (
+      !Number.isSafeInteger(stat.size) ||
+      stat.size < 0 ||
+      stat.size > maxBytes
+    ) {
+      throw new Error(
+        `${label} size ${stat.size} exceeds limit ${maxBytes}`,
+      );
+    }
+
+    const buffer = Buffer.allocUnsafe(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        offset,
+        buffer.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) {
+        throw new Error(`${label} changed size while it was being read`);
+      }
+      offset += bytesRead;
+    }
+
+    // Reading from the already-open descriptor closes the path-swap race.
+    // One byte beyond the snapshotted length detects concurrent growth
+    // without ever allocating in proportion to the new size.
+    const extra = Buffer.allocUnsafe(1);
+    const { bytesRead: extraBytes } = await handle.read(
+      extra,
+      0,
+      1,
+      buffer.length,
+    );
+    if (extraBytes !== 0) {
+      throw new Error(`${label} changed size while it was being read`);
+    }
+    return buffer;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBundleFileBounded(bundlePath: string): Promise<Buffer> {
+  return readRegularFileBounded(
+    bundlePath,
+    MAX_ZIP_ARCHIVE_BYTES,
+    'bundle',
+  );
 }
 
 /** `status` → the one-word summary token used by `--quiet` and `RESULT:`. */
@@ -285,7 +374,11 @@ function fmtComponent(label: string, c: ComponentResult): string {
 
 /** Shared by single-bundle mode and `verify-set` — loads/validates `--platform-key`. */
 async function resolvePlatformPublicKeyDerB64(platformKeyPath: string): Promise<string> {
-  const keyBytes = await fs.readFile(path.resolve(platformKeyPath));
+  const keyBytes = await readRegularFileBounded(
+    path.resolve(platformKeyPath),
+    MAX_PLATFORM_KEY_BYTES,
+    'platform key',
+  );
   let key: crypto.KeyObject;
   try {
     key = crypto.createPublicKey(keyBytes.toString('utf8'));
@@ -300,6 +393,28 @@ async function resolvePlatformPublicKeyDerB64(platformKeyPath: string): Promise<
     throw new Error('platform key must use the P-256 curve');
   }
   return Buffer.from(key.export({ type: 'spki', format: 'der' })).toString('base64');
+}
+
+/** Shared by single-bundle mode and `verify-set` — loads/validates `--target-keys`. */
+async function resolveTargetPublicKeys(
+  targetKeysPath: string,
+): Promise<Record<string, string>> {
+  const raw: unknown = JSON.parse(
+    (
+      await readRegularFileBounded(path.resolve(targetKeysPath), 1024 * 1024, 'target keys')
+    ).toString('utf8'),
+  );
+  if (
+    !raw ||
+    typeof raw !== 'object' ||
+    Array.isArray(raw) ||
+    Object.values(raw).some(
+      (v) => typeof v !== 'string' || crypto.createPublicKey(v).asymmetricKeyType !== 'ed25519',
+    )
+  ) {
+    throw new Error('Expected a map of target identity to Ed25519 PEM');
+  }
+  return raw as Record<string, string>;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -548,12 +663,21 @@ async function mainVerifySet(argv: string[]): Promise<number> {
       return 2;
     }
   }
+  let targetPublicKeys: Record<string, string> | undefined;
+  if (args.targetKeysPath) {
+    try {
+      targetPublicKeys = await resolveTargetPublicKeys(args.targetKeysPath);
+    } catch (err) {
+      process.stderr.write(`error: cannot load target keys: ${(err as Error).message}\n`);
+      return 2;
+    }
+  }
 
   const entries: Array<{ path: string; report: VerifyReport }> = [];
   for (const bundlePath of args.bundlePaths) {
     let buffer: Buffer;
     try {
-      buffer = await fs.readFile(path.resolve(bundlePath));
+      buffer = await readBundleFileBounded(path.resolve(bundlePath));
     } catch (err) {
       process.stderr.write(
         `error: cannot read bundle ${bundlePath}: ${(err as Error).message}\n`,
@@ -563,6 +687,7 @@ async function mainVerifySet(argv: string[]): Promise<number> {
     try {
       const report = await verifyBundle(buffer, {
         noRekor: args.noRekor,
+        ...(targetPublicKeys ? { targetPublicKeys } : {}),
         allowLegacyUnattested: args.allowLegacyUnattested,
         ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
       });
@@ -612,7 +737,7 @@ async function main(): Promise<number> {
   const resolvedPath = path.resolve(args.bundlePath);
   let buffer: Buffer;
   try {
-    buffer = await fs.readFile(resolvedPath);
+    buffer = await readBundleFileBounded(resolvedPath);
   } catch (err) {
     process.stderr.write(
       `error: cannot read bundle: ${(err as Error).message}\n`,
@@ -629,9 +754,19 @@ async function main(): Promise<number> {
       return 2;
     }
   }
+  let targetPublicKeys: Record<string, string> | undefined;
+  if (args.targetKeysPath) {
+    try {
+      targetPublicKeys = await resolveTargetPublicKeys(args.targetKeysPath);
+    } catch (err) {
+      process.stderr.write(`error: cannot load target keys: ${(err as Error).message}\n`);
+      return 2;
+    }
+  }
   try {
     report = await verifyBundle(buffer, {
       noRekor: args.noRekor,
+      ...(targetPublicKeys ? { targetPublicKeys } : {}),
       allowLegacyUnattested: args.allowLegacyUnattested,
       ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
     });

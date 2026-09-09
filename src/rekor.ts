@@ -11,7 +11,9 @@
  *   1. Verify the Signed Entry Timestamp (SET) — an ECDSA-P256-SHA256
  *      signature over the canonical `{body, integratedTime, logID,
  *      logIndex}` payload — against Sigstore's PINNED Rekor public key.
- *   2. Verify the inclusion proof — walk the RFC 6962 Merkle audit path
+ *   2. Verify the proof's signed checkpoint under the same pinned log key,
+ *      and require its authenticated tree size/root to match the proof.
+ *   3. Verify the inclusion proof — walk the RFC 6962 Merkle audit path
  *      from `leaf = SHA-256(0x00 || base64-decode(body))` up the
  *      sibling list and confirm it reproduces `inclusionProof.rootHash`.
  *
@@ -21,7 +23,7 @@
  * hostile intermediary cannot swap it; sovereign/private Rekor instances
  * (or tests) supply their own key via `VerifyOptions.rekorPublicKeyPem`.
  *
- *   3. Decode the hashedrekord body and bind its digest and signature to
+ *   4. Decode the hashedrekord body and bind its digest and signature to
  *      the exact Merkle root being verified. A genuine unrelated Rekor
  *      receipt therefore cannot be reattached to another bundle root.
  */
@@ -32,6 +34,9 @@ import * as crypto from 'node:crypto';
 // for the SET, inclusion proof, and private-instance metadata while still
 // bounding direct library calls before JSON/base64 processing.
 const MAX_REKOR_RECEIPT_BYTES = 1024 * 1024;
+const MAX_CHECKPOINT_BYTES = 64 * 1024;
+const MAX_CHECKPOINT_SIGNATURES = 32;
+const MAX_INCLUSION_HASHES = 64;
 
 // ── Pinned Sigstore Rekor signing key ────────────────────────────────────
 //
@@ -99,6 +104,7 @@ interface RekorInclusionProof {
   treeSize: number;
   rootHash: string;
   hashes: string[];
+  checkpoint: string;
 }
 
 interface NormalizedEntry {
@@ -116,6 +122,15 @@ export interface ExpectedRekorRoot {
   rootHashB64: string;
   signatureB64: string;
 }
+
+interface AuthenticatedCheckpoint {
+  treeSize: number;
+  rootHash: Buffer;
+}
+
+type CheckpointVerifyResult =
+  | { ok: true; checkpoint: AuthenticatedCheckpoint }
+  | { ok: false; reason: string };
 
 function decodeCanonicalBase64(value: string): Buffer | null {
   if (
@@ -186,6 +201,107 @@ function verifySet(
     };
   }
   return ok ? { ok: true } : { ok: false, reason: 'set_signature_invalid' };
+}
+
+// ── Signed checkpoint verification (C2SP signed-note checkpoint) ──────────
+
+function verifySignedCheckpoint(
+  envelope: string,
+  pubKeyPem: string,
+): CheckpointVerifyResult {
+  if (
+    envelope.length === 0 ||
+    Buffer.byteLength(envelope, 'utf8') > MAX_CHECKPOINT_BYTES
+  ) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+  if (
+    !envelope.endsWith('\n') ||
+    envelope.includes('\r') ||
+    /[\0\uD800-\uDFFF]/u.test(envelope)
+  ) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+
+  const separator = envelope.indexOf('\n\n');
+  if (separator <= 0) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+  const note = envelope.slice(0, separator + 1);
+  const signatureBlock = envelope.slice(separator + 2);
+  const noteLines = note.slice(0, -1).split('\n');
+  if (
+    noteLines.length < 3 ||
+    noteLines[0]!.length === 0 ||
+    noteLines[0]!.length > 1024 ||
+    !/^[1-9]\d{0,15}$/.test(noteLines[1]!)
+  ) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+  const treeSize = Number(noteLines[1]);
+  if (!Number.isSafeInteger(treeSize) || treeSize < 1) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+  const rootHash = decodeCanonicalBase64(noteLines[2]!);
+  if (rootHash === null || rootHash.length !== 32) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+
+  const signatureLines = signatureBlock.slice(0, -1).split('\n');
+  if (
+    signatureLines.length === 0 ||
+    signatureLines.length > MAX_CHECKPOINT_SIGNATURES ||
+    signatureLines.some((line) => line.length === 0)
+  ) {
+    return { ok: false, reason: 'checkpoint_malformed' };
+  }
+
+  let pubKey: crypto.KeyObject;
+  let expectedHint: Buffer;
+  try {
+    pubKey = crypto.createPublicKey(pubKeyPem);
+    const spkiDer = pubKey.export({ type: 'spki', format: 'der' });
+    expectedHint = crypto
+      .createHash('sha256')
+      .update(spkiDer)
+      .digest()
+      .subarray(0, 4);
+  } catch {
+    return { ok: false, reason: 'checkpoint_pubkey_load_failed' };
+  }
+
+  let matchingHintSeen = false;
+  for (const line of signatureLines) {
+    const match = /^— (\S{1,1024}) (\S+)$/u.exec(line);
+    if (!match) return { ok: false, reason: 'checkpoint_malformed' };
+    const signed = decodeCanonicalBase64(match[2]!);
+    if (signed === null || signed.length <= 4 || signed.length > 4096) {
+      return { ok: false, reason: 'checkpoint_malformed' };
+    }
+    const keyHint = signed.subarray(0, 4);
+    if (!crypto.timingSafeEqual(keyHint, expectedHint)) continue;
+    matchingHintSeen = true;
+    try {
+      if (
+        crypto.verify(
+          'sha256',
+          Buffer.from(note, 'utf8'),
+          pubKey,
+          signed.subarray(4),
+        )
+      ) {
+        return { ok: true, checkpoint: { treeSize, rootHash } };
+      }
+    } catch {
+      return { ok: false, reason: 'checkpoint_signature_invalid' };
+    }
+  }
+  return {
+    ok: false,
+    reason: matchingHintSeen
+      ? 'checkpoint_signature_invalid'
+      : 'checkpoint_signature_untrusted',
+  };
 }
 
 // ── Inclusion proof verification (RFC 6962 §2.1) ──────────────────────────
@@ -314,6 +430,14 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
     return null;
   }
   const p = inclusionProofRaw as Record<string, unknown>;
+  const checkpoint =
+    typeof p.checkpoint === 'string'
+      ? p.checkpoint
+      : p.checkpoint &&
+          typeof p.checkpoint === 'object' &&
+          typeof (p.checkpoint as Record<string, unknown>).envelope === 'string'
+        ? ((p.checkpoint as Record<string, unknown>).envelope as string)
+        : null;
   if (
     typeof p.logIndex !== 'number' ||
     !Number.isSafeInteger(p.logIndex) ||
@@ -321,7 +445,11 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
     !Number.isSafeInteger(p.treeSize) ||
     typeof p.rootHash !== 'string' ||
     !Array.isArray(p.hashes) ||
+    p.hashes.length > MAX_INCLUSION_HASHES ||
     !p.hashes.every((hash) => typeof hash === 'string') ||
+    checkpoint === null ||
+    Buffer.byteLength(checkpoint, 'utf8') > MAX_CHECKPOINT_BYTES ||
+    signedEntryTimestamp.length > 4096 ||
     obj.integratedTime < 0 ||
     obj.logIndex < 0 ||
     p.treeSize < 1 ||
@@ -340,8 +468,24 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
       treeSize: p.treeSize,
       rootHash: p.rootHash,
       hashes: p.hashes as string[],
+      checkpoint,
     },
   };
+}
+
+function hasInclusionProofWithoutCheckpoint(raw: unknown): boolean {
+  if (raw === null || typeof raw !== 'object') return false;
+  const obj = raw as Record<string, unknown>;
+  const verification =
+    obj.verification && typeof obj.verification === 'object'
+      ? (obj.verification as Record<string, unknown>)
+      : undefined;
+  const proof = obj.inclusionProof ?? verification?.inclusionProof;
+  return (
+    proof !== null &&
+    typeof proof === 'object' &&
+    (proof as Record<string, unknown>).checkpoint == null
+  );
 }
 
 function verifyBodyBinding(
@@ -397,9 +541,10 @@ function verifyBodyBinding(
  * @param overridePem  Optional PEM to pin instead of the bundled Sigstore
  *                     key — for sovereign/private Rekor instances and tests.
  *
- * Returns `{ ok: true }` ONLY when the SET signature verifies under the
- * resolved pinned key AND the inclusion proof reproduces its rootHash.
- * Every other outcome is `{ ok: false, reason }`.
+ * Returns `{ ok: true }` ONLY when the SET signature and the inclusion
+ * proof's signed checkpoint verify under the resolved pinned key, the
+ * checkpoint authenticates the proof's tree size/root, and the audit path
+ * reproduces that root. Every other outcome is `{ ok: false, reason }`.
  */
 export function verifyRekorReceipt(
   receiptJson: string,
@@ -417,6 +562,9 @@ export function verifyRekorReceipt(
     parsed = JSON.parse(receiptJson);
   } catch {
     return { ok: false, reason: 'receipt_not_json' };
+  }
+  if (hasInclusionProofWithoutCheckpoint(parsed)) {
+    return { ok: false, reason: 'checkpoint_missing' };
   }
   const entry = normalizeReceipt(parsed);
   if (!entry) {
@@ -450,6 +598,27 @@ export function verifyRekorReceipt(
 
   const setResult = verifySet(entry, pem);
   if (!setResult.ok) return setResult;
+
+  const checkpointResult = verifySignedCheckpoint(
+    entry.inclusionProof.checkpoint,
+    pem,
+  );
+  if (!checkpointResult.ok) return checkpointResult;
+  if (
+    checkpointResult.checkpoint.treeSize !== entry.inclusionProof.treeSize
+  ) {
+    return { ok: false, reason: 'checkpoint_tree_size_mismatch' };
+  }
+  if (!/^[0-9a-f]{64}$/i.test(entry.inclusionProof.rootHash)) {
+    return { ok: false, reason: 'inclusion_malformed' };
+  }
+  const proofRoot = Buffer.from(entry.inclusionProof.rootHash, 'hex');
+  if (
+    proofRoot.length !== checkpointResult.checkpoint.rootHash.length ||
+    !crypto.timingSafeEqual(proofRoot, checkpointResult.checkpoint.rootHash)
+  ) {
+    return { ok: false, reason: 'checkpoint_root_mismatch' };
+  }
 
   const inclusionResult = verifyInclusion(entry.inclusionProof, entry.body);
   if (!inclusionResult.ok) return inclusionResult;

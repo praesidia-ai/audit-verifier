@@ -5,19 +5,18 @@
  * `ZipStreamWriter` (AGV-035). No compression at the zip layer, no
  * encryption, UTF-8 filenames, CRC-32 mandatory.
  *
- * AUDIT-2026-05-15 — adds ZIP64 (APPNOTE 4.5) read support so the
- * verifier accepts bundles that exceed the 4 GiB classic limits (a
- * busy tenant at the 90-day cap can easily blow past 4 GiB). The
- * writer in `bundle-exporter.service.ts` only emits ZIP64 records
- * when needed, so small bundles remain byte-identical to the
- * pre-AUDIT-15 layout and the readZip path here transparently handles
- * both forms.
+ * AUDIT-2026-05-15 — adds ZIP64 (APPNOTE 4.5) framing support. Resource
+ * ceilings still apply before entry data is exposed, so ZIP64 metadata is
+ * accepted without allowing multi-gigabyte allocations. The writer in
+ * `bundle-exporter.service.ts` only emits ZIP64 records when needed, so
+ * small bundles remain byte-identical to the pre-AUDIT-15 layout.
  *
  * We deliberately avoid third-party libs (yauzl / jszip / adm-zip) so
  * the verifier keeps a zero-dependency footprint.
  */
 
 import * as zlib from 'node:zlib';
+import { Readable } from 'node:stream';
 import { TextDecoder } from 'node:util';
 
 // ── ZIP local file header signature       'PK\x03\x04'  (little-endian) ─
@@ -41,7 +40,7 @@ const ZIP64_EXTRA_ID = 0x0001;
 
 export interface ZipEntry {
   name: string;
-  /** STORED-method raw bytes (no compression at the zip layer). */
+  /** Uncompressed entry bytes; STORED entries are zero-copy archive views. */
   data: Buffer;
 }
 
@@ -53,22 +52,47 @@ export class ZipReadError extends Error {
 }
 
 export interface ZipReadLimits {
+  maxArchiveBytes?: number;
   maxEntries?: number;
+  maxEntryNameBytes?: number;
   maxEntryUncompressedBytes?: number;
   maxTotalUncompressedBytes?: number;
+  /** Optional exact-name allow-list, enforced before any entry payload is copied/inflated. */
+  allowedEntryNames?: ReadonlySet<string>;
+  /** Optional tighter per-entry caps, enforced before any entry payload is copied/inflated. */
+  maxEntryUncompressedBytesByName?: ReadonlyMap<string, number>;
 }
 
+// The library API receives a Buffer and the CLI snapshots the file into one,
+// so the raw archive itself must be small enough to coexist with parsed JSON
+// on an ordinary Node heap. Current producers cap gzip artifacts at 64 MiB
+// aggregate and metadata at 2 MiB; 72 MiB leaves deterministic framing room
+// without restoring the former multi-gigabyte allocation surface.
+export const MAX_ZIP_ARCHIVE_BYTES = 72 * 1024 * 1024;
+export const MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
+export const MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 68 * 1024 * 1024;
 const DEFAULT_MAX_ENTRIES = 64;
-const DEFAULT_MAX_ENTRY_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024;
-const DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_GUNZIP_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_MAX_ENTRY_NAME_BYTES = 4096;
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+export interface GzipOutputBudget {
+  /** Remaining decoded bytes shared by every nested gzip member. */
+  remainingBytes: number;
+}
+
+export interface GzipReadLimits {
+  entryName: string;
+  maxCompressedBytes: number;
+  maxOutputBytes: number;
+  outputBudget: GzipOutputBudget;
+}
 
 /**
  * Parse a PKZIP archive in-memory. Supports the subset produced by
- * `ZipStreamWriter`: STORED method (and DEFLATE for cross-tool
- * interop), no encryption, UTF-8 filenames, with optional ZIP64
- * extensions. Anything else throws {@link ZipReadError}.
+ * `ZipStreamWriter`: STORED method, no encryption, UTF-8 filenames, with
+ * optional ZIP64 extensions. ZIP-layer compression is rejected: evidence
+ * members already use gzip and are expanded by the bounded streaming path.
+ * Anything else throws {@link ZipReadError}.
  *
  * @param buffer  The raw zip bytes.
  * @returns       Ordered list of entries as they appeared in the
@@ -78,20 +102,44 @@ export function readZip(
   buffer: Buffer,
   limits: ZipReadLimits = {},
 ): ZipEntry[] {
+  const maxArchiveBytes = limits.maxArchiveBytes ?? MAX_ZIP_ARCHIVE_BYTES;
   const maxEntries = limits.maxEntries ?? DEFAULT_MAX_ENTRIES;
+  const maxEntryNameBytes =
+    limits.maxEntryNameBytes ?? DEFAULT_MAX_ENTRY_NAME_BYTES;
   const maxEntryBytes =
-    limits.maxEntryUncompressedBytes ?? DEFAULT_MAX_ENTRY_UNCOMPRESSED_BYTES;
+    limits.maxEntryUncompressedBytes ?? MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES;
   const maxTotalBytes =
-    limits.maxTotalUncompressedBytes ?? DEFAULT_MAX_TOTAL_UNCOMPRESSED_BYTES;
+    limits.maxTotalUncompressedBytes ?? MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES;
   if (
+    !Number.isSafeInteger(maxArchiveBytes) ||
+    maxArchiveBytes <= 0 ||
     !Number.isSafeInteger(maxEntries) ||
     maxEntries <= 0 ||
+    !Number.isSafeInteger(maxEntryNameBytes) ||
+    maxEntryNameBytes <= 0 ||
     !Number.isSafeInteger(maxEntryBytes) ||
     maxEntryBytes <= 0 ||
     !Number.isSafeInteger(maxTotalBytes) ||
     maxTotalBytes <= 0
   ) {
     throw new ZipReadError('invalid zip resource limits');
+  }
+  if (limits.maxEntryUncompressedBytesByName) {
+    for (const [name, limit] of limits.maxEntryUncompressedBytesByName) {
+      if (
+        typeof name !== 'string' ||
+        name.length === 0 ||
+        !Number.isSafeInteger(limit) ||
+        limit <= 0
+      ) {
+        throw new ZipReadError('invalid per-entry zip resource limit');
+      }
+    }
+  }
+  if (buffer.length > maxArchiveBytes) {
+    throw new ZipReadError(
+      `zip archive size ${buffer.length} exceeds limit ${maxArchiveBytes}`,
+    );
   }
   if (buffer.length < 22) {
     throw new ZipReadError('zip too small to contain an EOCD record');
@@ -216,14 +264,13 @@ export function readZip(
     }
     const method = buffer.readUInt16LE(p + 10);
     const expectedCrc = buffer.readUInt32LE(p + 16);
-    if (method !== 0 && method !== 8) {
-      // We accept STORED (the format ZipStreamWriter produces) and
-      // also DEFLATE in case a future archiver re-compresses our
-      // ndjson.gz entries at the zip layer. Anything else is a hard
-      // error so we don't silently mis-read encrypted or otherwise
-      // exotic content.
+    if (method !== 0) {
+      // Evidence streams are already gzip members. Accepting another archive
+      // compression layer would require materializing an intermediate entry
+      // before its nested budget can run, so fail closed on every non-STORED
+      // method.
       throw new ZipReadError(
-        `unsupported zip compression method ${method} (expected STORED or DEFLATE)`,
+        `unsupported zip compression method ${method} (expected STORED)`,
       );
     }
     let compressedSize = buffer.readUInt32LE(p + 20);
@@ -237,6 +284,11 @@ export function readZip(
       throw new ZipReadError('central directory entry extends past its bounds');
     }
     let name: string;
+    if (nameLen > maxEntryNameBytes) {
+      throw new ZipReadError(
+        `zip entry name length ${nameLen} exceeds limit ${maxEntryNameBytes}`,
+      );
+    }
     try {
       name = UTF8_DECODER.decode(buffer.subarray(p + 46, p + 46 + nameLen));
     } catch {
@@ -244,6 +296,9 @@ export function readZip(
     }
     if (name.length === 0 || name.includes('\0')) {
       throw new ZipReadError('zip entry has an invalid empty/NUL name');
+    }
+    if (limits.allowedEntryNames && !limits.allowedEntryNames.has(name)) {
+      throw new ZipReadError(`unexpected zip entry name: ${name}`);
     }
     if (names.has(name)) {
       throw new ZipReadError(`duplicate zip entry name: ${name}`);
@@ -302,9 +357,12 @@ export function readZip(
 
     p = cdhEnd;
 
-    if (uncompressedSize > maxEntryBytes) {
+    const namedMaxEntryBytes =
+      limits.maxEntryUncompressedBytesByName?.get(name) ?? maxEntryBytes;
+    const effectiveMaxEntryBytes = Math.min(maxEntryBytes, namedMaxEntryBytes);
+    if (uncompressedSize > effectiveMaxEntryBytes) {
       throw new ZipReadError(
-        `entry ${name} uncompressed size ${uncompressedSize} exceeds limit ${maxEntryBytes}`,
+        `entry ${name} uncompressed size ${uncompressedSize} exceeds limit ${effectiveMaxEntryBytes}`,
       );
     }
     if (totalUncompressed > maxTotalBytes - uncompressedSize) {
@@ -326,9 +384,12 @@ export function readZip(
     }
     const lfhNameLen = buffer.readUInt16LE(localHeaderOffset + 26);
     const lfhExtraLen = buffer.readUInt16LE(localHeaderOffset + 28);
-    if (
-      localHeaderOffset + 30 + lfhNameLen + lfhExtraLen > buffer.length
-    ) {
+    if (lfhNameLen > maxEntryNameBytes) {
+      throw new ZipReadError(
+        `local zip entry name length ${lfhNameLen} exceeds limit ${maxEntryNameBytes}`,
+      );
+    }
+    if (localHeaderOffset + 30 + lfhNameLen + lfhExtraLen > buffer.length) {
       throw new ZipReadError(`local header for ${name} is truncated`);
     }
     let localName: string;
@@ -340,7 +401,9 @@ export function readZip(
         ),
       );
     } catch {
-      throw new ZipReadError(`local header name for ${name} is not valid UTF-8`);
+      throw new ZipReadError(
+        `local header name for ${name} is not valid UTF-8`,
+      );
     }
     if (localName !== name) {
       throw new ZipReadError(`local/central filename mismatch for ${name}`);
@@ -359,11 +422,7 @@ export function readZip(
         localUncompressedSize === ZIP64_U32_LIMIT
       ) {
         const localExtraStart = localHeaderOffset + 30 + lfhNameLen;
-        const localZip64 = findZip64Extra(
-          buffer,
-          localExtraStart,
-          lfhExtraLen,
-        );
+        const localZip64 = findZip64Extra(buffer, localExtraStart, lfhExtraLen);
         if (!localZip64) {
           throw new ZipReadError(
             `local header for ${name} uses ZIP64 sentinel(s) without a ZIP64 extra field`,
@@ -410,32 +469,13 @@ export function readZip(
       throw new ZipReadError(`data for ${name} past file end`);
     }
     const rawData = buffer.subarray(dataStart, dataStart + compressedSize);
-    let data: Buffer;
-    if (method === 0) {
-      data = Buffer.from(rawData);
-      if (data.length !== uncompressedSize) {
-        throw new ZipReadError(
-          `STORED entry ${name} size mismatch: ${data.length} vs ${uncompressedSize}`,
-        );
-      }
-    } else {
-      // method 8 — DEFLATE
-      try {
-        data = zlib.inflateRawSync(rawData, {
-          maxOutputLength: uncompressedSize,
-        });
-      } catch (err) {
-        throw new ZipReadError(
-          `DEFLATE entry ${name} cannot be decompressed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-      if (data.length !== uncompressedSize) {
-        throw new ZipReadError(
-          `DEFLATE entry ${name} size mismatch: ${data.length} vs ${uncompressedSize}`,
-        );
-      }
+    // `buffer` already owns these immutable archive bytes. Returning a view
+    // avoids retaining a second complete copy of every gzip member.
+    const data = rawData;
+    if (data.length !== uncompressedSize) {
+      throw new ZipReadError(
+        `STORED entry ${name} size mismatch: ${data.length} vs ${uncompressedSize}`,
+      );
     }
     if (computeCrc32(data) !== expectedCrc) {
       throw new ZipReadError(`CRC-32 mismatch for ${name}`);
@@ -588,8 +628,7 @@ export function writeZip(
     chunks.push(local, nameBuf);
     if (extra.length > 0) chunks.push(extra);
     chunks.push(entry.data);
-    offset +=
-      local.length + nameBuf.length + extra.length + entry.data.length;
+    offset += local.length + nameBuf.length + extra.length + entry.data.length;
 
     central.push({
       name: entry.name,
@@ -610,7 +649,9 @@ export function writeZip(
       ? buildZip64Extra({
           uncompressedSize: sizeOverflow ? entry.size : undefined,
           compressedSize: sizeOverflow ? entry.size : undefined,
-          localHeaderOffset: offsetOverflow ? entry.localHeaderOffset : undefined,
+          localHeaderOffset: offsetOverflow
+            ? entry.localHeaderOffset
+            : undefined,
         })
       : Buffer.alloc(0);
 
@@ -713,7 +754,8 @@ function buildZip64Extra(values: {
   localHeaderOffset?: number;
 }): Buffer {
   const parts: number[] = [];
-  if (values.uncompressedSize !== undefined) parts.push(values.uncompressedSize);
+  if (values.uncompressedSize !== undefined)
+    parts.push(values.uncompressedSize);
   if (values.compressedSize !== undefined) parts.push(values.compressedSize);
   if (values.localHeaderOffset !== undefined)
     parts.push(values.localHeaderOffset);
@@ -733,21 +775,75 @@ export function gzipDeterministic(data: Buffer): Buffer {
   return zlib.gzipSync(data, { level: 9 });
 }
 
-/** Gunzip a buffer (verifier reads `*.gz` entries). */
-export function gunzip(
+/**
+ * Incrementally expand one nested gzip member.
+ *
+ * The generator never materializes the decoded member. It emits at most one
+ * zlib chunk at a time and debits both a per-entry ceiling and a caller-owned
+ * aggregate budget before exposing each chunk. Throwing in the consumer (for
+ * example on an oversized NDJSON record) destroys both streams immediately.
+ */
+export async function* gunzipChunks(
   data: Buffer,
-  maxOutputLength = DEFAULT_MAX_GUNZIP_BYTES,
-): Buffer {
-  if (!Number.isSafeInteger(maxOutputLength) || maxOutputLength <= 0) {
-    throw new ZipReadError('invalid gzip output limit');
+  limits: GzipReadLimits,
+): AsyncGenerator<Buffer, void, void> {
+  if (
+    typeof limits.entryName !== 'string' ||
+    limits.entryName.length === 0 ||
+    !Number.isSafeInteger(limits.maxCompressedBytes) ||
+    limits.maxCompressedBytes <= 0 ||
+    !Number.isSafeInteger(limits.maxOutputBytes) ||
+    limits.maxOutputBytes <= 0 ||
+    !Number.isSafeInteger(limits.outputBudget.remainingBytes) ||
+    limits.outputBudget.remainingBytes < 0
+  ) {
+    throw new ZipReadError('invalid gzip resource limits');
   }
-  try {
-    return zlib.gunzipSync(data, { maxOutputLength });
-  } catch (err) {
+  if (data.length > limits.maxCompressedBytes) {
     throw new ZipReadError(
-      `gzip entry cannot be decompressed: ${
+      `${limits.entryName} compressed size ${data.length} exceeds limit ${limits.maxCompressedBytes}`,
+    );
+  }
+
+  // Feed compressed input in bounded views as well. A single 32 MiB write can
+  // otherwise be retained/copied inside native zlib even though decoded
+  // output is chunked correctly.
+  const source = Readable.from(bufferViews(data, 64 * 1024));
+  const inflater = zlib.createGunzip({ chunkSize: 64 * 1024 });
+  const decoded = source.pipe(inflater);
+  let entryOutputBytes = 0;
+  try {
+    for await (const value of decoded) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      if (entryOutputBytes > limits.maxOutputBytes - chunk.length) {
+        throw new ZipReadError(
+          `${limits.entryName} expanded output exceeds per-entry limit ${limits.maxOutputBytes}`,
+        );
+      }
+      if (limits.outputBudget.remainingBytes < chunk.length) {
+        throw new ZipReadError(
+          `bundle gzip output exceeds total resource limit while reading ${limits.entryName}`,
+        );
+      }
+      entryOutputBytes += chunk.length;
+      limits.outputBudget.remainingBytes -= chunk.length;
+      yield chunk;
+    }
+  } catch (err) {
+    if (err instanceof ZipReadError) throw err;
+    throw new ZipReadError(
+      `${limits.entryName} cannot be decompressed: ${
         err instanceof Error ? err.message : String(err)
       }`,
     );
+  } finally {
+    source.destroy();
+    inflater.destroy();
+  }
+}
+
+function* bufferViews(data: Buffer, chunkBytes: number): Generator<Buffer> {
+  for (let offset = 0; offset < data.length; offset += chunkBytes) {
+    yield data.subarray(offset, Math.min(offset + chunkBytes, data.length));
   }
 }

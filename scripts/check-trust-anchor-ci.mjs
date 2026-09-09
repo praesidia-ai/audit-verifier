@@ -15,61 +15,37 @@
  *
  *   1. A PARTIAL edit — exactly one of the two constants changed while the
  *      other didn't (an incomplete fill-in, or an incomplete revert).
- *   2. An INCONSISTENT filled-in key — bad base64, a non-EC key, or a
- *      fingerprint that no longer matches the DER bytes (e.g. someone
- *      pastes a new key over the DER constant without recomputing the
- *      fingerprint, or vice versa).
+ *   2. An INVALID filled-in key — noncanonical base64/SPKI, anything other
+ *      than P-256, a noncanonical fingerprint, or a fingerprint that no
+ *      longer matches the DER bytes (e.g. someone pastes a new key over the
+ *      DER constant without recomputing the fingerprint, or vice versa).
  *
  * Both classes are real regressions a reviewer could plausibly miss in a
  * diff; this check fails the PR the moment either happens, instead of
  * only surfacing at `npm publish` time.
  */
-import crypto from 'node:crypto';
 import {
   PLATFORM_PUBLIC_KEY_DER_B64,
   PLATFORM_PUBLIC_KEY_FINGERPRINT,
 } from '../dist/platform-pubkey.js';
+import { validateTrustAnchor } from './trust-anchor-policy.mjs';
 
 function fail(message) {
   process.stderr.write(`trust-anchor CI check failed: ${message}\n`);
   process.exitCode = 1;
 }
 
-const derEmpty = PLATFORM_PUBLIC_KEY_DER_B64.length === 0;
-const fingerprintEmpty = PLATFORM_PUBLIC_KEY_FINGERPRINT.length === 0;
-
-if (derEmpty && fingerprintEmpty) {
+try {
+  const result = validateTrustAnchor({
+    derBase64: PLATFORM_PUBLIC_KEY_DER_B64,
+    fingerprint: PLATFORM_PUBLIC_KEY_FINGERPRINT,
+    allowEmpty: true,
+  });
   process.stdout.write(
-    'trust-anchor CI check: both constants are still the documented empty ' +
-      'placeholder (PROD16 FINDING 5, pending ops-side keypair generation) — OK.\n',
+    result.state === 'placeholder'
+      ? 'trust-anchor CI check: both constants remain the documented empty placeholder pending the production key ceremony — OK.\n'
+      : 'trust-anchor CI check: pinned key is canonical P-256 and internally consistent — OK.\n',
   );
-} else if (derEmpty !== fingerprintEmpty) {
-  fail(
-    'exactly one of PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT ' +
-      'is empty — this looks like a partial edit or an incomplete revert. Both must ' +
-      'be empty (placeholder) or both filled in together.',
-  );
-} else {
-  try {
-    const der = Buffer.from(PLATFORM_PUBLIC_KEY_DER_B64, 'base64');
-    if (der.toString('base64') !== PLATFORM_PUBLIC_KEY_DER_B64) {
-      fail('PLATFORM_PUBLIC_KEY_DER_B64 is not canonical base64');
-    } else {
-      const key = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
-      if (key.asymmetricKeyType !== 'ec') {
-        fail('the embedded trust anchor is not an EC public key');
-      } else {
-        const fingerprint = crypto.createHash('sha256').update(der).digest('hex');
-        if (fingerprint !== PLATFORM_PUBLIC_KEY_FINGERPRINT.toLowerCase()) {
-          fail('the embedded key does not match PLATFORM_PUBLIC_KEY_FINGERPRINT');
-        } else {
-          process.stdout.write(
-            'trust-anchor CI check: pinned key is filled in and internally consistent — OK.\n',
-          );
-        }
-      }
-    }
-  } catch (error) {
-    fail(error instanceof Error ? error.message : String(error));
-  }
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
 }

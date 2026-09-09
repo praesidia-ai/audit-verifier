@@ -11,10 +11,10 @@ FROM node:24.18-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY tsconfig.json ./
+COPY tsconfig.json tsconfig.spec.json ./
 COPY src ./src
 COPY README.md LICENSE ./
-RUN npm run build && npx vitest run
+RUN npm run build && npm run typecheck:spec && npx vitest run
 
 # ---- runtime: minimal, non-root, zero runtime deps ----
 FROM node:24.18-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS runtime

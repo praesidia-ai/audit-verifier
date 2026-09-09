@@ -26,7 +26,10 @@
  *   3. Compute the sha256-hex fingerprint of the decoded DER bytes and
  *      verify it through the independent production publication channel.
  *   4. Update {@link PLATFORM_PUBLIC_KEY_FINGERPRINT} to match.
- *   5. Cut a new `@praesidia/audit-verifier` release; auditors update
+ *   5. Set the protected `audit-verifier-production` environment variable
+ *      `PRODUCTION_PLATFORM_KEY_FINGERPRINT` to the independently approved
+ *      lowercase fingerprint. Never copy it from this file during approval.
+ *   6. Cut a new `@praesidia/audit-verifier` release; auditors update
  *      the CLI before verifying bundles emitted under the new key.
  *
  * Never generate or export a private PEM for this release step. Production

@@ -1,7 +1,8 @@
 name: Publish
 
-# A release is published only from an immutable version tag whose value matches
-# package.json. Configure the NPM_TOKEN repository secret before cutting a tag.
+# A release is published only from a version tag whose value matches package.json
+# and whose commit is contained in main. Protect tag creation/update/deletion with
+# the repository ruleset. Configure NPM_TOKEN before cutting a tag.
 # The package prepack hook additionally blocks release until the production
 # platform trust anchor has been pinned and verified.
 
@@ -17,6 +18,13 @@ jobs:
     name: npm publish (@praesidia/audit-verifier)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Configure this environment with required reviewers. Its fingerprint
+    # variable is the operator-owned approval input from the production key
+    # ceremony; the release assertion refuses to trust a fingerprint copied
+    # only from this source tree.
+    environment: audit-verifier-production
+    env:
+      PRAESIDIA_RELEASE_APPROVED_PLATFORM_KEY_FINGERPRINT: ${{ vars.PRODUCTION_PLATFORM_KEY_FINGERPRINT }}
     # MIL-0002 F4 — SLSA/npm provenance requires the OIDC token exchange;
     # `id-token: write` is scoped to this job only (least privilege).
     permissions:
@@ -26,6 +34,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -45,10 +54,22 @@ jobs:
             exit 1
           fi
 
+      - name: Verify tagged commit is contained in main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release commit $GITHUB_SHA is not contained in main" >&2
+            exit 1
+          fi
+
       - run: npm run build
+      - run: npm run typecheck:spec
+      - run: npm run test:trust-anchor-policy
       - run: npx vitest run
 
-      - name: Verify publish artifact and production trust anchor
+      - name: Verify operator-approved production trust anchor
+        run: npm run check:release-trust-anchor
+
+      - name: Verify publish artifact (prepack repeats the trust-anchor gate)
         run: npm pack --dry-run
 
       - name: Publish to npm

@@ -26,7 +26,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { readZip, writeZip, ZipReadError } from '../zip.js';
+import {
+  gzipDeterministic,
+  gunzipChunks,
+  readZip,
+  writeZip,
+  ZipReadError,
+} from '../zip.js';
 
 describe('AUDIT-2026-05-15 ZIP64 read support', () => {
   it('default writeZip emits classic EOCD with no ZIP64 locator for small archives', () => {
@@ -82,20 +88,18 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
   });
 
   it('forceZip64 LFH version-needed is 4.5 (45) per APPNOTE 4.5', () => {
-    const zip = writeZip(
-      [{ name: 'f', data: Buffer.from('x', 'utf8') }],
-      { forceZip64: true },
-    );
+    const zip = writeZip([{ name: 'f', data: Buffer.from('x', 'utf8') }], {
+      forceZip64: true,
+    });
     // Local file header: signature at offset 0, version-needed at +4.
     expect(zip.readUInt32LE(0)).toBe(0x04034b50);
     expect(zip.readUInt16LE(4)).toBe(45);
   });
 
   it('rejects a ZIP64 EOCD whose declared record size does not end at the locator', () => {
-    const zip = writeZip(
-      [{ name: 'f', data: Buffer.from('x', 'utf8') }],
-      { forceZip64: true },
-    );
+    const zip = writeZip([{ name: 'f', data: Buffer.from('x', 'utf8') }], {
+      forceZip64: true,
+    });
     const corrupted = Buffer.from(zip);
     const eocdOffset = corrupted.length - 22;
     const zip64EocdOffset = Number(
@@ -112,9 +116,7 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     // it falsely claims ZIP64 sentinels without a locator. This is
     // the "ZIP64 promised, ZIP64 missing" failure mode and the
     // reader must reject rather than silently mis-read.
-    const zip = writeZip([
-      { name: 'a', data: Buffer.from('1', 'utf8') },
-    ]);
+    const zip = writeZip([{ name: 'a', data: Buffer.from('1', 'utf8') }]);
     const corrupted = Buffer.from(zip);
     const eocdOffset = corrupted.length - 22;
     // Plant the sentinel on the cdOffset field.
@@ -173,10 +175,7 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     // sentinel — but that's already 0xFFFFFFFF, so it stays.
     const newEocdOffset = spliced.length - 22;
     const newLocatorOffset = newEocdOffset - 20;
-    spliced.writeBigUInt64LE(
-      BigInt(zip64EocdOffset + 8),
-      newLocatorOffset + 8,
-    );
+    spliced.writeBigUInt64LE(BigInt(zip64EocdOffset + 8), newLocatorOffset + 8);
     // Update the ZIP64 EOCD's cdSize and the locator's count of
     // central dir entries (cdSize grew by 8 because we appended 8
     // bytes inside the CD).
@@ -197,6 +196,115 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
       { name: 'manifest.json', data: Buffer.from('second') },
     ]);
     expect(() => readZip(zip)).toThrow(/duplicate zip entry name/);
+  });
+
+  it('returns zero-copy views for STORED payloads', () => {
+    const zip = writeZip([
+      { name: 'rows.ndjson.gz', data: Buffer.from('compressed-member') },
+    ]);
+    const [entry] = readZip(zip);
+    expect(entry!.data.buffer).toBe(zip.buffer);
+    expect(entry!.data.toString('utf8')).toBe('compressed-member');
+  });
+
+  it('rejects ZIP-layer DEFLATE before attempting inflation', () => {
+    const zip = writeZip([{ name: 'a.txt', data: Buffer.from('payload') }]);
+    const centralDirectoryOffset = zip.readUInt32LE(zip.length - 22 + 16);
+    // The payload is intentionally not rewritten as DEFLATE: rejection must
+    // happen from the method field before any inflation attempt reads it.
+    zip.writeUInt16LE(8, 8);
+    zip.writeUInt16LE(8, centralDirectoryOffset + 10);
+    expect(() => readZip(zip)).toThrow(
+      /unsupported zip compression method 8 \(expected STORED\)/,
+    );
+  });
+
+  it('enforces one aggregate budget across independently compressed gzip members', async () => {
+    const budget = { remainingBytes: 80 * 1024 };
+    const first = gzipDeterministic(Buffer.alloc(48 * 1024, 0x61));
+    const second = gzipDeterministic(Buffer.alloc(48 * 1024, 0x62));
+    let emitted = 0;
+
+    for await (const chunk of gunzipChunks(first, {
+      entryName: 'first.ndjson.gz',
+      maxCompressedBytes: 1024 * 1024,
+      maxOutputBytes: 64 * 1024,
+      outputBudget: budget,
+    })) {
+      emitted += chunk.length;
+    }
+    expect(emitted).toBe(48 * 1024);
+    expect(budget.remainingBytes).toBe(32 * 1024);
+
+    await expect(
+      (async () => {
+        for await (const chunk of gunzipChunks(second, {
+          entryName: 'second.ndjson.gz',
+          maxCompressedBytes: 1024 * 1024,
+          maxOutputBytes: 64 * 1024,
+          outputBudget: budget,
+        })) {
+          emitted += chunk.length;
+        }
+      })(),
+    ).rejects.toThrow(/total resource limit.*second\.ndjson\.gz/);
+    expect(emitted).toBe(48 * 1024);
+  });
+
+  it('rejects a gzip bomb before yielding bytes beyond its per-entry ceiling', async () => {
+    const bomb = gzipDeterministic(Buffer.alloc(2 * 1024 * 1024, 0x00));
+    let emitted = 0;
+    await expect(
+      (async () => {
+        for await (const chunk of gunzipChunks(bomb, {
+          entryName: 'bomb.ndjson.gz',
+          maxCompressedBytes: 1024 * 1024,
+          maxOutputBytes: 32 * 1024,
+          outputBudget: { remainingBytes: 1024 * 1024 },
+        })) {
+          emitted += chunk.length;
+        }
+      })(),
+    ).rejects.toThrow(/per-entry limit 32768/);
+    expect(emitted).toBeLessThanOrEqual(32 * 1024);
+  });
+
+  it('applies the same per-entry ceiling to concatenated gzip members', async () => {
+    const concatenated = Buffer.concat([
+      gzipDeterministic(Buffer.alloc(24 * 1024, 0x61)),
+      gzipDeterministic(Buffer.alloc(24 * 1024, 0x62)),
+    ]);
+    let emitted = 0;
+    await expect(
+      (async () => {
+        for await (const chunk of gunzipChunks(concatenated, {
+          entryName: 'concatenated.ndjson.gz',
+          maxCompressedBytes: 1024 * 1024,
+          maxOutputBytes: 32 * 1024,
+          outputBudget: { remainingBytes: 1024 * 1024 },
+        })) {
+          emitted += chunk.length;
+        }
+      })(),
+    ).rejects.toThrow(/per-entry limit 32768/);
+    expect(emitted).toBeLessThanOrEqual(32 * 1024);
+  });
+
+  it('surfaces truncated gzip input without materializing decoded output', async () => {
+    const complete = gzipDeterministic(Buffer.alloc(128 * 1024, 0x61));
+    const truncated = complete.subarray(0, complete.length - 4);
+    await expect(
+      (async () => {
+        for await (const _chunk of gunzipChunks(truncated, {
+          entryName: 'truncated.ndjson.gz',
+          maxCompressedBytes: 1024 * 1024,
+          maxOutputBytes: 256 * 1024,
+          outputBudget: { remainingBytes: 256 * 1024 },
+        })) {
+          // Drain the stream so footer validation runs.
+        }
+      })(),
+    ).rejects.toThrow(/truncated\.ndjson\.gz cannot be decompressed/);
   });
 
   it('rejects a CRC mismatch even when sizes remain valid', () => {
@@ -241,11 +349,28 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
       { name: 'b', data: Buffer.alloc(8) },
     ]);
     expect(() => readZip(zip, { maxEntries: 1 })).toThrow(/entry count/);
+    expect(() => readZip(zip, { maxEntryUncompressedBytes: 4 })).toThrow(
+      /uncompressed size/,
+    );
+    expect(() => readZip(zip, { maxTotalUncompressedBytes: 12 })).toThrow(
+      /total uncompressed size/,
+    );
+    expect(() => readZip(zip, { maxArchiveBytes: zip.length - 1 })).toThrow(
+      /archive size/,
+    );
+    const longNameZip = writeZip([
+      { name: 'long-name', data: Buffer.from('x') },
+    ]);
+    expect(() => readZip(longNameZip, { maxEntryNameBytes: 4 })).toThrow(
+      /entry name length/,
+    );
+    expect(() => readZip(zip, { allowedEntryNames: new Set(['a']) })).toThrow(
+      /unexpected zip entry name: b/,
+    );
     expect(() =>
-      readZip(zip, { maxEntryUncompressedBytes: 4 }),
-    ).toThrow(/uncompressed size/);
-    expect(() =>
-      readZip(zip, { maxTotalUncompressedBytes: 12 }),
-    ).toThrow(/total uncompressed size/);
+      readZip(zip, {
+        maxEntryUncompressedBytesByName: new Map([['a', 4]]),
+      }),
+    ).toThrow(/entry a uncompressed size 8 exceeds limit 4/);
   });
 });

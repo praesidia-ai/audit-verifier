@@ -1,3 +1,5 @@
+import { verifyHttpReceipt, httpTargetKeyFingerprint, httpRequestCommitment, type HttpRequestEnvelope } from './http-receipt.js';
+import { jcsCommitment, type JsonValue } from './jcs-canonical.js';
 /**
  * Praesidia compliance bundle verifier — pure-function orchestrator.
  *
@@ -52,8 +54,9 @@
  *                                 verification (BUGHUNT-SDK-05): the
  *                                 receipt's Signed Entry Timestamp (SET)
  *                                 is verified against the pinned Sigstore
- *                                 Rekor public key and its inclusion proof
- *                                 is walked to `inclusionProof.rootHash`
+ *                                 Rekor public key; the proof's signed
+ *                                 checkpoint authenticates its tree size
+ *                                 and root before the inclusion path is walked
  *                                 (see `rekor.ts`). A receipt that is not
  *                                 a genuine, SET-signed, log-included
  *                                 entry fails closed. Skipped only via
@@ -61,6 +64,7 @@
  */
 
 import * as crypto from 'node:crypto';
+import { TextDecoder } from 'node:util';
 
 import {
   canonicalJson,
@@ -72,7 +76,15 @@ import {
   type MerkleProof,
   GENESIS_PREV_ROW_HASH,
 } from './crypto.js';
-import { readZip, gunzip, type ZipEntry } from './zip.js';
+import {
+  MAX_ZIP_ARCHIVE_BYTES,
+  MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+  MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+  readZip,
+  gunzipChunks,
+  type ZipEntry,
+  type GzipOutputBudget,
+} from './zip.js';
 import { verifyRekorReceipt } from './rekor.js';
 import {
   PLATFORM_PUBLIC_KEY_DER_B64,
@@ -505,7 +517,11 @@ interface BundleProofEntry {
  * grade, etc. — `PA01-RESEARCH-proof.md` §4/§6) are built against the real
  * shape from day one instead of being migrated twice.
  */
-export type ComponentStatus = 'valid' | 'invalid' | 'incomplete' | 'unsupported';
+export type ComponentStatus =
+  | 'valid'
+  | 'invalid'
+  | 'incomplete'
+  | 'unsupported';
 
 export interface ComponentResult {
   /**
@@ -705,7 +721,8 @@ export interface VerifyReport {
    * window with NO verified seal evidence at all, or whose seals do not
    * account for the full decrease, still fails closed exactly as before —
    * this is a narrowing of the failure surface, never a widening. See
-   * `verifySealedPurgeAuthenticity` / `reconcilePurgeWindow` for the exact
+   * `verifySealedPurgeAuthenticity` / `verifyIntegrityCheckpoints` for the
+   * exact
    * reconciliation rule, including why an empty seal window is NEVER
    * treated as reconciling (an arithmetic coincidence is not evidence).
    */
@@ -882,14 +899,17 @@ export interface VerifyReport {
 }
 
 export interface VerifyOptions {
+  /** Out-of-band Ed25519 PEM pins keyed by "organizationId:targetId:keyId". Never loaded from a bundle. */
+  targetPublicKeys?: Readonly<Record<string, string>>;
   /** Skip the optional Rekor receipt fetch (default: false). */
   noRekor?: boolean;
   /**
    * BUGHUNT-SDK-05 — Explicit override for the `rekor` receipt check
    * (e.g. an on-line re-fetch). When supplied it wins for `rekor`
    * receipts; when ABSENT the verifier now runs REAL offline
-   * verification (SET signature under the pinned Sigstore key +
-   * inclusion proof — see `rekor.ts`), NOT the old `JSON.parse`-only
+   * verification (SET + signed-checkpoint signatures under the pinned
+   * Sigstore key, then inclusion proof — see `rekor.ts`), NOT the old
+   * `JSON.parse`-only
    * default that returned `true` for any valid JSON. Receives the raw
    * receipt string; returns `true` on success.
    */
@@ -947,6 +967,28 @@ export interface VerifyOptions {
    * self-signed bundle cannot pass without an external platform trust anchor.
    */
   allowLegacyUnattested?: boolean;
+  /**
+   * Optional lower resource ceilings for constrained callers and tests.
+   * Overrides may only reduce the verifier's built-in hard limits; attempts
+   * to widen them are rejected as bundle-format errors.
+   */
+  resourceLimits?: Partial<VerifyResourceLimits>;
+}
+
+export interface VerifyResourceLimits {
+  maxBundleBytes: number;
+  maxGzipOutputBytes: number;
+  maxTotalGzipOutputBytes: number;
+  maxNdjsonLineBytes: number;
+  maxTotalNdjsonRecords: number;
+  maxRows: number;
+  maxRoots: number;
+  maxProofs: number;
+  maxIntegrityCheckpoints: number;
+  maxSealedPurges: number;
+  maxActionEvents: number;
+  maxPublicKeys: number;
+  maxAnchorReceipts: number;
 }
 
 export interface AnchorReceiptEntry {
@@ -1018,6 +1060,122 @@ const EXPECTED_ENTRIES = [
   'public-keys.json',
 ];
 
+const BUNDLE_ALLOWED_ENTRY_NAMES = new Set([
+  ...EXPECTED_ENTRIES,
+  'integrity-checkpoints.ndjson.gz',
+  'action-events.ndjson.gz',
+  'sealed-purges.ndjson.gz',
+  'platform-attestation.json',
+  'README.md',
+]);
+
+const GZIP_ENTRY_NAMES = [
+  'rows.ndjson.gz',
+  'roots.ndjson.gz',
+  'proofs.ndjson.gz',
+  'integrity-checkpoints.ndjson.gz',
+  'action-events.ndjson.gz',
+  'sealed-purges.ndjson.gz',
+] as const;
+
+// Static documents are parsed in-memory, while gzip members are consumed a
+// chunk at a time. These outer-entry limits align with the producer's 2 MiB
+// metadata and 32 MiB compressed-artifact ceilings.
+const MAX_STATIC_ENTRY_BYTES = 2 * 1024 * 1024;
+const MAX_GZIP_COMPRESSED_BYTES = 32 * 1024 * 1024;
+const BUNDLE_ENTRY_LIMITS = new Map<string, number>([
+  ['manifest.json', MAX_STATIC_ENTRY_BYTES],
+  ['public-keys.json', MAX_STATIC_ENTRY_BYTES],
+  ['platform-attestation.json', MAX_STATIC_ENTRY_BYTES],
+  ['README.md', MAX_STATIC_ENTRY_BYTES],
+  ...GZIP_ENTRY_NAMES.map((name) => [name, MAX_GZIP_COMPRESSED_BYTES] as const),
+]);
+
+const DEFAULT_RESOURCE_LIMITS: Readonly<VerifyResourceLimits> = {
+  maxBundleBytes: MAX_ZIP_ARCHIVE_BYTES,
+  maxGzipOutputBytes: 32 * 1024 * 1024,
+  maxTotalGzipOutputBytes: 64 * 1024 * 1024,
+  maxNdjsonLineBytes: 1024 * 1024,
+  maxTotalNdjsonRecords: 300_000,
+  maxRows: 250_000,
+  maxRoots: 250_000,
+  maxProofs: 250_000,
+  maxIntegrityCheckpoints: 250_000,
+  maxSealedPurges: 250_000,
+  maxActionEvents: 250_000,
+  maxPublicKeys: 256,
+  maxAnchorReceipts: 200_000,
+};
+
+const STRICT_UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+
+function resolveResourceLimits(
+  overrides: Partial<VerifyResourceLimits> | undefined,
+): VerifyResourceLimits {
+  const resolved: VerifyResourceLimits = {
+    ...DEFAULT_RESOURCE_LIMITS,
+    ...overrides,
+  };
+  for (const key of Object.keys(DEFAULT_RESOURCE_LIMITS) as Array<
+    keyof VerifyResourceLimits
+  >) {
+    const value = resolved[key];
+    const hardLimit = DEFAULT_RESOURCE_LIMITS[key];
+    if (!Number.isSafeInteger(value) || value <= 0 || value > hardLimit) {
+      throw new Error(
+        `invalid resource limit ${key}: expected a positive safe integer no greater than ${hardLimit}`,
+      );
+    }
+  }
+  return resolved;
+}
+
+function decodeUtf8Strict(data: Buffer, entryName: string): string {
+  try {
+    return STRICT_UTF8_DECODER.decode(data);
+  } catch {
+    throw new Error(`${entryName} is not valid UTF-8`);
+  }
+}
+
+function assertManifestResourceClaims(
+  manifest: BundleManifest,
+  limits: VerifyResourceLimits,
+): void {
+  const claims: Array<[string, number | undefined, number]> = [
+    ['rowCount', manifest.rowCount, limits.maxRows],
+    ['rootCount', manifest.rootCount, limits.maxRoots],
+    [
+      'integrityCheckpointCount',
+      manifest.integrityCheckpointCount,
+      limits.maxIntegrityCheckpoints,
+    ],
+    ['actionEventCount', manifest.actionEventCount, limits.maxActionEvents],
+    ['keyVersions.length', manifest.keyVersions.length, limits.maxPublicKeys],
+  ];
+  for (const [field, value, limit] of claims) {
+    if (value !== undefined && value > limit) {
+      throw new Error(
+        `manifest ${field} ${value} exceeds verifier resource limit ${limit}`,
+      );
+    }
+  }
+  // A complete bundle needs one proof record for every audit row. Reject a
+  // signed scope that cannot fit the shared record budget before expanding
+  // any gzip member; optional sealed-purge records remain accounted exactly
+  // by the streaming parser.
+  const minimumNdjsonRecords =
+    manifest.rowCount * 2 +
+    manifest.rootCount +
+    (manifest.integrityCheckpointCount ?? 0) +
+    (manifest.actionEventCount ?? 0);
+  if (minimumNdjsonRecords > limits.maxTotalNdjsonRecords) {
+    throw new Error(
+      `manifest requires at least ${minimumNdjsonRecords} NDJSON records, exceeding verifier total resource limit ${limits.maxTotalNdjsonRecords}`,
+    );
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Entry point
 // ────────────────────────────────────────────────────────────────────────
@@ -1032,8 +1190,17 @@ export async function verifyBundle(
   bundle: Buffer,
   options: VerifyOptions = {},
 ): Promise<VerifyReport> {
+  const resourceLimits = resolveResourceLimits(options.resourceLimits);
+
   // 1) Read & validate the zip envelope.
-  const entries = readZip(bundle);
+  const entries = readZip(bundle, {
+    maxArchiveBytes: resourceLimits.maxBundleBytes,
+    maxEntries: BUNDLE_ALLOWED_ENTRY_NAMES.size,
+    maxEntryUncompressedBytes: MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
+    maxTotalUncompressedBytes: MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+    allowedEntryNames: BUNDLE_ALLOWED_ENTRY_NAMES,
+    maxEntryUncompressedBytesByName: BUNDLE_ENTRY_LIMITS,
+  });
   const byName = new Map<string, ZipEntry>();
   for (const e of entries) byName.set(e.name, e);
   for (const required of EXPECTED_ENTRIES) {
@@ -1044,9 +1211,10 @@ export async function verifyBundle(
 
   // 2) Parse manifest, public keys.
   const manifest = JSON.parse(
-    byName.get('manifest.json')!.data.toString('utf8'),
+    decodeUtf8Strict(byName.get('manifest.json')!.data, 'manifest.json'),
   ) as BundleManifest;
   assertManifestStructure(manifest);
+  assertManifestResourceClaims(manifest, resourceLimits);
 
   // FIX01 F5(b) / manifest-v4 — `integrity-checkpoints.ndjson.gz` is only
   // required once the DECLARED version says it should exist; checked here
@@ -1068,7 +1236,7 @@ export async function verifyBundle(
   }
 
   const publicKeysParsed: unknown = JSON.parse(
-    byName.get('public-keys.json')!.data.toString('utf8'),
+    decodeUtf8Strict(byName.get('public-keys.json')!.data, 'public-keys.json'),
   );
   if (
     publicKeysParsed === null ||
@@ -1078,6 +1246,11 @@ export async function verifyBundle(
     throw new Error('public-keys.json must contain an object');
   }
   const publicKeysRaw = publicKeysParsed as Record<string, unknown>;
+  if (Object.keys(publicKeysRaw).length > resourceLimits.maxPublicKeys) {
+    throw new Error(
+      `public-keys.json key count exceeds verifier resource limit ${resourceLimits.maxPublicKeys}`,
+    );
+  }
   const publicKeys = new Map<number, PublicKeyRecord>();
   const keyMaterialOwners = new Map<string, string>();
   for (const [k, v] of Object.entries(publicKeysRaw)) {
@@ -1109,9 +1282,37 @@ export async function verifyBundle(
   // 3) Verify manifest signature.
   const manifestResult = withStatus(verifyManifest(manifest, publicKeys));
 
+  const gzipOutputBudget: GzipOutputBudget = {
+    remainingBytes: resourceLimits.maxTotalGzipOutputBytes,
+  };
+  const ndjsonRecordBudget: NdjsonRecordBudget = {
+    remainingRecords: resourceLimits.maxTotalNdjsonRecords,
+  };
+  const parseGzipNdjson = async <T>(
+    entryName: string,
+    maxRecords: number,
+  ): Promise<T[]> => {
+    const entry = byName.get(entryName);
+    if (!entry) throw new Error(`bundle missing required entry: ${entryName}`);
+    return parseNdjsonChunks<T>(
+      gunzipChunks(entry.data, {
+        entryName,
+        maxCompressedBytes: MAX_GZIP_COMPRESSED_BYTES,
+        maxOutputBytes: resourceLimits.maxGzipOutputBytes,
+        outputBudget: gzipOutputBudget,
+      }),
+      entryName,
+      maxRecords,
+      resourceLimits.maxNdjsonLineBytes,
+      ndjsonRecordBudget,
+    );
+  };
+
   // 4) Parse + verify rows.
-  const rowsNdjson = gunzip(byName.get('rows.ndjson.gz')!.data);
-  const rows = parseNdjson<BundleRow>(rowsNdjson);
+  const rows = await parseGzipNdjson<BundleRow>(
+    'rows.ndjson.gz',
+    resourceLimits.maxRows,
+  );
   assertRowsStructure(rows, manifest.orgId);
 
   // NX-TAC-02 — Thread the manifest's signatureAlgorithm into the
@@ -1136,16 +1337,34 @@ export async function verifyBundle(
   });
 
   // 5) Parse + verify roots.
-  const rootsNdjson = gunzip(byName.get('roots.ndjson.gz')!.data);
-  const roots = parseNdjson<BundleRoot>(rootsNdjson);
+  const roots = await parseGzipNdjson<BundleRoot>(
+    'roots.ndjson.gz',
+    resourceLimits.maxRoots,
+  );
   assertRootsStructure(roots, manifest.orgId);
+  let anchorReceiptCount = 0;
+  for (const root of roots) {
+    anchorReceiptCount +=
+      Array.isArray(root.anchorReceipts) && root.anchorReceipts.length > 0
+        ? root.anchorReceipts.length
+        : root.anchorReceipt
+          ? 1
+          : 0;
+    if (anchorReceiptCount > resourceLimits.maxAnchorReceipts) {
+      throw new Error(
+        `bundle anchor receipt count exceeds verifier resource limit ${resourceLimits.maxAnchorReceipts}`,
+      );
+    }
+  }
   const rootSigResult = withStatus(
     verifyRootSignatures(roots, publicKeys, manifest.signatureAlgorithm),
   );
 
   // 6) Parse + verify inclusion proofs.
-  const proofsNdjson = gunzip(byName.get('proofs.ndjson.gz')!.data);
-  const proofs = parseNdjson<BundleProofEntry>(proofsNdjson);
+  const proofs = await parseGzipNdjson<BundleProofEntry>(
+    'proofs.ndjson.gz',
+    resourceLimits.maxProofs,
+  );
   assertProofsStructure(proofs);
   const proofResult = withStatus(verifyInclusionProofs(rows, roots, proofs));
 
@@ -1153,8 +1372,9 @@ export async function verifyBundle(
   // empty array for every earlier version).
   const checkpoints: BundleIntegrityCheckpoint[] =
     manifest.version >= 4
-      ? parseNdjson<BundleIntegrityCheckpoint>(
-          gunzip(byName.get('integrity-checkpoints.ndjson.gz')!.data),
+      ? await parseGzipNdjson<BundleIntegrityCheckpoint>(
+          'integrity-checkpoints.ndjson.gz',
+          resourceLimits.maxIntegrityCheckpoints,
         )
       : [];
   assertIntegrityCheckpointsStructure(checkpoints, manifest.orgId);
@@ -1170,7 +1390,10 @@ export async function verifyBundle(
   // algorithm) — see `verifySealedPurgeAuthenticity`.
   const sealedPurgesEntry = byName.get('sealed-purges.ndjson.gz') ?? null;
   const sealedPurges: BundleSealedPurge[] = sealedPurgesEntry
-    ? parseNdjson<BundleSealedPurge>(gunzip(sealedPurgesEntry.data))
+    ? await parseGzipNdjson<BundleSealedPurge>(
+        'sealed-purges.ndjson.gz',
+        resourceLimits.maxSealedPurges,
+      )
     : [];
   assertSealedPurgesStructure(sealedPurges, manifest.orgId);
   const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys);
@@ -1189,15 +1412,22 @@ export async function verifyBundle(
   // empty array for every earlier version, mirroring integrity checkpoints).
   const actionEvents: BundleActionEvent[] =
     manifest.version >= 5
-      ? parseNdjson<BundleActionEvent>(
-          gunzip(byName.get('action-events.ndjson.gz')!.data),
+      ? await parseGzipNdjson<BundleActionEvent>(
+          'action-events.ndjson.gz',
+          resourceLimits.maxActionEvents,
         )
       : [];
   assertActionEventsStructure(actionEvents, manifest.orgId);
   const actionEventsSupported = manifest.version >= 5;
 
   const actionEventChainResult = actionEventsSupported
-    ? withStatus(verifyActionEventChain(actionEvents, publicKeys, manifest.signatureAlgorithm))
+    ? withStatus(
+        verifyActionEventChain(
+          actionEvents,
+          publicKeys,
+          manifest.signatureAlgorithm,
+        ),
+      )
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const permitBindingResult = actionEventsSupported
     ? withStatus(verifyPermitBinding(actionEvents))
@@ -1208,20 +1438,26 @@ export async function verifyBundle(
   const dispatchIntegrityResult = actionEventsSupported
     ? withStatus(verifyDispatchIntegrity(actionEvents))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
-  const targetAckRaw = actionEventsSupported ? verifyTargetAck(actionEvents) : null;
+  const targetAckRaw = actionEventsSupported
+    ? verifyTargetAck(actionEvents, options.targetPublicKeys)
+    : null;
   const targetAckResult = actionEventsSupported
     ? withStatus(targetAckRaw!.result, targetAckRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
-  const callerResultRaw = actionEventsSupported ? verifyCallerResult(actionEvents) : null;
+  const callerResultRaw = actionEventsSupported
+    ? verifyCallerResult(actionEvents)
+    : null;
   const callerResultResult = actionEventsSupported
     ? withStatus(callerResultRaw!.result, callerResultRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
-  const closureLegalityRaw = actionEventsSupported ? verifyClosureLegality(actionEvents) : null;
+  const closureLegalityRaw = actionEventsSupported
+    ? verifyClosureLegality(actionEvents)
+    : null;
   const closureLegalityResult = actionEventsSupported
     ? withStatus(closureLegalityRaw!.result, closureLegalityRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const evidenceGradeResult = actionEventsSupported
-    ? withStatus(verifyEvidenceGrade(actionEvents, manifest))
+    ? withStatus(verifyEvidenceGrade(actionEvents, manifest, options.targetPublicKeys))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const actionCompletenessResult = actionEventsSupported
     ? withStatus(verifyActionCompleteness(manifest, actionEvents))
@@ -1753,7 +1989,10 @@ function verifyKeyBinding(
     // instead of silently taking the true-v1 fallback.
     if (manifest.version >= 2 || signedEntry.status !== undefined) {
       const usedRecord = publicKeys.get(ver);
-      if (usedRecord === undefined || usedRecord.status !== signedEntry.status) {
+      if (
+        usedRecord === undefined ||
+        usedRecord.status !== signedEntry.status
+      ) {
         failed += 1;
         if (firstFailure === undefined) {
           firstFailure = k;
@@ -1762,15 +2001,14 @@ function verifyKeyBinding(
         continue;
       }
       const signedRevokedAtTime =
-        signedEntry.revokedAt == null ? null : Date.parse(signedEntry.revokedAt);
+        signedEntry.revokedAt == null
+          ? null
+          : Date.parse(signedEntry.revokedAt);
       const usedRevokedAtTime =
         usedRecord.revokedAt === null ? null : usedRecord.revokedAt.getTime();
       const signedRevokedAtInvalid =
         signedEntry.revokedAt != null && Number.isNaN(signedRevokedAtTime);
-      if (
-        signedRevokedAtInvalid ||
-        signedRevokedAtTime !== usedRevokedAtTime
-      ) {
+      if (signedRevokedAtInvalid || signedRevokedAtTime !== usedRevokedAtTime) {
         failed += 1;
         if (firstFailure === undefined) {
           firstFailure = k;
@@ -1860,6 +2098,38 @@ function verifyRootCoverage(
     }
   }
 
+  const verifiedSealByRootAndCount = new Map<string, BundleSealedPurge>();
+  for (const seal of verifiedSeals) {
+    const key = [
+      seal.periodStart,
+      seal.periodEnd,
+      seal.rootHash,
+      seal.rowCount,
+    ].join('\0');
+    if (!verifiedSealByRootAndCount.has(key)) {
+      verifiedSealByRootAndCount.set(key, seal);
+    }
+  }
+  const matchingSeal = (
+    root: BundleRoot,
+    missingCount: number,
+  ): BundleSealedPurge | null => {
+    // A seal can only account for complete removal of the root's committed
+    // rows under the existing contract. Include both committed and missing
+    // counts in the predicate before the O(1) lookup.
+    if (root.rowCount !== missingCount) return null;
+    return (
+      verifiedSealByRootAndCount.get(
+        [
+          root.periodStart,
+          root.periodEnd,
+          root.rootHash,
+          String(root.rowCount),
+        ].join('\0'),
+      ) ?? null
+    );
+  };
+
   const rowTimes: number[] = [];
   for (const row of rows) {
     if (typeof row.signedAt === 'string') {
@@ -1897,7 +2167,7 @@ function verifyRootCoverage(
       // unconditionally regardless of any matching seal.
       const seal =
         rowsInPeriod < root.rowCount
-          ? findMatchingSeal(verifiedSeals, root, root.rowCount - rowsInPeriod)
+          ? matchingSeal(root, root.rowCount - rowsInPeriod)
           : null;
       if (seal) {
         sealExemptions.push(
@@ -1916,7 +2186,7 @@ function verifyRootCoverage(
     if (proofsForRoot !== root.rowCount) {
       const seal =
         proofsForRoot < root.rowCount
-          ? findMatchingSeal(verifiedSeals, root, root.rowCount - proofsForRoot)
+          ? matchingSeal(root, root.rowCount - proofsForRoot)
           : null;
       if (seal) {
         sealExemptions.push(
@@ -1940,35 +2210,6 @@ function verifyRootCoverage(
     ...(reason !== undefined ? { reason } : {}),
     ...(sealExemptions.length > 0 ? { sealExemptions } : {}),
   };
-}
-
-/**
- * FIX01 (audit-verifier2) / `BE-0003` — find a VERIFIED sealed-purge entry
- * that names the exact same period+root as the root under evaluation. Exact
- * string equality on `periodStart`/`periodEnd`/`rootHash`, per the spec —
- * these are the same ISO/base64 values both sides derive from the same
- * underlying `AuditMerkleRoot` row, so no fuzzy/tolerant matching is used
- * (a near-miss is NOT evidence; it is itself suspicious).
- */
-function findMatchingSeal(
-  verifiedSeals: BundleSealedPurge[],
-  root: BundleRoot,
-  missingCount: number,
-): BundleSealedPurge | null {
-  return (
-    verifiedSeals.find(
-      (seal) =>
-        seal.periodStart === root.periodStart &&
-        seal.periodEnd === root.periodEnd &&
-        seal.rootHash === root.rootHash &&
-        // A retention seal records exactly how many rows the purge replaced.
-        // Matching only period+root let a valid seal for one removed row
-        // excuse an arbitrary suffix deletion. Require arithmetic coverage,
-        // not merely a nearby signed artifact.
-        BigInt(seal.rowCount) === BigInt(root.rowCount) &&
-        BigInt(seal.rowCount) === BigInt(missingCount),
-    ) ?? null
-  );
 }
 
 /**
@@ -2029,7 +2270,14 @@ function verifyIntegrityCheckpoints(
       cumulativeRowCount: cp.cumulativeRowCount,
       asOf: cp.asOf,
     });
-    if (!verifySignature(cp.signatureAlgorithm, message, cp.signature, entry.publicKey)) {
+    if (
+      !verifySignature(
+        cp.signatureAlgorithm,
+        message,
+        cp.signature,
+        entry.publicKey,
+      )
+    ) {
       fail(cp.id, 'checkpoint signature does not verify');
     }
   }
@@ -2039,15 +2287,110 @@ function verifyIntegrityCheckpoints(
   // avoid Number precision loss on a very chatty tenant.
   //
   // FIX01 (audit-verifier2) — `AuditRetentionSealService.purgeWithSeal` can
-  // legitimately DECREASE this value. `reconcilePurgeWindow` downgrades
-  // this to a pass ONLY when a VERIFIED seal (or seals) whose `deletedAt`
+  // legitimately DECREASE this value. The pre-indexed purge-window check
+  // downgrades this to a pass ONLY when a VERIFIED seal (or seals) whose
+  // `deletedAt`
   // falls in `(prev.asOf, cur.asOf]` sums to at least the observed
-  // decrease — see that function's doc comment for why an empty seal
-  // window is never treated as reconciling even when the arithmetic is
-  // trivially satisfied.
+  // decrease. An empty seal window is never treated as reconciling even
+  // when the arithmetic is trivially satisfied.
   const byAsOf = [...checkpoints].sort(
     (a, b) => Date.parse(a.asOf) - Date.parse(b.asOf),
   );
+  const checkpointTimes = byAsOf.map((cp) => Date.parse(cp.asOf));
+  const checkpointIndexById = new Map(
+    byAsOf.map((cp, index) => [cp.id, index] as const),
+  );
+
+  // Adjacent checkpoint windows are disjoint. Assign each verified seal to
+  // its one `(prev.asOf, cur.asOf]` window once, instead of filtering the
+  // full seal list for every checkpoint comparison.
+  const sealsByWindow: BundleSealedPurge[][] = Array.from(
+    { length: byAsOf.length },
+    () => [],
+  );
+  const sealRowsByWindow = Array.from({ length: byAsOf.length }, () => 0n);
+  for (const seal of verifiedSeals) {
+    const sealTime = Date.parse(seal.deletedAt);
+    const windowIndex = lowerBound(checkpointTimes, sealTime);
+    if (
+      windowIndex <= 0 ||
+      windowIndex >= checkpointTimes.length ||
+      sealTime <= checkpointTimes[windowIndex - 1]!
+    ) {
+      continue;
+    }
+    sealsByWindow[windowIndex]!.push(seal);
+    sealRowsByWindow[windowIndex] =
+      sealRowsByWindow[windowIndex]! + BigInt(seal.rowCount);
+  }
+  const reconcileAtIndex = (
+    index: number,
+    decrease: bigint,
+  ): { exempted: boolean; seals: BundleSealedPurge[] } => {
+    const seals = sealsByWindow[index] ?? [];
+    return {
+      exempted: seals.length > 0 && decrease <= (sealRowsByWindow[index] ?? 0n),
+      seals,
+    };
+  };
+
+  // Compute each row's canonical link once, then advance a tip set as the
+  // sorted checkpoints move forward. This preserves the former per-window
+  // link-not-claimed semantics while reducing C checkpoints x R rows work
+  // to one row sort plus a single advancing pass.
+  const timedRows = rows
+    .map((row) => ({
+      row,
+      time:
+        typeof row.signedAt === 'string'
+          ? Date.parse(row.signedAt)
+          : Number.POSITIVE_INFINITY,
+      link: computeChainLink(row),
+    }))
+    .sort((a, b) => a.time - b.time);
+  const chainLinkByRow = new Map(
+    timedRows.map(({ row, link }) => [row, link] as const),
+  );
+  const claimedLinks = new Set<string>();
+  const candidateTips = new Set<BundleRow>();
+  const candidatesByLink = new Map<string, BundleRow[]>();
+  const tipsByCheckpointId = new Map<string, BundleRow | null>();
+  let rowCursor = 0;
+  for (
+    let checkpointIndex = 0;
+    checkpointIndex < byAsOf.length;
+    checkpointIndex++
+  ) {
+    const checkpointTime = checkpointTimes[checkpointIndex]!;
+    while (
+      rowCursor < timedRows.length &&
+      timedRows[rowCursor]!.time <= checkpointTime
+    ) {
+      const timed = timedRows[rowCursor]!;
+      rowCursor += 1;
+      if (typeof timed.row.prevRowHash === 'string') {
+        claimedLinks.add(timed.row.prevRowHash);
+        const predecessors = candidatesByLink.get(timed.row.prevRowHash);
+        if (predecessors) {
+          for (const predecessor of predecessors) {
+            candidateTips.delete(predecessor);
+          }
+          candidatesByLink.delete(timed.row.prevRowHash);
+        }
+      }
+      if (timed.link !== null && !claimedLinks.has(timed.link)) {
+        candidateTips.add(timed.row);
+        const sameLink = candidatesByLink.get(timed.link) ?? [];
+        sameLink.push(timed.row);
+        candidatesByLink.set(timed.link, sameLink);
+      }
+    }
+    const soleTip =
+      candidateTips.size === 1
+        ? (candidateTips.values().next().value ?? null)
+        : null;
+    tipsByCheckpointId.set(byAsOf[checkpointIndex]!.id, soleTip);
+  }
   // Precomputed once, shared with the chainHeadHash loop (3) below so both
   // checks reconcile against the exact same prev/cur pair and BigInt
   // parse — `null` marks a checkpoint whose cumulativeRowCount failed to
@@ -2068,17 +2411,15 @@ function verifyIntegrityCheckpoints(
     const prevCount = countsByAsOf[i - 1];
     const curCount = countsByAsOf[i];
     if (prevCount === null || curCount === null) {
-      fail(cur.id, 'checkpoint cumulativeRowCount is not a valid integer string');
+      fail(
+        cur.id,
+        'checkpoint cumulativeRowCount is not a valid integer string',
+      );
       continue;
     }
     if (curCount < prevCount) {
       const decrease = prevCount - curCount;
-      const { exempted, seals } = reconcilePurgeWindow(
-        prev.asOf,
-        cur.asOf,
-        decrease,
-        verifiedSeals,
-      );
+      const { exempted, seals } = reconcileAtIndex(i, decrease);
       if (exempted) {
         sealExemptions.push(
           `seal_exempted: cumulativeRowCount decrease of ${decrease} between checkpoints ${prev.asOf}..${cur.asOf} reconciled by AuditRetentionSeal(s) ${seals.map((s) => `${s.id} (approval ${s.approvalId})`).join(', ')}`,
@@ -2107,8 +2448,7 @@ function verifyIntegrityCheckpoints(
   // genesis hash — that claim ("no rows existed yet") is fully consistent
   // with an empty window and is checked as a pass, not skipped.
   for (const cp of checkpoints) {
-    const cpMs = Date.parse(cp.asOf);
-    const tip = trueSubchainTip(rows, cpMs);
+    const tip = tipsByCheckpointId.get(cp.id) ?? null;
     if (tip === null) {
       if (cp.chainHeadHash === GENESIS_PREV_ROW_HASH) {
         checked += 1; // consistent: no rows at/before asOf, claims genesis.
@@ -2116,7 +2456,7 @@ function verifyIntegrityCheckpoints(
       continue; // ambiguous (dormant/boundary/purged/broken) — not asserted.
     }
     checked += 1;
-    const computedLink = computeChainLink(tip);
+    const computedLink = chainLinkByRow.get(tip) ?? null;
     if (computedLink !== cp.chainHeadHash) {
       // FIX01 (audit-verifier2) — reconcile against the SAME prev/cur pair
       // and decrease amount as check (2) above, per the spec ("For a
@@ -2125,21 +2465,15 @@ function verifyIntegrityCheckpoints(
       // has a predecessor in asOf order; the very first checkpoint has
       // nothing to reconcile against and keeps failing as before (no
       // regression — this matches the pre-existing, unaffected behavior).
-      const idx = byAsOf.findIndex((c) => c.id === cp.id);
+      const idx = checkpointIndexById.get(cp.id) ?? -1;
       let exempted = false;
       let sealNames: string[] = [];
       if (idx > 0) {
-        const prev = byAsOf[idx - 1]!;
         const prevCount = countsByAsOf[idx - 1];
         const curCount = countsByAsOf[idx];
         if (prevCount !== null && curCount !== null) {
           const decrease = prevCount - curCount;
-          const reconciled = reconcilePurgeWindow(
-            prev.asOf,
-            cp.asOf,
-            decrease,
-            verifiedSeals,
-          );
+          const reconciled = reconcileAtIndex(idx, decrease);
           exempted = reconciled.exempted;
           sealNames = reconciled.seals.map(
             (s) => `${s.id} (approval ${s.approvalId})`,
@@ -2167,80 +2501,6 @@ function verifyIntegrityCheckpoints(
     ...(reason !== undefined ? { reason } : {}),
     ...(sealExemptions.length > 0 ? { sealExemptions } : {}),
   };
-}
-
-/**
- * FIX01 (audit-verifier2) / `BE-0003` — the reconciliation rule from the
- * spec's algorithm step 3: collect every VERIFIED sealed-purge entry whose
- * `deletedAt` falls in `(prevAsOf, curAsOf]` and check whether their summed
- * `rowCount` accounts for the observed `decrease` between two checkpoints.
- *
- * Deliberately requires the collected seal window to be NON-EMPTY before
- * exempting anything, even though the literal arithmetic
- * (`decrease <= sum`) is also trivially satisfied by an EMPTY window
- * whenever `decrease <= 0` (i.e. the count did not actually decrease, but
- * a `chain_head_hash_mismatch` fired anyway from an unrelated content
- * alteration that left the count unchanged). Without this guard, a bundle
- * with NO sealed-purge evidence at all would still have every
- * non-count-related tampering signal on this check silently downgraded to
- * a pass by an arithmetic coincidence — that is not evidence of a
- * legitimate purge, it is the ABSENCE of evidence, and rule 4 of the spec
- * ("downgrade-only... must never turn an existing pass into a fail") is not
- * license to turn a real fail into an unevidenced pass either. Requiring at
- * least one verified seal in the window makes every exemption traceable to
- * a real, named, independently-signed `AuditRetentionSeal` record.
- */
-function reconcilePurgeWindow(
-  prevAsOf: string,
-  curAsOf: string,
-  decrease: bigint,
-  verifiedSeals: BundleSealedPurge[],
-): { exempted: boolean; seals: BundleSealedPurge[] } {
-  const prevMs = Date.parse(prevAsOf);
-  const curMs = Date.parse(curAsOf);
-  const windowSeals = verifiedSeals.filter((seal) => {
-    const t = Date.parse(seal.deletedAt);
-    return !Number.isNaN(t) && t > prevMs && t <= curMs;
-  });
-  if (windowSeals.length === 0) {
-    return { exempted: false, seals: [] };
-  }
-  const sumRowCount = windowSeals.reduce(
-    (acc, seal) => acc + BigInt(seal.rowCount),
-    0n,
-  );
-  return { exempted: decrease <= sumRowCount, seals: windowSeals };
-}
-
-/**
- * FIX01 F5(b) — the true tip (most-recently-chained row) of the SUBSET of
- * `rows` with `signedAt <= atOrBeforeMs`, found by the same
- * link-not-claimed-by-any-successor logic `verifyChain` uses for the
- * OTHER end of the chain (the leading anchor). Returns `null` when the
- * subset is empty, or when it doesn't resolve to exactly one tip (a
- * within-window fork/break — already surfaced by `chain` itself; this
- * function declines to double-report it here).
- */
-function trueSubchainTip(
-  rows: BundleRow[],
-  atOrBeforeMs: number,
-): BundleRow | null {
-  const inWindow = rows.filter((r) => {
-    if (typeof r.signedAt !== 'string') return false;
-    const t = Date.parse(r.signedAt);
-    return !Number.isNaN(t) && t <= atOrBeforeMs;
-  });
-  if (inWindow.length === 0) return null;
-
-  const claimedLinks = new Set<string>();
-  for (const r of inWindow) {
-    if (typeof r.prevRowHash === 'string') claimedLinks.add(r.prevRowHash);
-  }
-  const tips = inWindow.filter((r) => {
-    const link = computeChainLink(r);
-    return link !== null && !claimedLinks.has(link);
-  });
-  return tips.length === 1 ? tips[0]! : null;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -2552,7 +2812,7 @@ function verifyActionEventChain(
         } else if (e.prevEventCommitment !== prevComputed) {
           fail(
             id,
-            'action_event_chain_break: prevEventCommitment does not match the independently recomputed commitment of the previous event in this actionId\'s stream',
+            "action_event_chain_break: prevEventCommitment does not match the independently recomputed commitment of the previous event in this actionId's stream",
           );
         }
       }
@@ -2823,7 +3083,9 @@ function verifyDispatchIntegrity(
 
   const byAction = groupActionEvents(events);
   for (const [actionId, stream] of byAction) {
-    for (const e of stream.filter((x) => x.eventType === 'DISPATCH_ATTEMPTED')) {
+    for (const e of stream.filter(
+      (x) => x.eventType === 'DISPATCH_ATTEMPTED',
+    )) {
       checked += 1;
       if (e.dispatched !== true) {
         fail(
@@ -2832,9 +3094,7 @@ function verifyDispatchIntegrity(
         );
       }
     }
-    const closed = stream.find(
-      (e) => e.eventType === 'ACTION_CLOSED',
-    );
+    const closed = stream.find((e) => e.eventType === 'ACTION_CLOSED');
     if (!closed) continue;
     const closure = payloadStr(closed.payload, 'closure');
     if (!closure) continue;
@@ -2843,13 +3103,21 @@ function verifyDispatchIntegrity(
     );
     checked += 1;
     const id = `${actionId}#${closed.actionSeq}`;
-    if (POST_DISPATCH_ALLOWED_CLOSURES.has(closure) && !PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) && !reachedDispatch) {
+    if (
+      POST_DISPATCH_ALLOWED_CLOSURES.has(closure) &&
+      !PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) &&
+      !reachedDispatch
+    ) {
       fail(
         id,
         `dispatch_evidence_missing: closure "${closure}" requires a prior DISPATCH_ATTEMPTED(dispatched:true) event, none found for actionId ${actionId}`,
       );
     }
-    if (PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) && !POST_DISPATCH_ALLOWED_CLOSURES.has(closure) && reachedDispatch) {
+    if (
+      PRE_DISPATCH_ALLOWED_CLOSURES.has(closure) &&
+      !POST_DISPATCH_ALLOWED_CLOSURES.has(closure) &&
+      reachedDispatch
+    ) {
       fail(
         id,
         `dispatch_evidence_contradiction: closure "${closure}" is pre-dispatch-only but a DISPATCH_ATTEMPTED(dispatched:true) event exists for actionId ${actionId}`,
@@ -2866,11 +3134,83 @@ function verifyDispatchIntegrity(
   };
 }
 
+interface HttpTargetActionContext {
+  stream: BundleActionEvent[];
+  closed: BundleActionEvent | undefined;
+  legal: boolean;
+}
+
+/** Verify a target under a separately supplied identity pin and the original request/result evidence. */
+function verifiedHttpTarget(event: BundleActionEvent, events: BundleActionEvent[], pins: VerifyOptions['targetPublicKeys'], contexts: Map<string, HttpTargetActionContext>): boolean {
+  try {
+    const payload = event.payload;
+    if (!payload || !payload.receipt || typeof payload.receipt !== 'object') return false;
+    const receipt = payload.receipt as { statement?: Record<string, unknown> };
+    const statement = receipt.statement;
+    if (payload.signatureAlgorithm !== 'Ed25519' || payload.targetSignature !== (payload.receipt as { signature?: unknown }).signature) return false;
+    if (!statement || typeof statement.targetId !== 'string' || typeof statement.keyId !== 'string') return false;
+    const pin = pins?.[`${event.organizationId}:${statement.targetId}:${statement.keyId}`];
+    if (!pin) return false;
+    // A late response may follow an honest timeout closure. Only the validated
+    // append-only closure chain can establish the effective outcome; selecting
+    // the first closure rejects reconciliation, while trusting the last payload
+    // would allow a determined outcome to be overwritten or an action re-closed.
+    // Cache once per action/component, not once per target acknowledgement.
+    const actionKey = JSON.stringify([event.organizationId, event.actionId]);
+    let context = contexts.get(actionKey);
+    if (!context) {
+      const stream = events.filter(e => e.actionId === event.actionId && e.organizationId === event.organizationId)
+        .sort((a, b) => a.actionSeq - b.actionSeq);
+      const legality = verifyClosureLegality(stream);
+      context = { stream, legal: legality.result.ok && legality.status !== 'incomplete',
+        closed: [...stream].reverse().find(e => e.eventType === 'ACTION_CLOSED' || e.eventType === 'OUTCOME_RECONCILED') };
+      contexts.set(actionKey, context);
+    }
+    if (!context.legal) return false;
+    const { stream, closed } = context;
+    const closure = closed?.payload?.[closed.eventType === 'OUTCOME_RECONCILED' ? 'toClosure' : 'closure'];
+    const expectedClosure = ({ succeeded: 'SUCCEEDED', failed_no_effect: 'FAILED_NO_EFFECT', partial: 'PARTIAL', unknown: 'OUTCOME_UNKNOWN' } as Record<string, string>)[String(statement.effect)];
+    if (!expectedClosure || (closed && (closure !== expectedClosure || event.actionSeq >= closed.actionSeq))) return false;
+    const proposal = stream.find(e => e.eventType === 'ACTION_PROPOSED' && e.actionSeq < event.actionSeq);
+    // Match the receipt's result, not an earlier timeout observation. The old
+    // body-bearing producer observed the caller before ACK; the current producer
+    // emits ACK first. Both pieces must precede the effective closure, if present.
+    const caller = stream.find(e => e.eventType === 'CALLER_RESULT_OBSERVED' &&
+      e.payload?.observer === 'praesidia-http-edge' &&
+      e.payload.requestCommitment === statement.requestCommitment &&
+      e.payload.resultCommitment === statement.resultCommitment &&
+      (!closed || e.actionSeq < closed.actionSeq));
+    if (!proposal?.payload || !caller?.payload) return false;
+    let requestCommitment: string;
+    let resultCommitment: string;
+    if (proposal.payload.evidenceContent === 'commitments-only.v1') {
+      // The explicit new producer shape attests commitments, not undisclosed content.
+      // Do not reinterpret a legacy body-bearing event with missing content as this shape.
+      if (caller.payload.evidenceContent !== 'commitments-only.v1' ||
+          Object.hasOwn(proposal.payload, 'request') || Object.hasOwn(proposal.payload, 'checkpoint') ||
+          Object.hasOwn(caller.payload, 'result') || proposal.payload.targetIdentity !== statement.targetId ||
+          proposal.payload.targetKeyFingerprint !== httpTargetKeyFingerprint(pin) ||
+          typeof proposal.payload.requestCommitment !== 'string' || typeof caller.payload.resultCommitment !== 'string') return false;
+      requestCommitment = proposal.payload.requestCommitment;
+      resultCommitment = caller.payload.resultCommitment;
+    } else {
+      const request = proposal.payload.request as HttpRequestEnvelope | undefined;
+      if (!request || request.version !== 'praesidia.http-request.v1' || request.method !== 'POST' || request.contentType !== 'application/json' || request.targetId !== statement.targetId || request.targetKeyFingerprint !== httpTargetKeyFingerprint(pin) || !Object.hasOwn(caller.payload, 'result')) return false;
+      requestCommitment = httpRequestCommitment(request);
+      resultCommitment = jcsCommitment(caller.payload.result as JsonValue);
+    }
+    if (proposal.payload.requestCommitment !== requestCommitment || caller.payload.requestCommitment !== requestCommitment || caller.payload.resultCommitment !== resultCommitment || payload.resultCommitment !== resultCommitment || payload.requestCommitment !== requestCommitment) return false;
+    return verifyHttpReceipt(payload.receipt, pin, { organizationId: event.organizationId, actionId: event.actionId,
+      targetId: statement.targetId, keyId: statement.keyId, requestCommitment, resultCommitment });
+  } catch { return false; }
+}
+
 /** PA-0010 (D8) — see {@link VerifyReport.targetAck}'s doc comment. */
-function verifyTargetAck(events: BundleActionEvent[]): {
+function verifyTargetAck(events: BundleActionEvent[], pins?: VerifyOptions['targetPublicKeys']): {
   result: RawComponentResult;
   status?: ComponentStatus;
 } {
+  const httpContexts = new Map<string, HttpTargetActionContext>();
   let checked = 0;
   let failed = 0;
   let redacted = 0;
@@ -2893,7 +3233,10 @@ function verifyTargetAck(events: BundleActionEvent[]): {
         redacted += 1;
         continue;
       }
-      fail(id, 'TARGET_ACKNOWLEDGED carries neither payload nor payloadCommitment');
+      fail(
+        id,
+        'TARGET_ACKNOWLEDGED carries neither payload nor payloadCommitment',
+      );
       continue;
     }
     const grade = e.payload.grade;
@@ -2905,6 +3248,8 @@ function verifyTargetAck(events: BundleActionEvent[]): {
           id,
           'target_ack_grade_a_missing_signature: grade A requires a non-empty targetSignature and signatureAlgorithm',
         );
+      } else if (!verifiedHttpTarget(e, events, pins, httpContexts)) {
+        fail(id, 'target_ack_grade_a_unverified: a separately pinned target key and matching original request/result commitments are required; signature presence is not verification');
       }
     } else if (grade === 'B') {
       const attestation = payloadStr(e.payload, 'edgeAttestation');
@@ -2958,7 +3303,10 @@ function verifyCallerResult(events: BundleActionEvent[]): {
         redacted += 1;
         continue;
       }
-      fail(id, 'CALLER_RESULT_OBSERVED carries neither payload nor payloadCommitment');
+      fail(
+        id,
+        'CALLER_RESULT_OBSERVED carries neither payload nor payloadCommitment',
+      );
       continue;
     }
     if (typeof e.payload.success !== 'boolean') {
@@ -2966,7 +3314,11 @@ function verifyCallerResult(events: BundleActionEvent[]): {
       continue;
     }
     const commitment = e.payload.resultCommitment;
-    if (commitment !== undefined && commitment !== null && !isSha256HexDigest(commitment)) {
+    if (
+      commitment !== undefined &&
+      commitment !== null &&
+      !isSha256HexDigest(commitment)
+    ) {
       fail(
         id,
         'CALLER_RESULT_OBSERVED.payload.resultCommitment is present but not a well-formed sha256 hex digest',
@@ -2990,7 +3342,8 @@ function verifyCallerResult(events: BundleActionEvent[]): {
           `CALLER_RESULT_OBSERVED.payload.outcomeClass is present but not a recognized value (completed_success | completed_with_error | no_response_received): ${JSON.stringify(outcomeClass)}`,
         );
       } else if (
-        CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS[outcomeClass] !== e.payload.success
+        CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS[outcomeClass] !==
+        e.payload.success
       ) {
         fail(
           id,
@@ -3051,7 +3404,8 @@ function callerResultEvidencePositivity(
   const outcomeClass = payload.outcomeClass;
   if (typeof outcomeClass === 'string') {
     if (outcomeClass === 'no_response_received') return 'negative';
-    if (outcomeClass in CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS) return 'positive';
+    if (outcomeClass in CALLER_RESULT_OUTCOME_CLASS_EXPECTS_SUCCESS)
+      return 'positive';
     return 'negative'; // unrecognized value — verifyCallerResult flags it invalid separately; never treat it as positive support here.
   }
   return payload.success === true ? 'positive' : 'ambiguous';
@@ -3131,7 +3485,10 @@ function verifyClosureLegality(events: BundleActionEvent[]): {
     let currentClosure: string | null = null;
     let firstClosureSeen = false;
     for (const e of stream) {
-      if (e.eventType !== 'ACTION_CLOSED' && e.eventType !== 'OUTCOME_RECONCILED') {
+      if (
+        e.eventType !== 'ACTION_CLOSED' &&
+        e.eventType !== 'OUTCOME_RECONCILED'
+      ) {
         continue;
       }
       checked += 1;
@@ -3140,7 +3497,10 @@ function verifyClosureLegality(events: BundleActionEvent[]): {
 
       if (e.eventType === 'ACTION_CLOSED') {
         if (firstClosureSeen) {
-          fail(id, 'multiple_action_closed: an actionId may only be first-closed once (append-only D6 — a re-close is a defect or forgery)');
+          fail(
+            id,
+            'multiple_action_closed: an actionId may only be first-closed once (append-only D6 — a re-close is a defect or forgery)',
+          );
           continue;
         }
         firstClosureSeen = true;
@@ -3229,6 +3589,16 @@ function verifyClosureLegality(events: BundleActionEvent[]): {
           currentClosure = toClosure;
           continue;
         }
+        // Older producers omitted reconciliation reasons. When one is present,
+        // it must obey the same D7 reason/outcome contract as an initial closure.
+        if (e.payload && Object.hasOwn(e.payload, 'reason')) {
+          const reconciliationReason = payloadStr(e.payload, 'reason');
+          if (!reconciliationReason || !Object.hasOwn(REASON_ALLOWED_CLOSURES, reconciliationReason) ||
+              !REASON_ALLOWED_CLOSURES[reconciliationReason]!.has(toClosure)) {
+            fail(id, `closure_reason_mismatch: reconciled closure "${toClosure}" cannot be produced by reason "${String(e.payload.reason)}"`);
+            continue;
+          }
+        }
         if (EVIDENCE_CLAIMING_CLOSURES.has(toClosure)) {
           if (support === 'none') {
             fail(
@@ -3281,7 +3651,9 @@ function verifyClosureLegality(events: BundleActionEvent[]): {
 function verifyEvidenceGrade(
   events: BundleActionEvent[],
   manifest: BundleManifest,
+  pins?: VerifyOptions['targetPublicKeys'],
 ): RawComponentResult {
+  const httpContexts = new Map<string, HttpTargetActionContext>();
   let checked = 0;
   let failed = 0;
   let firstFailure: string | undefined;
@@ -3316,8 +3688,7 @@ function verifyEvidenceGrade(
         const grade = e.payload.grade;
         if (
           grade === 'A' &&
-          payloadStr(e.payload, 'targetSignature') &&
-          payloadStr(e.payload, 'signatureAlgorithm')
+          verifiedHttpTarget(e, events, pins, httpContexts)
         ) {
           best = 'A';
         } else if (
@@ -3465,8 +3836,10 @@ function assertActionEventsStructure(
       (e.permitNonce !== null && typeof e.permitNonce !== 'string') ||
       (e.edgeVersion !== null && typeof e.edgeVersion !== 'string') ||
       (e.adapterVersion !== null && typeof e.adapterVersion !== 'string') ||
-      (e.externalReceiptRef !== null && typeof e.externalReceiptRef !== 'string') ||
-      (e.artifactStorageRef !== null && typeof e.artifactStorageRef !== 'string')
+      (e.externalReceiptRef !== null &&
+        typeof e.externalReceiptRef !== 'string') ||
+      (e.artifactStorageRef !== null &&
+        typeof e.artifactStorageRef !== 'string')
     ) {
       throw new Error(
         `action-events.ndjson.gz has an invalid/incomplete event: actionId=${String(e?.actionId)} actionSeq=${String(e?.actionSeq)} — every field required to reconstruct the signed preimage (organizationId, issuerType, dispatched, timeSource, permitNonce, edgeVersion, adapterVersion, externalReceiptRef, artifactStorageRef) must be present, per PA01-CONTRACT-manifest-v5-actions.md`,
@@ -3897,9 +4270,7 @@ function verifyInclusionProofs(
       }
       continue;
     }
-    const decodedSiblings = entry.proof.map((s) =>
-      decodeBase64Strict(s, 32),
-    );
+    const decodedSiblings = entry.proof.map((s) => decodeBase64Strict(s, 32));
     if (decodedSiblings.some((s) => s === null)) {
       failed += 1;
       if (!firstFailure) {
@@ -4070,9 +4441,7 @@ async function verifyRekorReceipts(
  * `anchorReceipts` array; synthesizes a legacy rekor entry from
  * `anchorReceipt` only when the array is absent or empty.
  */
-function collectAnchorEntries(
-  root: BundleRoot,
-): AnchorReceiptEntry[] {
+function collectAnchorEntries(root: BundleRoot): AnchorReceiptEntry[] {
   if (Array.isArray(root.anchorReceipts) && root.anchorReceipts.length > 0) {
     return root.anchorReceipts;
   }
@@ -4143,9 +4512,7 @@ async function verifyAnchorReceipt(
   }
   if (entry.provider === 's3') {
     const shape = verifyS3ReceiptShape(entry.receipt);
-    return shape.ok
-      ? { ok: false, reason: 'unverifiable_offline' }
-      : shape;
+    return shape.ok ? { ok: false, reason: 'unverifiable_offline' } : shape;
   }
   return { ok: false, reason: 'unknown_provider' };
 }
@@ -4500,15 +4867,16 @@ function verifyPlatformAttestation(
   }
   if (
     seenVersions.size !== Object.keys(publicKeysRaw).length ||
-    Object.keys(publicKeysRaw).some((version) =>
-      !seenVersions.has(Number(version)),
+    Object.keys(publicKeysRaw).some(
+      (version) => !seenVersions.has(Number(version)),
     )
   ) {
     return {
       ok: false,
       checked: 1,
       failed: 1,
-      reason: 'keyversion_set_mismatch: platform attestation must cover every bundled key exactly once',
+      reason:
+        'keyversion_set_mismatch: platform attestation must cover every bundled key exactly once',
     };
   }
 
@@ -4571,10 +4939,7 @@ function assertManifestStructure(manifest: BundleManifest): void {
     const fingerprint =
       decodedPublicKey === null
         ? null
-        : crypto
-            .createHash('sha256')
-            .update(decodedPublicKey)
-            .digest('hex');
+        : crypto.createHash('sha256').update(decodedPublicKey).digest('hex');
     if (
       !key ||
       typeof key !== 'object' ||
@@ -4672,6 +5037,7 @@ function assertIntegrityCheckpointsStructure(
       cp.organizationId !== orgId ||
       decodeBase64Strict(cp.chainHeadHash, 32) === null ||
       typeof cp.cumulativeRowCount !== 'string' ||
+      cp.cumulativeRowCount.length > 20 ||
       !/^\d+$/.test(cp.cumulativeRowCount) ||
       !isIsoDate(cp.asOf) ||
       typeof cp.signature !== 'string' ||
@@ -4696,7 +5062,7 @@ function assertIntegrityCheckpointsStructure(
  * presence rule to enforce here — only that whatever IS present is
  * well-formed enough to parse safely. `rowCount` is validated as a
  * digit-string and never converted with `Number(...)` anywhere in this
- * file — see `verifySealedPurgeAuthenticity` / `reconcilePurgeWindow`.
+ * file — see `verifySealedPurgeAuthenticity` / `verifyIntegrityCheckpoints`.
  */
 function assertSealedPurgesStructure(
   purges: BundleSealedPurge[],
@@ -4724,10 +5090,12 @@ function assertSealedPurgesStructure(
       !isIsoDate(p.periodEnd) ||
       Date.parse(p.periodStart) >= Date.parse(p.periodEnd) ||
       typeof p.rowCount !== 'string' ||
+      p.rowCount.length > 20 ||
       !/^[1-9]\d*$/.test(p.rowCount) ||
       decodeBase64Strict(p.rootHash, 32) === null ||
       (p.rekorReceipt !== null &&
-        (typeof p.rekorReceipt !== 'object' || Array.isArray(p.rekorReceipt))) ||
+        (typeof p.rekorReceipt !== 'object' ||
+          Array.isArray(p.rekorReceipt))) ||
       !(authFieldsAllNull || authFieldsAllPresent) ||
       (p.signingKeyVersion !== null && p.signingKeyVersion < 1) ||
       !isIsoDate(p.deletedAt) ||
@@ -4841,7 +5209,9 @@ function assertRowsStructure(rows: BundleRow[], orgId: string): void {
       !Number.isSafeInteger(row.keyVersion) ||
       row.keyVersion < 1
     ) {
-      throw new Error(`rows.ndjson.gz has an invalid/duplicate row: ${String(row?.id)}`);
+      throw new Error(
+        `rows.ndjson.gz has an invalid/duplicate row: ${String(row?.id)}`,
+      );
     }
     ids.add(row.id);
   }
@@ -4893,7 +5263,9 @@ function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
         root.signatureAlgorithm !== 'Ed25519' &&
         root.signatureAlgorithm !== 'ECDSA_P256_SHA256')
     ) {
-      throw new Error(`roots.ndjson.gz has an invalid/duplicate root: ${String(root?.id)}`);
+      throw new Error(
+        `roots.ndjson.gz has an invalid/duplicate root: ${String(root?.id)}`,
+      );
     }
     ids.add(root.id);
     hashes.add(root.rootHash);
@@ -4999,15 +5371,91 @@ function computeChainLink(prev: BundleRow): string | null {
   return sha256(Buffer.concat([canonical, sigBytes])).toString('base64');
 }
 
-function parseNdjson<T>(buf: Buffer): T[] {
-  const text = buf.toString('utf8');
-  if (text.length === 0) return [];
+async function parseNdjsonChunks<T>(
+  chunks: AsyncIterable<Buffer>,
+  entryName: string,
+  maxRecords: number,
+  maxLineBytes: number,
+  recordBudget: NdjsonRecordBudget,
+): Promise<T[]> {
   const out: T[] = [];
-  for (const line of text.split('\n')) {
-    if (line.length === 0) continue;
-    out.push(JSON.parse(line) as T);
+  let lineParts: Buffer[] = [];
+  let lineBytes = 0;
+  let lineNumber = 1;
+
+  const parseCurrentLine = (): void => {
+    if (lineBytes === 0) {
+      throw new Error(`${entryName} line ${lineNumber} is empty`);
+    }
+    if (out.length >= maxRecords) {
+      throw new Error(
+        `${entryName} record count exceeds verifier resource limit ${maxRecords}`,
+      );
+    }
+    if (recordBudget.remainingRecords === 0) {
+      throw new Error(
+        `bundle NDJSON record count exceeds total resource limit while reading ${entryName}`,
+      );
+    }
+    const lineBuffer =
+      lineParts.length === 1
+        ? lineParts[0]!
+        : Buffer.concat(lineParts, lineBytes);
+    let line: string;
+    try {
+      line = STRICT_UTF8_DECODER.decode(lineBuffer);
+    } catch {
+      throw new Error(`${entryName} line ${lineNumber} is not valid UTF-8`);
+    }
+    try {
+      out.push(JSON.parse(line) as T);
+      recordBudget.remainingRecords -= 1;
+    } catch {
+      throw new Error(`${entryName} line ${lineNumber} is not valid JSON`);
+    }
+    lineParts = [];
+    lineBytes = 0;
+  };
+
+  for await (const chunk of chunks) {
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start);
+      const end = newline === -1 ? chunk.length : newline;
+      const partBytes = end - start;
+      if (lineBytes > maxLineBytes - partBytes) {
+        throw new Error(
+          `${entryName} line ${lineNumber} exceeds verifier resource limit ${maxLineBytes} bytes`,
+        );
+      }
+      if (partBytes > 0) {
+        lineParts.push(chunk.subarray(start, end));
+        lineBytes += partBytes;
+      }
+      if (newline === -1) break;
+
+      parseCurrentLine();
+      lineNumber += 1;
+      start = newline + 1;
+    }
+  }
+
+  // A final newline terminates the previous record and deliberately leaves
+  // no pending line. Empty members remain the canonical encoding of zero
+  // records; an internal/consecutive blank line is rejected above.
+  if (lineBytes > 0) {
+    if (lineBytes > maxLineBytes) {
+      throw new Error(
+        `${entryName} line ${lineNumber} exceeds verifier resource limit ${maxLineBytes} bytes`,
+      );
+    }
+    parseCurrentLine();
   }
   return out;
+}
+
+interface NdjsonRecordBudget {
+  remainingRecords: number;
 }
 
 /**
@@ -5071,9 +5519,7 @@ function parsePublicKeyEntry(
       revokedAt = parsed;
     }
     const publicKey =
-      obj.publicKey.length <= 512
-        ? decodeBase64Strict(obj.publicKey)
-        : null;
+      obj.publicKey.length <= 512 ? decodeBase64Strict(obj.publicKey) : null;
     if (publicKey === null || publicKey.length === 0) {
       throw new Error(
         `public-keys.json[${versionKey}].publicKey is not canonical base64`,

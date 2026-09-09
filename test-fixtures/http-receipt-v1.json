@@ -1,0 +1,74 @@
+{
+  "target": {
+    "targetId": "fixture-target",
+    "destination": "https://target.example/execute",
+    "keyId": "fixture-key",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA3Bq4V+yuUfl2LNPH4NIk5y2lex4ZlyPAGRs7QYl7yH8=\n-----END PUBLIC KEY-----\n"
+  },
+  "request": {
+    "targetId": "fixture-target",
+    "body": {
+      "message": "signed π receipt",
+      "amount": "5.00",
+      "nested": {
+        "z": null,
+        "a": [
+          1,
+          true
+        ]
+      }
+    },
+    "checkpoint": {
+      "runtime": "langgraph",
+      "threadId": "thread-1",
+      "nodeId": "execute-1"
+    }
+  },
+  "envelope": {
+    "version": "praesidia.http-request.v1",
+    "targetId": "fixture-target",
+    "destination": "https://target.example/execute",
+    "targetKeyFingerprint": "6d257008e14c6bde4bbf140a740ec6bf4fd25c54502c1d8354943f691af24b30",
+    "method": "POST",
+    "contentType": "application/json",
+    "body": {
+      "message": "signed π receipt",
+      "amount": "5.00",
+      "nested": {
+        "z": null,
+        "a": [
+          1,
+          true
+        ]
+      }
+    }
+  },
+  "organizationId": "22222222-2222-4222-8222-222222222222",
+  "response": {
+    "actionId": "11111111-1111-7111-8111-111111111111",
+    "approvalId": "33333333-3333-4333-8333-333333333333",
+    "closure": "SUCCEEDED",
+    "evidenceGrade": "A",
+    "requestCommitment": "193a1341942790718597eba4273a5dd060f5eb53f55b4e071138c317df737df3",
+    "resultCommitment": "74dfac46825a44bb62e3093d58bb5dc962c1c59c1b49f24f8c9d61cb2bf82790",
+    "result": {
+      "applied": "5.00",
+      "transactionId": "fixture-transaction"
+    },
+    "receipt": {
+      "statement": {
+        "version": "praesidia.http-receipt.v1",
+        "actionId": "11111111-1111-7111-8111-111111111111",
+        "organizationId": "22222222-2222-4222-8222-222222222222",
+        "targetId": "fixture-target",
+        "keyId": "fixture-key",
+        "requestCommitment": "193a1341942790718597eba4273a5dd060f5eb53f55b4e071138c317df737df3",
+        "resultCommitment": "74dfac46825a44bb62e3093d58bb5dc962c1c59c1b49f24f8c9d61cb2bf82790",
+        "effect": "succeeded",
+        "issuedAt": "2026-09-05T00:00:00.000Z",
+        "targetTransactionId": "fixture-transaction"
+      },
+      "signature": "iqik8GW5eoRq6fbTnkAWeR+xIynHL8VvT/cXbCZGQmz8no7OQiWhQxkVWJSCLas3mfUwao5B/xPWdz9vCO1YAg=="
+    }
+  }
+}

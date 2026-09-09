@@ -1,3 +1,5 @@
+import { httpRequestCommitment, httpTargetKeyFingerprint } from '../http-receipt.js';
+import { jcsCanonicalize, jcsCommitment } from '../jcs-canonical.js';
 /**
  * AGV-040 — Verifier acceptance tests.
  *
@@ -15,7 +17,7 @@
  * against the live exporter (which live in be-core's test suite).
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as crypto from 'node:crypto';
 import * as zlib from 'node:zlib';
 import * as fs from 'node:fs';
@@ -39,7 +41,13 @@ import {
   extractEcdsaSFromSignature,
   GENESIS_PREV_ROW_HASH,
 } from '../crypto.js';
-import { writeZip, gzipDeterministic, readZip } from '../zip.js';
+import * as cryptoPrimitives from '../crypto.js';
+import {
+  MAX_ZIP_ARCHIVE_BYTES,
+  writeZip,
+  gzipDeterministic,
+  readZip,
+} from '../zip.js';
 import { verifyRekorReceipt } from '../rekor.js';
 
 // Most fixtures intentionally model pre-attestation legacy bundles. Their
@@ -449,11 +457,7 @@ function readBundleEntries(zip: Buffer): Map<string, Buffer> {
 }
 
 /** Repack a fixture while replacing exactly one named entry. */
-function replaceBundleEntry(
-  zip: Buffer,
-  name: string,
-  data: Buffer,
-): Buffer {
+function replaceBundleEntry(zip: Buffer, name: string, data: Buffer): Buffer {
   return writeZip(
     readZip(zip).map((entry) => ({
       name: entry.name,
@@ -547,6 +551,188 @@ describe('verifyBundle', () => {
     // fails too — `manifest`, whose signature covers none of the row
     // content, is the clean independent witness.)
     expect(report.manifest.status).toBe('valid');
+  });
+
+  describe('bundle resource boundaries', () => {
+    it('rejects an archive larger than the configured raw-byte ceiling', async () => {
+      const { zip } = buildFixtureBundle();
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: { maxBundleBytes: zip.length - 1 },
+        }),
+      ).rejects.toThrow(/zip archive size .* exceeds limit/);
+    });
+
+    it('rejects unknown archive members before processing their payload', async () => {
+      const { zip } = buildFixtureBundle();
+      const withUnexpectedMember = writeZip([
+        ...readZip(zip),
+        { name: '../ignored.bin', data: Buffer.from('ignored') },
+      ]);
+      await expect(
+        verifyBundle(withUnexpectedMember, { noRekor: true }),
+      ).rejects.toThrow(/unexpected zip entry name/);
+    });
+
+    it('rejects an oversized static member before JSON parsing', async () => {
+      const { zip } = buildFixtureBundle();
+      const oversizedManifest = replaceBundleEntry(
+        zip,
+        'manifest.json',
+        Buffer.alloc(4 * 1024 * 1024 + 1, 0x20),
+      );
+      await expect(
+        verifyBundle(oversizedManifest, { noRekor: true }),
+      ).rejects.toThrow(/manifest\.json uncompressed size .* exceeds limit/);
+    });
+
+    it('rejects signed manifest counts above the configured record ceiling', async () => {
+      const { zip } = buildFixtureBundle();
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: { maxRows: 3 },
+        }),
+      ).rejects.toThrow(
+        /manifest rowCount 4 exceeds verifier resource limit 3/,
+      );
+    });
+
+    it('rejects an NDJSON member with too many records', async () => {
+      const { zip } = buildFixtureBundle();
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: { maxProofs: 3 },
+        }),
+      ).rejects.toThrow(/proofs\.ndjson\.gz record count exceeds.*3/);
+    });
+
+    it('rejects aggregate anchor-receipt fanout above its configured ceiling', async () => {
+      const base = buildFixtureBundle();
+      const root = {
+        ...base.roots[0]!,
+        anchorReceipts: [
+          {
+            provider: 's3',
+            receipt: 's3:bucket:key:version-1',
+            anchoredAt: '2026-05-01T01:00:00.000Z',
+          },
+          {
+            provider: 's3',
+            receipt: 's3:bucket:key:version-2',
+            anchoredAt: '2026-05-01T01:00:01.000Z',
+          },
+        ],
+      };
+      const zip = replaceBundleEntry(
+        base.zip,
+        'roots.ndjson.gz',
+        gzipDeterministic(Buffer.from(`${JSON.stringify(root)}\n`, 'utf8')),
+      );
+      // Keep this assertion before provider verification: no external hook
+      // should be invoked for a bundle that exceeds the aggregate ceiling.
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: { maxAnchorReceipts: 1 },
+        }),
+      ).rejects.toThrow(/anchor receipt count exceeds.*1/);
+    });
+
+    it('rejects an oversized NDJSON line without splitting the whole stream', async () => {
+      const { zip } = buildFixtureBundle();
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: { maxNdjsonLineBytes: 64 },
+        }),
+      ).rejects.toThrow(/rows\.ndjson\.gz line 1 exceeds.*64 bytes/);
+    });
+
+    it('rejects blank NDJSON lines instead of letting them bypass record caps', async () => {
+      const { zip } = buildFixtureBundle();
+      const blankRows = replaceBundleEntry(
+        zip,
+        'rows.ndjson.gz',
+        gzipDeterministic(Buffer.from('\n\n', 'utf8')),
+      );
+      await expect(verifyBundle(blankRows, { noRekor: true })).rejects.toThrow(
+        /rows\.ndjson\.gz line 1 is empty/,
+      );
+    });
+
+    it('stops a high-ratio nested gzip at the per-entry decoded-byte ceiling', async () => {
+      const { zip } = buildFixtureBundle();
+      const compressedBomb = replaceBundleEntry(
+        zip,
+        'rows.ndjson.gz',
+        gzipDeterministic(Buffer.alloc(256 * 1024, 0x20)),
+      );
+      await expect(
+        verifyBundle(compressedBomb, {
+          noRekor: true,
+          resourceLimits: { maxGzipOutputBytes: 32 * 1024 },
+        }),
+      ).rejects.toThrow(
+        /rows\.ndjson\.gz expanded output exceeds per-entry limit 32768/,
+      );
+    });
+
+    it('shares one decoded-byte budget across every nested gzip member', async () => {
+      const { zip } = buildFixtureBundle();
+      const totalDecodedBytes = readZip(zip)
+        .filter((entry) => entry.name.endsWith('.ndjson.gz'))
+        .reduce(
+          (total, entry) => total + zlib.gunzipSync(entry.data).length,
+          0,
+        );
+      expect(totalDecodedBytes).toBeGreaterThan(1);
+
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          resourceLimits: {
+            maxTotalGzipOutputBytes: totalDecodedBytes - 1,
+          },
+        }),
+      ).rejects.toThrow(/bundle gzip output exceeds total resource limit/);
+    });
+
+    it('rejects signed scopes that cannot fit the shared NDJSON record budget', async () => {
+      const { zip } = buildFixtureBundle();
+      await expect(
+        verifyBundle(zip, {
+          noRekor: true,
+          // Four rows imply four proof records, plus the declared root.
+          resourceLimits: { maxTotalNdjsonRecords: 5 },
+        }),
+      ).rejects.toThrow(
+        /manifest requires at least 9 NDJSON records, exceeding verifier total resource limit 5/,
+      );
+    });
+
+    it('charges optional NDJSON members to the same aggregate record budget', async () => {
+      const { zip } = buildFixtureBundle();
+      const withOptionalSeal = writeZip([
+        ...readZip(zip),
+        {
+          name: 'sealed-purges.ndjson.gz',
+          data: gzipDeterministic(Buffer.from('{}\n')),
+        },
+      ]);
+      await expect(
+        verifyBundle(withOptionalSeal, {
+          noRekor: true,
+          // Exactly enough for 4 rows + 1 root + 4 proofs; the optional
+          // seal must not receive a fresh independent allowance.
+          resourceLimits: { maxTotalNdjsonRecords: 9 },
+        }),
+      ).rejects.toThrow(
+        /bundle NDJSON record count exceeds total resource limit while reading sealed-purges\.ndjson\.gz/,
+      );
+    });
   });
 
   it('detects a tampered row payload byte (row signature mismatch)', async () => {
@@ -931,10 +1117,7 @@ describe('verifyBundle', () => {
       const zip = replaceBundleEntry(
         base.zip,
         'public-keys.json',
-        Buffer.from(
-          JSON.stringify({ '1': keys['1'], '2': keys['1'] }),
-          'utf8',
-        ),
+        Buffer.from(JSON.stringify({ '1': keys['1'], '2': keys['1'] }), 'utf8'),
       );
 
       await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
@@ -1666,7 +1849,7 @@ describe('verifyBundle', () => {
       expect(report.rekor.reason).toContain('malformed');
     });
 
-    it('rejects oversized receipt metadata before verification', async () => {
+    it('rejects oversized receipt metadata at the streaming line boundary before verification', async () => {
       const zip = rebuildWithReceipts([
         {
           provider: 'rekor',
@@ -1675,7 +1858,7 @@ describe('verifyBundle', () => {
         },
       ]);
       await expect(verifyBundle(zip)).rejects.toThrow(
-        /roots\.ndjson\.gz has an invalid\/duplicate root/,
+        /roots\.ndjson\.gz line 1 exceeds verifier resource limit/,
       );
       expect(verifyRekorReceipt('x'.repeat(1024 * 1024 + 1))).toEqual({
         ok: false,
@@ -1732,7 +1915,9 @@ describe('verifyBundle', () => {
         noRekor: true,
         anchorReceiptVerifier: async (entry, expectedRoot) => {
           calls.push(entry.provider);
-          expect(expectedRoot.rootHash).toBe(buildFixtureBundle().roots[0]!.rootHash);
+          expect(expectedRoot.rootHash).toBe(
+            buildFixtureBundle().roots[0]!.rootHash,
+          );
           return { ok: true };
         },
       });
@@ -1795,14 +1980,15 @@ describe('verifyBundle', () => {
    * BUGHUNT-SDK-05 — Real offline Rekor receipt verification.
    *
    * The DEFAULT `rekor` check is now cryptographic: the receipt's Signed
-   * Entry Timestamp (SET) must verify under the pinned Rekor key AND its
-   * inclusion proof must reproduce `inclusionProof.rootHash`. A forged
+   * Entry Timestamp (SET) and signed checkpoint must verify under the pinned
+   * Rekor key, and its inclusion proof must reproduce the checkpoint's
+   * authenticated root. A forged
    * non-Rekor blob like `"{}"` no longer passes (the old `JSON.parse`
    * default returned `true` for it). Tests pin a fresh Rekor key via
    * `rekorPublicKeyPem` (the sovereign-instance / test seam) and mint a
    * self-consistent single-leaf signed entry, then prove tampers fail.
    */
-  describe('BUGHUNT-SDK-05 — real Rekor SET + inclusion verification', () => {
+  describe('BUGHUNT-SDK-05 — real Rekor SET + checkpoint + inclusion verification', () => {
     const LEAF = Buffer.from([0x00]);
 
     function flipLastByteB64(b64: string): string {
@@ -1813,12 +1999,16 @@ describe('verifyBundle', () => {
 
     /**
      * Mint a self-consistent Rekor receipt (persisted flat shape) whose
-     * SET verifies under the returned P-256 pubkey and whose single-leaf
-     * inclusion proof verifies against its rootHash.
+     * SET and signed checkpoint verify under the returned P-256 pubkey and
+     * whose single-leaf inclusion proof verifies against that checkpoint.
      */
     function buildRekorReceipt(opts?: {
       tamperSet?: boolean;
       tamperProof?: boolean;
+      tamperCheckpoint?: boolean;
+      tamperTreeSize?: boolean;
+      omitCheckpoint?: boolean;
+      bundleStyleCheckpoint?: boolean;
       unrelatedRoot?: boolean;
     }): { receiptJson: string; publicKeyPem: string } {
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
@@ -1880,15 +2070,37 @@ describe('verifyBundle', () => {
         .update(LEAF)
         .update(Buffer.from(body, 'base64'))
         .digest('hex');
+      const checkpointNote = `rekor.test\n1\n${Buffer.from(leafHash, 'hex').toString('base64')}\n`;
+      const checkpointSignature = crypto.sign(
+        'sha256',
+        Buffer.from(checkpointNote, 'utf8'),
+        privateKey,
+      );
+      const signedCheckpoint = Buffer.concat([
+        Buffer.from(logID, 'hex').subarray(0, 4),
+        checkpointSignature,
+      ]);
+      const checkpointEnvelope = `${checkpointNote}\n— rekor.test ${
+        opts?.tamperCheckpoint
+          ? flipLastByteB64(signedCheckpoint.toString('base64'))
+          : signedCheckpoint.toString('base64')
+      }\n`;
 
       const receipt = {
         uuid: '24296fb24b8ad77a000000000000000000000000000000000000000000000001',
         logIndex,
         inclusionProof: {
           logIndex: 0,
-          treeSize: 1,
+          treeSize: opts?.tamperTreeSize ? 2 : 1,
           rootHash: opts?.tamperProof ? '00'.repeat(32) : leafHash,
           hashes: [] as string[],
+          ...(opts?.omitCheckpoint
+            ? {}
+            : {
+                checkpoint: opts?.bundleStyleCheckpoint
+                  ? { envelope: checkpointEnvelope }
+                  : checkpointEnvelope,
+              }),
         },
         signedEntryTimestamp,
         logId: logID,
@@ -1926,7 +2138,7 @@ describe('verifyBundle', () => {
       ]);
     }
 
-    it('verifies a genuine signed Rekor receipt (SET + inclusion) by default', async () => {
+    it('verifies a genuine signed Rekor receipt (SET + checkpoint + inclusion) by default', async () => {
       const { receiptJson, publicKeyPem } = buildRekorReceipt();
       const zip = bundleWithRekorReceipt(receiptJson);
       // Default rekor path (no rekorFetcher/anchorReceiptVerifier); pin the
@@ -1937,6 +2149,18 @@ describe('verifyBundle', () => {
       expect(report.rekor.ok).toBe(true);
       expect(report.rekor.checked).toBe(1);
       expect(report.rekor.failed).toBe(0);
+      expect(report.ok).toBe(true);
+    });
+
+    it('accepts the Sigstore bundle-style checkpoint envelope object', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        bundleStyleCheckpoint: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(true);
       expect(report.ok).toBe(true);
     });
 
@@ -1971,7 +2195,46 @@ describe('verifyBundle', () => {
         rekorPublicKeyPem: publicKeyPem,
       });
       expect(report.rekor.ok).toBe(false);
-      expect(report.rekor.reason).toContain('inclusion_root_mismatch');
+      expect(report.rekor.reason).toContain('checkpoint_root_mismatch');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS an inclusion proof that omits its signed checkpoint', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        omitCheckpoint: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toContain('checkpoint_missing');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS a tampered signed checkpoint', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        tamperCheckpoint: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toContain('checkpoint_signature_invalid');
+      expect(report.ok).toBe(false);
+    });
+
+    it('FAILS proof metadata whose tree size disagrees with the signed checkpoint', async () => {
+      const { receiptJson, publicKeyPem } = buildRekorReceipt({
+        tamperTreeSize: true,
+      });
+      const zip = bundleWithRekorReceipt(receiptJson);
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
+      expect(report.rekor.ok).toBe(false);
+      expect(report.rekor.reason).toContain('checkpoint_tree_size_mismatch');
       expect(report.ok).toBe(false);
     });
 
@@ -1991,7 +2254,9 @@ describe('verifyBundle', () => {
         unrelatedRoot: true,
       });
       const zip = bundleWithRekorReceipt(receiptJson);
-      const report = await verifyBundle(zip, { rekorPublicKeyPem: publicKeyPem });
+      const report = await verifyBundle(zip, {
+        rekorPublicKeyPem: publicKeyPem,
+      });
       expect(report.ok).toBe(false);
       expect(report.rekor.reason).toContain('body_root_mismatch');
     });
@@ -2954,9 +3219,7 @@ describe('verifyBundle', () => {
       expect(report.rootCoverage.failed).toBe(0);
       expect(report.rootCoverage.sealExemptions).toBeDefined();
       expect(report.rootCoverage.sealExemptions![0]).toContain('seal-1');
-      expect(report.rootCoverage.sealExemptions![0]).toContain(
-        'approval-42',
-      );
+      expect(report.rootCoverage.sealExemptions![0]).toContain('approval-42');
       expect(report.bundle.sealedPurgesSeen).toBe(1);
       expect(report.bundle.sealedPurgesVerified).toBe(1);
       expect(report.ok).toBe(true);
@@ -2997,14 +3260,9 @@ describe('verifyBundle', () => {
         privateKey,
       });
       const report = await verifyBundle(
-        packBundleWithSeals(
-          manifestJson,
-          [],
-          base.roots,
-          [],
-          publicKeys,
-          [undercountingSeal],
-        ),
+        packBundleWithSeals(manifestJson, [], base.roots, [], publicKeys, [
+          undercountingSeal,
+        ]),
         { noRekor: true },
       );
 
@@ -3050,14 +3308,9 @@ describe('verifyBundle', () => {
         legacyNumericRowCountPreimage: true,
       });
       const report = await verifyBundle(
-        packBundleWithSeals(
-          manifestJson,
-          [],
-          base.roots,
-          [],
-          publicKeys,
-          [legacySeal],
-        ),
+        packBundleWithSeals(manifestJson, [], base.roots, [], publicKeys, [
+          legacySeal,
+        ]),
         { noRekor: true },
       );
 
@@ -3366,9 +3619,7 @@ describe('verifyBundle', () => {
         rowCount: 1,
       });
       const rootSignature = signEd25519(rootMessage, privateKey);
-      const rootSignedAt = new Date(
-        Date.parse(periodEnd) + 5000,
-      ).toISOString();
+      const rootSignedAt = new Date(Date.parse(periodEnd) + 5000).toISOString();
       const root = {
         id: 'root-0',
         organizationId: orgId,
@@ -3594,9 +3845,7 @@ describe('verifyBundle', () => {
         rowCount: 1,
       });
       const rootSignature = signEd25519(rootMessage, privateKey);
-      const rootSignedAt = new Date(
-        Date.parse(periodEnd) + 5000,
-      ).toISOString();
+      const rootSignedAt = new Date(Date.parse(periodEnd) + 5000).toISOString();
       const root = {
         id: 'root-0',
         organizationId: orgId,
@@ -3675,7 +3924,7 @@ describe('verifyBundle', () => {
       ]);
     }
 
-    it('verifies a row signed with detailsCommitment present, using be-core\'s REAL captured canonical bytes (post-cutover shape)', async () => {
+    it("verifies a row signed with detailsCommitment present, using be-core's REAL captured canonical bytes (post-cutover shape)", async () => {
       const zip = buildDetailsCommitmentFixtureBundle({
         includeDetailsCommitment: true,
       });
@@ -3722,7 +3971,7 @@ describe('verifyBundle', () => {
    * after `detailsCommitment` support is added above, so this fix is
    * necessary — not incidental — to SCAN-AV-01.
    */
-  describe('SCAN-AV-01 — canonicalJson matches be-core\'s undefined-omission rule', () => {
+  describe("SCAN-AV-01 — canonicalJson matches be-core's undefined-omission rule", () => {
     it('omits an object key whose value is undefined; preserves an explicit null', () => {
       const result = canonicalJson({ a: undefined, b: 1, z: null });
       expect(result.toString('utf8')).toBe('{"b":1,"z":null}');
@@ -3782,7 +4031,9 @@ describe('verifyBundle', () => {
         configurable: true,
       });
       obj.a = 1;
-      expect(canonicalJson(obj).toString('utf8')).toBe('{"__proto__":"x","a":1}');
+      expect(canonicalJson(obj).toString('utf8')).toBe(
+        '{"__proto__":"x","a":1}',
+      );
     });
 
     it('treats a bare __proto__ object-literal key as prototype syntax (no own key created), matching be-core', () => {
@@ -3842,9 +4093,9 @@ describe('verifyBundle', () => {
         },
         { name: 'README.md', data: entries.get('README.md')! },
       ]);
-      await expect(
-        verifyBundleStrict(zip, { noRekor: true }),
-      ).rejects.toThrow(/newer than/);
+      await expect(verifyBundleStrict(zip, { noRekor: true })).rejects.toThrow(
+        /newer than/,
+      );
     });
 
     it('accepts the currently-supported manifest versions unchanged', async () => {
@@ -4185,11 +4436,7 @@ describe('verifyBundle', () => {
       const publicKeyB64 = Buffer.from(publicKey).toString('base64');
 
       const checkpoints = opts.checkpointDefs.map((def) =>
-        signCheckpoint(
-          def,
-          orgId,
-          def.privateKeyOverride ?? privateKey,
-        ),
+        signCheckpoint(def, orgId, def.privateKeyOverride ?? privateKey),
       );
       const sealedPurges = (opts.sealedPurgeDefs ?? []).map((def) =>
         signSealedPurge(def, orgId, def.privateKeyOverride ?? privateKey),
@@ -4313,6 +4560,31 @@ describe('verifyBundle', () => {
       expect(report.integrityCheckpoints.failed).toBe(0);
       expect(report.completeness.ok).toBe(true);
       expect(report.ok).toBe(true);
+    });
+
+    it('computes row chain links once rather than once per checkpoint', async () => {
+      const base = buildFixtureBundle();
+      const tip = tipChainHeadHash(base);
+      const { zip } = buildV4Bundle({
+        checkpointDefs: Array.from({ length: 50 }, (_, index) => ({
+          id: `cp-linear-${index}`,
+          asOfIso: '2026-05-01T01:30:00.000Z',
+          chainHeadHash: tip,
+          cumulativeRowCount: '4',
+        })),
+      });
+      const hashSpy = vi.spyOn(cryptoPrimitives, 'sha256');
+      try {
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(true);
+        // The fixture has four rows. The chain verifier and checkpoint pass
+        // each hash those rows a constant number of times; adding fifty
+        // checkpoints must not add 50 x 4 canonical-link recomputations.
+        expect(hashSpy.mock.calls.length).toBeGreaterThanOrEqual(4);
+        expect(hashSpy.mock.calls.length).toBeLessThan(100);
+      } finally {
+        hashSpy.mockRestore();
+      }
     });
 
     it('rejects a v4 manifest missing integrityCheckpointCount with a distinct reason', async () => {
@@ -4878,7 +5150,10 @@ describe('verifyBundle', () => {
       return cliPath;
     }
 
-    function writeTempBundle(zip: Buffer): { tmpDir: string; bundlePath: string } {
+    function writeTempBundle(zip: Buffer): {
+      tmpDir: string;
+      bundlePath: string;
+    } {
       const tmpDir = fs.mkdtempSync(
         path.join(os.tmpdir(), 'audit-verifier-cli-status-'),
       );
@@ -4952,10 +5227,111 @@ describe('verifyBundle', () => {
       try {
         const stdout = execFileSync(
           process.execPath,
-          [cliPath, bundlePath, '--no-rekor', '--allow-legacy-unattested', '--quiet'],
+          [
+            cliPath,
+            bundlePath,
+            '--no-rekor',
+            '--allow-legacy-unattested',
+            '--quiet',
+          ],
           { encoding: 'utf8' },
         );
         expect(stdout).toBe('OK\n');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects an oversized sparse bundle before reading it into memory', () => {
+      const cliPath = cliPathOrThrow();
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'audit-verifier-cli-size-'),
+      );
+      const bundlePath = path.join(tmpDir, 'oversized.zip');
+      try {
+        fs.writeFileSync(bundlePath, Buffer.alloc(0));
+        fs.truncateSync(bundlePath, MAX_ZIP_ARCHIVE_BYTES + 1);
+        try {
+          execFileSync(process.execPath, [cliPath, bundlePath], {
+            encoding: 'utf8',
+          });
+          throw new Error(
+            'expected exit code 2, process did not exit non-zero',
+          );
+        } catch (err) {
+          const e = err as { status?: number; stderr?: string };
+          expect(e.status).toBe(2);
+          expect(e.stderr).toContain('bundle size');
+          expect(e.stderr).toContain('exceeds limit');
+        }
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects an oversized platform key before reading it into memory', () => {
+      const { zip } = buildBundleWithTamper({});
+      const cliPath = cliPathOrThrow();
+      const { tmpDir, bundlePath } = writeTempBundle(zip);
+      const keyPath = path.join(tmpDir, 'oversized-platform-key.pem');
+      try {
+        fs.writeFileSync(keyPath, Buffer.alloc(0));
+        fs.truncateSync(keyPath, 64 * 1024 + 1);
+        try {
+          execFileSync(
+            process.execPath,
+            [
+              cliPath,
+              bundlePath,
+              '--platform-key',
+              keyPath,
+              '--no-rekor',
+              '--allow-legacy-unattested',
+            ],
+            { encoding: 'utf8' },
+          );
+          throw new Error(
+            'expected exit code 2, process did not exit non-zero',
+          );
+        } catch (err) {
+          const e = err as { status?: number; stderr?: string };
+          expect(e.status).toBe(2);
+          expect(e.stderr).toContain('platform key size');
+          expect(e.stderr).toContain('exceeds limit');
+        }
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects a FIFO bundle path without waiting for a writer', () => {
+      if (process.platform === 'win32') return;
+
+      const cliPath = cliPathOrThrow();
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'audit-verifier-cli-fifo-'),
+      );
+      const bundlePath = path.join(tmpDir, 'bundle.fifo');
+      try {
+        execFileSync('mkfifo', [bundlePath]);
+        try {
+          execFileSync(process.execPath, [cliPath, bundlePath], {
+            encoding: 'utf8',
+            timeout: 2_000,
+          });
+          throw new Error(
+            'expected exit code 2, process did not exit non-zero',
+          );
+        } catch (err) {
+          const e = err as {
+            status?: number;
+            stderr?: string;
+            code?: string;
+          };
+          expect(e.code).not.toBe('ETIMEDOUT');
+          expect(e.status).toBe(2);
+          expect(e.stderr).toContain('bundle path is not a regular file');
+        }
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
@@ -5294,7 +5670,13 @@ describe('verifyBundle', () => {
     it('round-trips a genuine v5 bundle end to end — all nine new components valid', async () => {
       const { zip } = buildV5Bundle({
         events: successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000001'),
-        evidenceGradeSummaryOverride: { A: 0, B: 0, C: 1, D: 0, enforcementMode: 'observe' },
+        evidenceGradeSummaryOverride: {
+          A: 0,
+          B: 0,
+          C: 1,
+          D: 0,
+          enforcementMode: 'observe',
+        },
       });
       const report = await verifyBundle(zip, { noRekor: true });
       expect(report.status).toBe('valid');
@@ -5340,7 +5722,9 @@ describe('verifyBundle', () => {
         });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.manifest.status).toBe('invalid');
-        expect(report.manifest.reason).toMatch(/action_event_count_present_on_v4_manifest/);
+        expect(report.manifest.reason).toMatch(
+          /action_event_count_present_on_v4_manifest/,
+        );
       });
 
       it('rejects a v5 manifest missing evidenceGradeSummary', async () => {
@@ -5355,22 +5739,36 @@ describe('verifyBundle', () => {
         // Re-sign is unnecessary for THIS assertion: the missing-field check
         // in `verifyManifest` fires before signature verification runs.
         const zip = writeZip([
-          { name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8') },
+          {
+            name: 'manifest.json',
+            data: Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'),
+          },
           { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
           { name: 'roots.ndjson.gz', data: entries.get('roots.ndjson.gz')! },
           { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
           { name: 'public-keys.json', data: entries.get('public-keys.json')! },
           { name: 'README.md', data: entries.get('README.md')! },
-          { name: 'integrity-checkpoints.ndjson.gz', data: entries.get('integrity-checkpoints.ndjson.gz')! },
-          { name: 'action-events.ndjson.gz', data: entries.get('action-events.ndjson.gz')! },
+          {
+            name: 'integrity-checkpoints.ndjson.gz',
+            data: entries.get('integrity-checkpoints.ndjson.gz')!,
+          },
+          {
+            name: 'action-events.ndjson.gz',
+            data: entries.get('action-events.ndjson.gz')!,
+          },
         ]);
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.manifest.status).toBe('invalid');
-        expect(report.manifest.reason).toMatch(/evidence_grade_summary_missing_on_v5_manifest/);
+        expect(report.manifest.reason).toMatch(
+          /evidence_grade_summary_missing_on_v5_manifest/,
+        );
       });
 
       it('a v5 manifest declaring version >= 5 with NO action-events.ndjson.gz entry is a bundle-format error', async () => {
-        const { zip } = buildV5Bundle({ events: [], omitActionEventsFile: true });
+        const { zip } = buildV5Bundle({
+          events: [],
+          omitActionEventsFile: true,
+        });
         await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
           /missing required entry: action-events\.ndjson\.gz/,
         );
@@ -5390,15 +5788,18 @@ describe('verifyBundle', () => {
     describe('actionEventChain', () => {
       it('rejects an action event signed under a REVOKED key (threat-model row #7, key-rotation-revocation)', async () => {
         const { zip } = buildV5Bundle({
-          events: successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000002').map((e, i) =>
-            i === 0 ? { ...e, keyVersion: 1 } : e,
-          ),
+          events: successfulActionEvents(
+            'aaaaaaaa-0000-7000-8000-000000000002',
+          ).map((e, i) => (i === 0 ? { ...e, keyVersion: 1 } : e)),
           extraPublicKeys: {},
         });
         const entries = readBundleEntries(zip);
         const publicKeys = JSON.parse(
           entries.get('public-keys.json')!.toString('utf8'),
-        ) as Record<string, { publicKey: string; status: string; revokedAt: string | null }>;
+        ) as Record<
+          string,
+          { publicKey: string; status: string; revokedAt: string | null }
+        >;
         publicKeys['1']!.status = 'REVOKED';
         publicKeys['1']!.revokedAt = '2026-04-01T00:00:00.000Z';
         // Also mark REVOKED in the SIGNED manifest.keyVersions — otherwise
@@ -5407,7 +5808,11 @@ describe('verifyBundle', () => {
         const manifest = JSON.parse(
           entries.get('manifest.json')!.toString('utf8'),
         ) as Record<string, unknown> & {
-          keyVersions: Array<{ keyVersion: number; status?: string; revokedAt?: string | null }>;
+          keyVersions: Array<{
+            keyVersion: number;
+            status?: string;
+            revokedAt?: string | null;
+          }>;
         };
         // manifest.keyVersions is inside the SIGNED preimage — leaving it
         // ACTIVE here (unsigned public-keys.json alone is REVOKED) is
@@ -5424,13 +5829,18 @@ describe('verifyBundle', () => {
             data: Buffer.from(JSON.stringify(publicKeys, null, 2), 'utf8'),
           },
         ]);
-        const report = await verifyBundle(rebuilt, { noRekor: true, allowLegacyUnattested: true });
+        const report = await verifyBundle(rebuilt, {
+          noRekor: true,
+          allowLegacyUnattested: true,
+        });
         expect(report.actionEventChain.status).toBe('invalid');
         expect(report.actionEventChain.reason).toMatch(/key_revoked/);
       });
 
-      it('rejects an actionSeq gap within one actionId\'s stream (insertion — fabricated row mid-stream)', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000003');
+      it("rejects an actionSeq gap within one actionId's stream (insertion — fabricated row mid-stream)", async () => {
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-000000000003',
+        );
         // Skip actionSeq 3 entirely, as if an event were deleted/never
         // inserted, or as if a fabricated row were spliced in without
         // renumbering the tail — either way a gap.
@@ -5441,9 +5851,11 @@ describe('verifyBundle', () => {
         expect(report.actionEventChain.reason).toMatch(/action_event_seq_gap/);
       });
 
-      it('rejects a tampered prevEventCommitment — manifests as a signature failure BY CONSTRUCTION, since prevEventCommitment is baked into the signed preimage (mirrors AUDIT-SDK-01\'s prev_row_hash binding for audit rows — an attacker cannot break the chain link without also invalidating the event\'s own signature)', async () => {
+      it("rejects a tampered prevEventCommitment — manifests as a signature failure BY CONSTRUCTION, since prevEventCommitment is baked into the signed preimage (mirrors AUDIT-SDK-01's prev_row_hash binding for audit rows — an attacker cannot break the chain link without also invalidating the event's own signature)", async () => {
         const { zip } = buildV5Bundle({
-          events: successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000004'),
+          events: successfulActionEvents(
+            'aaaaaaaa-0000-7000-8000-000000000004',
+          ),
           postSignEvents: (evs) => {
             const target = evs.find((e) => e.actionSeq === 4)!;
             target.prevEventCommitment = 'f'.repeat(64);
@@ -5537,7 +5949,11 @@ describe('verifyBundle', () => {
               eventType: 'DISPATCH_ATTEMPTED',
               observedAtIso: isoSecond(T0, 3),
               dispatched: true,
-              payload: { requestCommitment: 'a'.repeat(64), permitId: 'p1', enforcementMode: 'observe' },
+              payload: {
+                requestCommitment: 'a'.repeat(64),
+                permitId: 'p1',
+                enforcementMode: 'observe',
+              },
               prevEventCommitmentOverride: 'deadbeef'.repeat(8),
             },
           ],
@@ -5547,7 +5963,9 @@ describe('verifyBundle', () => {
       });
 
       it('rejects a duplicate (actionId, actionSeq) pair (replay — a genuine signed event resubmitted out of context)', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000007');
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-000000000007',
+        );
         const { zip } = buildV5Bundle({
           events,
           postSignEvents: (evs) => {
@@ -5585,7 +6003,9 @@ describe('verifyBundle', () => {
     describe('permitBinding', () => {
       it('rejects a permitNonce consumed by two distinct actionIds (threat-model row #1, permit-replay)', async () => {
         const sharedNonce = 'shared-permit-nonce';
-        const a1 = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000a1').map((e) =>
+        const a1 = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000a1',
+        ).map((e) =>
           e.eventType === 'PERMIT_CONSUMED' || e.eventType === 'PERMIT_ISSUED'
             ? {
                 ...e,
@@ -5600,7 +6020,9 @@ describe('verifyBundle', () => {
               }
             : e,
         );
-        const a2 = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000a2').map((e) =>
+        const a2 = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000a2',
+        ).map((e) =>
           e.eventType === 'PERMIT_CONSUMED' || e.eventType === 'PERMIT_ISSUED'
             ? {
                 ...e,
@@ -5622,15 +6044,22 @@ describe('verifyBundle', () => {
       });
 
       it('rejects PERMIT_ISSUED/PERMIT_CONSUMED disagreeing on requestCommitment (D2 substitution)', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000b1').map((e) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000b1',
+        ).map((e) =>
           e.eventType === 'PERMIT_CONSUMED'
-            ? { ...e, payload: { ...e.payload, requestCommitment: 'f'.repeat(64) } }
+            ? {
+                ...e,
+                payload: { ...e.payload, requestCommitment: 'f'.repeat(64) },
+              }
             : e,
         );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.permitBinding.status).toBe('invalid');
-        expect(report.permitBinding.reason).toMatch(/permit_request_commitment_mismatch/);
+        expect(report.permitBinding.reason).toMatch(
+          /permit_request_commitment_mismatch/,
+        );
       });
 
       it('rejects a mismatch between the signed top-level permitNonce and its payload mirror', async () => {
@@ -5658,8 +6087,7 @@ describe('verifyBundle', () => {
                   ...e,
                   payload: {
                     ...e.payload,
-                    destinationIdempotencyCommitment:
-                      destinationCommitment,
+                    destinationIdempotencyCommitment: destinationCommitment,
                   },
                 }
               : e,
@@ -5691,9 +6119,14 @@ describe('verifyBundle', () => {
 
     describe('requestBinding — threat-model row #2, commitment-mismatch (request substitution)', () => {
       it('rejects DISPATCH_ATTEMPTED and PERMIT_CONSUMED disagreeing on requestCommitment', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000c1').map((e) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000c1',
+        ).map((e) =>
           e.eventType === 'DISPATCH_ATTEMPTED'
-            ? { ...e, payload: { ...e.payload, requestCommitment: 'f'.repeat(64) } }
+            ? {
+                ...e,
+                payload: { ...e.payload, requestCommitment: 'f'.repeat(64) },
+              }
             : e,
         );
         const { zip } = buildV5Bundle({ events });
@@ -5724,8 +6157,12 @@ describe('verifyBundle', () => {
 
     describe('dispatchIntegrity', () => {
       it('rejects a DISPATCH_ATTEMPTED event with dispatched: false', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000d1').map((e) =>
-          e.eventType === 'DISPATCH_ATTEMPTED' ? { ...e, dispatched: false } : e,
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000d1',
+        ).map((e) =>
+          e.eventType === 'DISPATCH_ATTEMPTED'
+            ? { ...e, dispatched: false }
+            : e,
         );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
@@ -5734,13 +6171,15 @@ describe('verifyBundle', () => {
       });
 
       it('rejects a SUCCEEDED closure with no DISPATCH_ATTEMPTED event at all', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000d2').filter(
-          (e) => e.eventType !== 'DISPATCH_ATTEMPTED',
-        );
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000d2',
+        ).filter((e) => e.eventType !== 'DISPATCH_ATTEMPTED');
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.dispatchIntegrity.status).toBe('invalid');
-        expect(report.dispatchIntegrity.reason).toMatch(/dispatch_evidence_missing/);
+        expect(report.dispatchIntegrity.reason).toMatch(
+          /dispatch_evidence_missing/,
+        );
       });
 
       it('rejects a DENIED (pre-dispatch-only) closure alongside a real DISPATCH_ATTEMPTED event', async () => {
@@ -5759,7 +6198,11 @@ describe('verifyBundle', () => {
             eventType: 'DISPATCH_ATTEMPTED',
             observedAtIso: isoSecond(T0, 1),
             dispatched: true,
-            payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+            payload: {
+              requestCommitment: 'a'.repeat(64),
+              permitId: null,
+              enforcementMode: 'observe',
+            },
           },
           {
             actionId,
@@ -5772,14 +6215,21 @@ describe('verifyBundle', () => {
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.dispatchIntegrity.status).toBe('invalid');
-        expect(report.dispatchIntegrity.reason).toMatch(/dispatch_evidence_contradiction/);
+        expect(report.dispatchIntegrity.reason).toMatch(
+          /dispatch_evidence_contradiction/,
+        );
       });
     });
 
     describe('targetAck — threat-model row #8, target-ack-mismatch', () => {
-      function actionWithTargetAck(actionId: string, ackPayload: Record<string, unknown>): ActionEventDef[] {
+      function actionWithTargetAck(
+        actionId: string,
+        ackPayload: Record<string, unknown>,
+      ): ActionEventDef[] {
         return [
-          ...successfulActionEvents(actionId).filter((e) => e.eventType !== 'CALLER_RESULT_OBSERVED'),
+          ...successfulActionEvents(actionId).filter(
+            (e) => e.eventType !== 'CALLER_RESULT_OBSERVED',
+          ),
           {
             actionId,
             actionSeq: 5,
@@ -5792,44 +6242,238 @@ describe('verifyBundle', () => {
         );
       }
 
+      it.each(['valid', 'missing-pin', 'wrong-pin', 'changed-result', 'changed-request', 'changed-signature', 'commitments-only', 'commitments-wrong-key', 'commitments-changed-result', 'legacy-missing-result', 'mixed-content'] as const)('independently verifies HTTP target receipts: %s', async mode => {
+        const actionId = 'aaaaaaaa-0000-7000-8000-000000000099';
+        const organizationId = '00000000-0000-0000-0000-000000000001';
+        const keys = crypto.generateKeyPairSync('ed25519');
+        const publicKeyPem = keys.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+        const request = { version: 'praesidia.http-request.v1' as const, targetId: 'bank', destination: 'https://target.example/credit', targetKeyFingerprint: httpTargetKeyFingerprint(publicKeyPem), method: 'POST' as const, contentType: 'application/json' as const, body: { amount: '5.00' } };
+        const requestCommitment = httpRequestCommitment(request);
+        const result = { applied: '5.00' };
+        const resultCommitment = jcsCommitment(result);
+        const statement = { version: 'praesidia.http-receipt.v1', organizationId, actionId, targetId: 'bank', keyId: 'key-1', requestCommitment, resultCommitment, effect: 'succeeded', issuedAt: isoSecond(T0, 4), targetTransactionId: 'credit-1' };
+        const signature = crypto.sign(null, jcsCanonicalize(statement), keys.privateKey).toString('base64');
+        const events: ActionEventDef[] = successfulActionEvents(actionId).map(event => ({ ...event,
+          actionSeq: event.eventType === 'ACTION_CLOSED' ? 7 : event.actionSeq,
+          payload: event.eventType === 'ACTION_PROPOSED' ? { protocol: 'http-receipt', actionClass: 'http:POST', request: mode === 'changed-request' ? { ...request, body: { amount: '500.00' } } : request, requestCommitment }
+            : event.eventType === 'CALLER_RESULT_OBSERVED' ? { observer: 'praesidia-http-edge', success: true, outcomeClass: 'completed_success', result: mode === 'changed-result' ? { applied: '999.00' } : result, resultCommitment, requestCommitment }
+            : { ...event.payload, ...(event.payload?.requestCommitment ? { requestCommitment } : {}) },
+        }));
+        events.push({ actionId, actionSeq: 6, eventType: 'TARGET_ACKNOWLEDGED', observedAtIso: isoSecond(T0, 4), payload: { grade: 'A', targetSignature: signature, signatureAlgorithm: 'Ed25519', requestCommitment, resultCommitment, receipt: { statement, signature: mode === 'changed-signature' ? 'A'.repeat(86) + '==' : signature } } });
+        if (['commitments-only', 'commitments-wrong-key', 'commitments-changed-result', 'mixed-content'].includes(mode)) {
+          const proposal = events.find(event => event.eventType === 'ACTION_PROPOSED')!;
+          proposal.payload = { protocol: 'http-receipt', actionClass: 'http:POST', evidenceContent: 'commitments-only.v1', targetIdentity: 'bank', targetKeyFingerprint: mode === 'commitments-wrong-key' ? '0'.repeat(64) : request.targetKeyFingerprint, requestCommitment };
+          const observed = events.find(event => event.eventType === 'CALLER_RESULT_OBSERVED')!;
+          observed.payload = { observer: 'praesidia-http-edge', success: true, outcomeClass: 'completed_success', evidenceContent: 'commitments-only.v1', resultCommitment: mode === 'commitments-changed-result' ? '0'.repeat(64) : resultCommitment, requestCommitment,
+            ...(mode === 'mixed-content' ? { result } : {}) };
+        }
+        if (mode === 'legacy-missing-result') delete events.find(event => event.eventType === 'CALLER_RESULT_OBSERVED')!.payload!.result;
+        const { zip } = buildV5Bundle({ events: events.sort((a, b) => a.actionSeq - b.actionSeq), evidenceGradeSummaryOverride: { A: 1, B: 0, C: 0, D: 0, enforcementMode: 'observe' } });
+        const report = await verifyBundle(zip, { noRekor: true, ...(mode !== 'missing-pin' ? { targetPublicKeys: { [`${organizationId}:bank:key-1`]: mode === 'wrong-pin' ? crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }).toString() : publicKeyPem } } : {}) });
+        expect(report.targetAck.status).toBe(['valid', 'commitments-only'].includes(mode) ? 'valid' : 'invalid');
+        expect(report.evidenceGrade.status).toBe(['valid', 'commitments-only'].includes(mode) ? 'valid' : 'invalid');
+        expect(report.status, JSON.stringify(report)).toBe(['valid', 'commitments-only'].includes(mode) ? 'valid' : 'invalid');
+      });
+
       it('rejects a grade-A TARGET_ACKNOWLEDGED claim with no targetSignature', async () => {
-        const events = actionWithTargetAck('aaaaaaaa-0000-7000-8000-0000000000e1', {
-          grade: 'A',
-          targetId: 't1',
-          authoritativeState: 'succeeded',
-          observedAt: isoSecond(T0, 4),
-          adapterVersion: '1.0.0',
-        });
+        const events = actionWithTargetAck(
+          'aaaaaaaa-0000-7000-8000-0000000000e1',
+          {
+            grade: 'A',
+            targetId: 't1',
+            authoritativeState: 'succeeded',
+            observedAt: isoSecond(T0, 4),
+            adapterVersion: '1.0.0',
+          },
+        );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.targetAck.status).toBe('invalid');
-        expect(report.targetAck.reason).toMatch(/target_ack_grade_a_missing_signature/);
+        expect(report.targetAck.reason).toMatch(
+          /target_ack_grade_a_missing_signature/,
+        );
+      });
+
+      describe('late signed HTTP receipt reconciliation', () => {
+        function lateReceipt(effect: 'succeeded' | 'partial' | 'failed_no_effect' | 'unknown' = 'succeeded') {
+          const actionId = 'aaaaaaaa-0000-7000-8000-00000000009a';
+          const organizationId = '00000000-0000-0000-0000-000000000001';
+          const keys = crypto.generateKeyPairSync('ed25519');
+          const pin = keys.publicKey.export({ type: 'spki', format: 'pem' }).toString();
+          const request = { version: 'praesidia.http-request.v1' as const, targetId: 'bank',
+            destination: 'https://target.example/credit', targetKeyFingerprint: httpTargetKeyFingerprint(pin),
+            method: 'POST' as const, contentType: 'application/json' as const, body: { amount: '5.00' } };
+          const requestCommitment = httpRequestCommitment(request);
+          const result = { applied: effect === 'partial' ? '2.00' : '5.00' };
+          const resultCommitment = jcsCommitment(result);
+          // The receipt is issued during the original attempt, one second after
+          // the sweeper closes unknown, and observed immediately. Reconciliation
+          // does not extend the producer's five-minute receipt freshness window.
+          const statement = { version: 'praesidia.http-receipt.v1', organizationId, actionId,
+            targetId: 'bank', keyId: 'key-1', requestCommitment, resultCommitment, effect,
+            issuedAt: isoSecond(T0, 11), targetTransactionId: 'credit-late-1' };
+          const receipt = { statement, signature: crypto.sign(null, jcsCanonicalize(statement), keys.privateKey).toString('base64') };
+          const closure = { succeeded: 'SUCCEEDED', partial: 'PARTIAL', failed_no_effect: 'FAILED_NO_EFFECT', unknown: 'OUTCOME_UNKNOWN' }[effect];
+          const events: ActionEventDef[] = successfulActionEvents(actionId).slice(0, 4).map(event => ({ ...event,
+            payload: event.eventType === 'ACTION_PROPOSED'
+              ? { protocol: 'http-receipt', actionClass: 'http:POST', evidenceContent: 'commitments-only.v1',
+                  targetIdentity: request.targetId, targetKeyFingerprint: request.targetKeyFingerprint, requestCommitment }
+              : { ...event.payload, requestCommitment },
+          }));
+          events.push(
+            { actionId, actionSeq: 5, eventType: 'ACTION_CLOSED', observedAtIso: isoSecond(T0, 10),
+              payload: { closure: 'OUTCOME_UNKNOWN', reason: 'TIMEOUT', evidenceGrade: 'C' } },
+            { actionId, actionSeq: 6, eventType: 'TARGET_ACKNOWLEDGED', observedAtIso: isoSecond(T0, 11),
+              payload: { grade: 'A', targetSignature: receipt.signature, signatureAlgorithm: 'Ed25519', requestCommitment, resultCommitment, receipt } },
+            { actionId, actionSeq: 7, eventType: 'CALLER_RESULT_OBSERVED', observedAtIso: isoSecond(T0, 12),
+              payload: { observer: 'praesidia-http-edge', evidenceContent: 'commitments-only.v1',
+                success: effect === 'succeeded', outcomeClass: effect === 'succeeded' ? 'completed_success' : 'completed_with_error',
+                requestCommitment, resultCommitment } },
+            { actionId, actionSeq: 8, eventType: 'OUTCOME_RECONCILED', observedAtIso: isoSecond(T0, 13),
+              payload: { toClosure: closure, reason: effect === 'unknown' ? 'TIMEOUT' : 'EVIDENCED', evidenceGrade: 'A', outcomeReason: 'target_signed_assertion' } },
+          );
+          const verify = async () => {
+            const { zip } = buildV5Bundle({ events: events.map((event, index) => ({ ...event, actionSeq: index + 1 })),
+              evidenceGradeSummaryOverride: { A: 1, B: 0, C: 0, D: 0, enforcementMode: 'observe' } });
+            return verifyBundle(zip, { noRekor: true, targetPublicKeys: { [`${organizationId}:bank:key-1`]: pin } });
+          };
+          return { events, verify, receipt, keys, request, result, requestCommitment, resultCommitment };
+        }
+
+        it.each(['succeeded', 'partial', 'failed_no_effect', 'unknown'] as const)('accepts a signed %s receipt after an honest unknown closure', async effect => {
+          const report = await lateReceipt(effect).verify();
+          expect(report.status, JSON.stringify(report)).toBe('valid');
+          expect(report.actionEventChain.status).toBe('valid');
+          expect(report.permitBinding.status).toBe('valid');
+          expect(report.requestBinding.status).toBe('valid');
+          expect(report.closureLegality.status).toBe('valid');
+          expect(report.targetAck.status).toBe('valid');
+          expect(report.evidenceGrade.status).toBe('valid');
+        });
+
+        it('accepts incomplete → unknown → partial with the legacy body-bearing receipt evidence', async () => {
+          const fixture = lateReceipt('partial');
+          fixture.events[4]!.payload!.closure = 'EVIDENCE_INCOMPLETE';
+          fixture.events.splice(5, 0, { ...fixture.events[4]!, eventType: 'OUTCOME_RECONCILED',
+            payload: { toClosure: 'OUTCOME_UNKNOWN', reason: 'TIMEOUT' } });
+          fixture.events[0]!.payload = { protocol: 'http-receipt', actionClass: 'http:POST', request: fixture.request, requestCommitment: fixture.requestCommitment };
+          const caller = fixture.events.find(event => event.eventType === 'CALLER_RESULT_OBSERVED')!;
+          delete caller.payload!.evidenceContent;
+          caller.payload!.result = fixture.result;
+          const report = await fixture.verify();
+          expect(report.status, JSON.stringify(report)).toBe('valid');
+          expect(report.targetAck.status).toBe('valid');
+          expect(report.evidenceGrade.status).toBe('valid');
+        });
+
+        it('matches the late receipt to its result even when a prior timeout observation exists', async () => {
+          const fixture = lateReceipt();
+          fixture.events.splice(4, 0, { ...fixture.events[6]!, observedAtIso: isoSecond(T0, 9),
+            payload: { ...fixture.events[6]!.payload, success: false, outcomeClass: 'no_response_received',
+              resultCommitment: jcsCommitment({ error: 'timeout' }) } });
+          const report = await fixture.verify();
+          expect(report.status, JSON.stringify(report)).toBe('valid');
+          expect(report.targetAck.status).toBe('valid');
+          expect(report.evidenceGrade.status).toBe('valid');
+        });
+
+        it('preserves older reconciliation payloads that omitted the optional reason', async () => {
+          const fixture = lateReceipt();
+          delete fixture.events[7]!.payload!.reason;
+          const report = await fixture.verify();
+          expect(report.status, JSON.stringify(report)).toBe('valid');
+          expect(report.closureLegality.status).toBe('valid');
+          expect(report.targetAck.status).toBe('valid');
+        });
+
+        it.each(['determined-overwrite', 'double-initial-close', 'missing-initial-close', 'malformed-target',
+          'contradictory-reason', 'malformed-reason', 'unknown-reason', 'illegal-intermediate', 'receipt-after-final-close',
+          'caller-after-final-close', 'unknown-receipt-for-success', 'substituted-request',
+          'changed-signature', 'invalid-issued-at', 'invalid-event-signature'] as const)('rejects %s despite an otherwise genuine signed target receipt', async mode => {
+          const fixture = lateReceipt(mode === 'unknown-receipt-for-success' ? 'unknown' : 'partial');
+          const initial = fixture.events[4]!;
+          const ack = fixture.events[5]!;
+          const caller = fixture.events[6]!;
+          const reconciled = fixture.events[7]!;
+          if (mode === 'determined-overwrite') {
+            // Make the original determined closure independently legal, then
+            // attempt to overwrite it with the genuine late partial receipt.
+            fixture.events.splice(4, 0, { ...caller, observedAtIso: isoSecond(T0, 9),
+              payload: { success: true, outcomeClass: 'completed_success', resultCommitment: fixture.resultCommitment } });
+            initial.payload = { closure: 'SUCCEEDED', reason: 'EVIDENCED' };
+          } else if (mode === 'double-initial-close') {
+            reconciled.eventType = 'ACTION_CLOSED';
+            reconciled.payload = { closure: 'PARTIAL', reason: 'EVIDENCED' };
+          } else if (mode === 'missing-initial-close') fixture.events.splice(4, 1);
+          else if (mode === 'malformed-target') reconciled.payload!.toClosure = 42;
+          else if (mode === 'contradictory-reason') reconciled.payload!.reason = 'TIMEOUT';
+          else if (mode === 'malformed-reason') reconciled.payload!.reason = { reason: 'EVIDENCED' };
+          else if (mode === 'unknown-reason') reconciled.payload!.reason = 'constructor';
+          else if (mode === 'illegal-intermediate') fixture.events.splice(5, 0, { ...initial,
+            eventType: 'OUTCOME_RECONCILED', payload: { toClosure: 'DENIED', reason: 'POLICY' } });
+          else if (mode === 'receipt-after-final-close') {
+            fixture.events.splice(5, 1);
+            fixture.events.push(ack);
+          } else if (mode === 'caller-after-final-close') {
+            fixture.events.splice(6, 1);
+            fixture.events.push(caller);
+          }
+          else if (mode === 'unknown-receipt-for-success') reconciled.payload = { toClosure: 'SUCCEEDED', reason: 'EVIDENCED' };
+          else if (mode === 'substituted-request') fixture.events[0]!.payload!.requestCommitment = 'f'.repeat(64);
+          else if (mode === 'changed-signature') {
+            fixture.receipt.signature = 'A'.repeat(86) + '==';
+            ack.payload!.targetSignature = fixture.receipt.signature;
+          } else if (mode === 'invalid-issued-at') {
+            // Even re-signing a noncanonical timestamp must not make it valid.
+            fixture.receipt.statement.issuedAt = '2026-05-01';
+            fixture.receipt.signature = crypto.sign(null, jcsCanonicalize(fixture.receipt.statement), fixture.keys.privateKey).toString('base64');
+            ack.payload!.targetSignature = fixture.receipt.signature;
+          } else if (mode === 'invalid-event-signature') reconciled.tamperSignature = true;
+          const report = await fixture.verify();
+          expect(report.status, JSON.stringify(report)).toBe('invalid');
+          if (mode === 'invalid-event-signature') expect(report.actionEventChain.status).toBe('invalid');
+          else {
+            expect(report.targetAck.status).toBe('invalid');
+            expect(report.evidenceGrade.status).toBe('invalid');
+          }
+          if (mode === 'determined-overwrite') expect(report.closureLegality.reason).toMatch(/illegal_reconciliation/);
+          if (mode === 'double-initial-close') expect(report.closureLegality.reason).toMatch(/multiple_action_closed/);
+          if (mode.includes('reason')) expect(report.closureLegality.reason).toMatch(/closure_reason_mismatch/);
+        });
       });
 
       it('rejects a grade-B TARGET_ACKNOWLEDGED claim with destinationAuthenticated !== true', async () => {
-        const events = actionWithTargetAck('aaaaaaaa-0000-7000-8000-0000000000e2', {
-          grade: 'B',
-          targetId: 't1',
-          authoritativeState: 'succeeded',
-          observedAt: isoSecond(T0, 4),
-          adapterVersion: '1.0.0',
-          edgeAttestation: 'attestation-bytes',
-          destinationAuthenticated: false,
-        });
+        const events = actionWithTargetAck(
+          'aaaaaaaa-0000-7000-8000-0000000000e2',
+          {
+            grade: 'B',
+            targetId: 't1',
+            authoritativeState: 'succeeded',
+            observedAt: isoSecond(T0, 4),
+            adapterVersion: '1.0.0',
+            edgeAttestation: 'attestation-bytes',
+            destinationAuthenticated: false,
+          },
+        );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.targetAck.status).toBe('invalid');
-        expect(report.targetAck.reason).toMatch(/target_ack_grade_b_missing_attestation/);
+        expect(report.targetAck.reason).toMatch(
+          /target_ack_grade_b_missing_attestation/,
+        );
       });
 
       it('accepts a well-formed grade-C TARGET_ACKNOWLEDGED claim', async () => {
-        const events = actionWithTargetAck('aaaaaaaa-0000-7000-8000-0000000000e3', {
-          grade: 'C',
-          targetId: null,
-          authoritativeState: 'succeeded',
-          observedAt: isoSecond(T0, 4),
-          adapterVersion: '1.0.0',
-        });
+        const events = actionWithTargetAck(
+          'aaaaaaaa-0000-7000-8000-0000000000e3',
+          {
+            grade: 'C',
+            targetId: null,
+            authoritativeState: 'succeeded',
+            observedAt: isoSecond(T0, 4),
+            adapterVersion: '1.0.0',
+          },
+        );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.targetAck.status).toBe('valid');
@@ -5838,19 +6482,28 @@ describe('verifyBundle', () => {
 
     describe('callerResult — threat-model row #9, caller-result-forgery', () => {
       it('rejects a CALLER_RESULT_OBSERVED event whose payload.success is not a boolean', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000f1').map((e) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000f1',
+        ).map((e) =>
           e.eventType === 'CALLER_RESULT_OBSERVED'
-            ? { ...e, payload: { success: 'yes', resultCommitment: 'b'.repeat(64) } }
+            ? {
+                ...e,
+                payload: { success: 'yes', resultCommitment: 'b'.repeat(64) },
+              }
             : e,
         );
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.callerResult.status).toBe('invalid');
-        expect(report.callerResult.reason).toMatch(/payload\.success must be a boolean/);
+        expect(report.callerResult.reason).toMatch(
+          /payload\.success must be a boolean/,
+        );
       });
 
       it('rejects a CALLER_RESULT_OBSERVED event with a malformed resultCommitment', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000f2').map((e) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000f2',
+        ).map((e) =>
           e.eventType === 'CALLER_RESULT_OBSERVED'
             ? { ...e, payload: { success: true, resultCommitment: 'not-hex' } }
             : e,
@@ -5864,7 +6517,9 @@ describe('verifyBundle', () => {
 
     describe('redaction — threat-model row #10, redaction-completeness', () => {
       it('a legitimately redacted CALLER_RESULT_OBSERVED (payload: null, payloadCommitment present) verifies as incomplete, not invalid — exit code 3', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000g1').map((e) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000g1',
+        ).map((e) =>
           e.eventType === 'CALLER_RESULT_OBSERVED'
             ? { ...e, payload: null, payloadCommitment: 'c'.repeat(64) }
             : e,
@@ -5886,8 +6541,12 @@ describe('verifyBundle', () => {
       });
 
       it('an illegitimately stripped event (payload: null AND payloadCommitment: null) is a structural bundle-format error', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000g2').map((e) =>
-          e.eventType === 'CALLER_RESULT_OBSERVED' ? { ...e, payload: null, payloadCommitment: null } : e,
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000g2',
+        ).map((e) =>
+          e.eventType === 'CALLER_RESULT_OBSERVED'
+            ? { ...e, payload: null, payloadCommitment: null }
+            : e,
         );
         const { zip } = buildV5Bundle({ events });
         await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
@@ -5897,7 +6556,7 @@ describe('verifyBundle', () => {
     });
 
     describe('closureLegality — the centerpiece (D7, threat-model row #5 crash-window-recovery)', () => {
-      it('a bundle claiming FAILED_NO_EFFECT with reason TIMEOUT verifies as invalid (D7\'s hard rule)', async () => {
+      it("a bundle claiming FAILED_NO_EFFECT with reason TIMEOUT verifies as invalid (D7's hard rule)", async () => {
         const actionId = 'aaaaaaaa-0000-7000-8000-0000000000h1';
         const events: ActionEventDef[] = [
           {
@@ -5913,7 +6572,11 @@ describe('verifyBundle', () => {
             eventType: 'DISPATCH_ATTEMPTED',
             observedAtIso: isoSecond(T0, 1),
             dispatched: true,
-            payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+            payload: {
+              requestCommitment: 'a'.repeat(64),
+              permitId: null,
+              enforcementMode: 'observe',
+            },
           },
           {
             actionId,
@@ -5925,13 +6588,19 @@ describe('verifyBundle', () => {
             // never FAILED_NO_EFFECT (D7's own worker never constructs
             // this transition — this fixture models a forged/buggy
             // producer attempting it anyway).
-            payload: { closure: 'FAILED_NO_EFFECT', reason: 'TIMEOUT', attemptCount: 3 },
+            payload: {
+              closure: 'FAILED_NO_EFFECT',
+              reason: 'TIMEOUT',
+              attemptCount: 3,
+            },
           },
         ];
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.closureLegality.status).toBe('invalid');
-        expect(report.closureLegality.reason).toMatch(/closure_reason_mismatch/);
+        expect(report.closureLegality.reason).toMatch(
+          /closure_reason_mismatch/,
+        );
         expect(report.status).toBe('invalid');
       });
 
@@ -5951,7 +6620,11 @@ describe('verifyBundle', () => {
             eventType: 'DISPATCH_ATTEMPTED',
             observedAtIso: isoSecond(T0, 1),
             dispatched: true,
-            payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+            payload: {
+              requestCommitment: 'a'.repeat(64),
+              permitId: null,
+              enforcementMode: 'observe',
+            },
           },
           {
             actionId,
@@ -5961,13 +6634,19 @@ describe('verifyBundle', () => {
             // Declares EVIDENCED (passes the reason/closure table) but no
             // TARGET_ACKNOWLEDGED/CALLER_RESULT_OBSERVED event exists
             // anywhere in this actionId's stream — the deeper check.
-            payload: { closure: 'FAILED_NO_EFFECT', reason: 'EVIDENCED', resultCommitment: null },
+            payload: {
+              closure: 'FAILED_NO_EFFECT',
+              reason: 'EVIDENCED',
+              resultCommitment: null,
+            },
           },
         ];
         const { zip } = buildV5Bundle({ events });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.closureLegality.status).toBe('invalid');
-        expect(report.closureLegality.reason).toMatch(/closure_lacks_evidencing_event/);
+        expect(report.closureLegality.reason).toMatch(
+          /closure_lacks_evidencing_event/,
+        );
       });
 
       it('a genuine OUTCOME_UNKNOWN via reason TIMEOUT verifies as valid (the honest crash-window-recovery outcome)', async () => {
@@ -5986,14 +6665,22 @@ describe('verifyBundle', () => {
             eventType: 'DISPATCH_ATTEMPTED',
             observedAtIso: isoSecond(T0, 1),
             dispatched: true,
-            payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+            payload: {
+              requestCommitment: 'a'.repeat(64),
+              permitId: null,
+              enforcementMode: 'observe',
+            },
           },
           {
             actionId,
             actionSeq: 3,
             eventType: 'ACTION_CLOSED',
             observedAtIso: isoSecond(T0, 100),
-            payload: { closure: 'OUTCOME_UNKNOWN', reason: 'TIMEOUT', attemptCount: 3 },
+            payload: {
+              closure: 'OUTCOME_UNKNOWN',
+              reason: 'TIMEOUT',
+              attemptCount: 3,
+            },
           },
         ];
         const { zip } = buildV5Bundle({ events });
@@ -6033,7 +6720,13 @@ describe('verifyBundle', () => {
             actionSeq: 2,
             eventType: 'ACTION_CLOSED',
             observedAtIso: isoSecond(T0, 1),
-            payload: { closure: 'DUPLICATE_SUPPRESSED', reason: 'REPLAY', message: 'replay suppressed', errorCode: 'PERMIT_REPLAYED', enforcementMode: 'enforce' },
+            payload: {
+              closure: 'DUPLICATE_SUPPRESSED',
+              reason: 'REPLAY',
+              message: 'replay suppressed',
+              errorCode: 'PERMIT_REPLAYED',
+              enforcementMode: 'enforce',
+            },
           },
         ];
         const { zip } = buildV5Bundle({ events });
@@ -6061,7 +6754,11 @@ describe('verifyBundle', () => {
               eventType: 'DISPATCH_ATTEMPTED',
               observedAtIso: isoSecond(T0, 1),
               dispatched: true,
-              payload: { requestCommitment: 'a'.repeat(64), permitId: null, enforcementMode: 'observe' },
+              payload: {
+                requestCommitment: 'a'.repeat(64),
+                permitId: null,
+                enforcementMode: 'observe',
+              },
             },
             {
               actionId,
@@ -6091,7 +6788,9 @@ describe('verifyBundle', () => {
           const { zip } = buildV5Bundle({ events });
           const report = await verifyBundle(zip, { noRekor: true });
           expect(report.closureLegality.status).toBe('invalid');
-          expect(report.closureLegality.reason).toMatch(/closure_evidencing_event_not_positive/);
+          expect(report.closureLegality.reason).toMatch(
+            /closure_evidencing_event_not_positive/,
+          );
           expect(report.status).toBe('invalid');
         });
 
@@ -6129,7 +6828,9 @@ describe('verifyBundle', () => {
           const report = await verifyBundle(zip, { noRekor: true });
           expect(report.closureLegality.status).toBe('incomplete');
           expect(report.closureLegality.ok).toBe(false);
-          expect(report.closureLegality.reason).toMatch(/closure_evidencing_event_ambiguous/);
+          expect(report.closureLegality.reason).toMatch(
+            /closure_evidencing_event_ambiguous/,
+          );
           expect(report.status).toBe('incomplete');
         });
 
@@ -6143,7 +6844,9 @@ describe('verifyBundle', () => {
           const { zip } = buildV5Bundle({ events });
           const report = await verifyBundle(zip, { noRekor: true });
           expect(report.callerResult.status).toBe('invalid');
-          expect(report.callerResult.reason).toMatch(/outcomeClass.*inconsistent with payload\.success/);
+          expect(report.callerResult.reason).toMatch(
+            /outcomeClass.*inconsistent with payload\.success/,
+          );
         });
 
         it('rejects a CALLER_RESULT_OBSERVED with an unrecognized outcomeClass value', async () => {
@@ -6163,21 +6866,39 @@ describe('verifyBundle', () => {
 
     describe('evidenceGrade — corrigendum C4: derive, do not believe', () => {
       it('rejects a declared grade A when only grade-C evidence is actually present', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000i1');
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000i1',
+        );
         const { zip } = buildV5Bundle({
           events,
-          evidenceGradeSummaryOverride: { A: 1, B: 0, C: 0, D: 0, enforcementMode: 'observe' },
+          evidenceGradeSummaryOverride: {
+            A: 1,
+            B: 0,
+            C: 0,
+            D: 0,
+            enforcementMode: 'observe',
+          },
         });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.evidenceGrade.status).toBe('invalid');
-        expect(report.evidenceGrade.reason).toMatch(/declared_grade_exceeds_derived_evidence/);
+        expect(report.evidenceGrade.reason).toMatch(
+          /declared_grade_exceeds_derived_evidence/,
+        );
       });
 
       it('accepts a declared grade C matching the actually-present evidence', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000i2');
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000i2',
+        );
         const { zip } = buildV5Bundle({
           events,
-          evidenceGradeSummaryOverride: { A: 0, B: 0, C: 1, D: 0, enforcementMode: 'observe' },
+          evidenceGradeSummaryOverride: {
+            A: 0,
+            B: 0,
+            C: 1,
+            D: 0,
+            enforcementMode: 'observe',
+          },
         });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.evidenceGrade.status).toBe('valid');
@@ -6205,33 +6926,57 @@ describe('verifyBundle', () => {
       });
 
       it('rejects enforcementMode "enforce" when a counted event\'s own payload declares "observe" — an observe-mode action must never be countable as enforced', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000i3');
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000i3',
+        );
         // successfulActionEvents' DISPATCH_ATTEMPTED already declares
         // enforcementMode: 'observe' in its payload.
         const { zip } = buildV5Bundle({
           events,
-          evidenceGradeSummaryOverride: { A: 0, B: 0, C: 1, D: 0, enforcementMode: 'enforce' },
+          evidenceGradeSummaryOverride: {
+            A: 0,
+            B: 0,
+            C: 1,
+            D: 0,
+            enforcementMode: 'enforce',
+          },
         });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.evidenceGrade.status).toBe('invalid');
-        expect(report.evidenceGrade.reason).toMatch(/observe_mode_action_counted_as_enforced/);
+        expect(report.evidenceGrade.reason).toMatch(
+          /observe_mode_action_counted_as_enforced/,
+        );
       });
     });
 
     describe('actionCompleteness — truncation defense', () => {
       it('rejects a signed actionEventCount that disagrees with the rows actually shipped', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000j1');
-        const { zip } = buildV5Bundle({ events, actionEventCountOverride: events.length + 1 });
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000j1',
+        );
+        const { zip } = buildV5Bundle({
+          events,
+          actionEventCountOverride: events.length + 1,
+        });
         const report = await verifyBundle(zip, { noRekor: true });
         expect(report.actionCompleteness.status).toBe('invalid');
-        expect(report.actionCompleteness.reason).toMatch(/action event count mismatch/);
+        expect(report.actionCompleteness.reason).toMatch(
+          /action event count mismatch/,
+        );
       });
     });
 
     describe('substitution (narrower proxy — see PA01-FIXED-audit-verifier.md for the documented scope limit)', () => {
       it('rejects an action event whose organizationId field was left unedited from a foreign org (structural bundle-format error)', async () => {
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000k1').map((e, i) =>
-          i === 0 ? { ...e, organizationIdOverride: '99999999-0000-0000-0000-000000000099' } : e,
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000k1',
+        ).map((e, i) =>
+          i === 0
+            ? {
+                ...e,
+                organizationIdOverride: '99999999-0000-0000-0000-000000000099',
+              }
+            : e,
         );
         const { zip } = buildV5Bundle({ events });
         await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
@@ -6241,7 +6986,9 @@ describe('verifyBundle', () => {
 
       it('rejects an action event validly signed for a foreign org whose organizationId field was rewritten post-signing to match the target org (signature no longer verifies)', async () => {
         const foreignOrgId = '99999999-0000-0000-0000-000000000099';
-        const events = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000k2').map((e, i) =>
+        const events = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000k2',
+        ).map((e, i) =>
           i === 0 ? { ...e, organizationIdOverride: foreignOrgId } : e,
         );
         const { zip } = buildV5Bundle({
@@ -6256,7 +7003,9 @@ describe('verifyBundle', () => {
         // Patch the wire org back to the bundle's real orgId so the
         // structural check passes and the SIGNATURE check is what fires.
         const entries = readBundleEntries(zip);
-        const manifest = JSON.parse(entries.get('manifest.json')!.toString('utf8')) as { orgId: string };
+        const manifest = JSON.parse(
+          entries.get('manifest.json')!.toString('utf8'),
+        ) as { orgId: string };
         const lines = zlib
           .gunzipSync(entries.get('action-events.ndjson.gz')!)
           .toString('utf8')
@@ -6272,17 +7021,24 @@ describe('verifyBundle', () => {
           ...[...entries.entries()]
             .filter(([name]) => name !== 'action-events.ndjson.gz')
             .map(([name, data]) => ({ name, data })),
-          { name: 'action-events.ndjson.gz', data: gzipDeterministic(rebuiltNdjson) },
+          {
+            name: 'action-events.ndjson.gz',
+            data: gzipDeterministic(rebuiltNdjson),
+          },
         ]);
         const report = await verifyBundle(rebuilt, { noRekor: true });
         expect(report.actionEventChain.status).toBe('invalid');
-        expect(report.actionEventChain.reason).toMatch(/signature does not verify/);
+        expect(report.actionEventChain.reason).toMatch(
+          /signature does not verify/,
+        );
       });
     });
 
     describe('split view — threat-model row #12, split-view-divergence', () => {
       it('two independently-built bundles for the same actionId diverge deterministically: the untampered one verifies, the altered one does not, at the exact same offender', async () => {
-        const honestEvents = successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000l1');
+        const honestEvents = successfulActionEvents(
+          'aaaaaaaa-0000-7000-8000-0000000000l1',
+        );
         const gradeSummary = {
           A: 0,
           B: 0,
@@ -6305,7 +7061,9 @@ describe('verifyBundle', () => {
         });
 
         const honestReport = await verifyBundle(honestZip, { noRekor: true });
-        const tamperedReport = await verifyBundle(tamperedZip, { noRekor: true });
+        const tamperedReport = await verifyBundle(tamperedZip, {
+          noRekor: true,
+        });
 
         expect(honestReport.status).toBe('valid');
         expect(tamperedReport.status).toBe('invalid');

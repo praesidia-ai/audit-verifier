@@ -13,6 +13,10 @@ export type {
   ComponentResult,
   ComponentStatus,
   VerifyOptions,
+  VerifyResourceLimits,
   AnchorReceiptEntry,
   ExpectedAnchorRoot,
 } from './verify.js';
+
+export { verifyHttpReceipt, httpRequestCommitment, httpTargetKeyFingerprint } from './http-receipt.js';
+export type { SignedHttpReceipt, HttpReceiptStatement, HttpRequestEnvelope, HttpReceiptExpected } from './http-receipt.js';

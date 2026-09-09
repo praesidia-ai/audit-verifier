@@ -173,8 +173,10 @@ checks every cryptographic invariant the bundle commits to:
 6. **Rekor receipt** — when `--no-rekor` is NOT passed, each root's
    Sigstore Rekor receipt is verified **cryptographically and offline**:
    its Signed Entry Timestamp (SET) is checked against the **pinned**
-   Sigstore Rekor public key, and its inclusion proof is walked to the
-   receipt's `rootHash`. Its `hashedrekord` body must also contain the exact
+   Sigstore Rekor public key. The inclusion proof's C2SP signed checkpoint
+   is verified under that same pin, its authenticated tree size/root must
+   match the proof metadata, and the proof is then walked to that root. Its
+   `hashedrekord` body must also contain the exact
    audit root hash and root signature from the bundle, preventing a genuine
    but unrelated receipt from being reattached. A receipt that is not a
    genuine, SET-signed, log-included entry (e.g. an empty `{}`) **fails**.
@@ -182,6 +184,9 @@ checks every cryptographic invariant the bundle commits to:
    is baked in at build time (never fetched at verify time); a sovereign
    Rekor instance can pass its own key via `verifyBundle`'s
    `rekorPublicKeyPem` option.
+   Legacy receipts that omit `inclusionProof.checkpoint` fail closed with
+   `checkpoint_missing`; producers must persist the log's signed checkpoint,
+   not only the unauthenticated `treeSize`/`rootHash` proof fields.
    - **A root with no anchor receipt at all still fails closed** — an
      unwitnessed root does not get the benefit of the doubt. The `reason`
      distinguishes two different situations rather than reporting them
@@ -218,7 +223,19 @@ checks every cryptographic invariant the bundle commits to:
 9. **Archive integrity and resource bounds** — duplicate filenames,
    local/central-header disagreement, invalid UTF-8 names, CRC mismatches,
    unsupported encryption, malformed ZIP64, and excessive decompression are
-   rejected before bundle contents are trusted.
+   rejected before bundle contents are trusted. Only the ten members defined
+   by the supported bundle versions are accepted. The verifier caps the raw
+   archive at 72 MiB, ZIP members at 32 MiB each / 68 MiB aggregate, static
+   JSON/README members at 2 MiB each, nested-gzip output at 32 MiB each /
+   64 MiB aggregate, NDJSON lines at 1 MiB, evidence records at 250,000 per
+   member and 300,000 aggregate, public keys at 256, and anchor receipts at
+   200,000. STORED members are zero-copy views and nested gzip/NDJSON is
+   parsed incrementally under shared byte and record budgets; ZIP-layer
+   DEFLATE is rejected. Library callers may lower
+   (but not raise) configurable ceilings with `VerifyOptions.resourceLimits`;
+   the CLI checks the file size through an already-open descriptor before
+   allocating its buffer. Larger evidence ranges must be split into multiple
+   bundles.
 10. **Root coverage** — for every Merkle root whose full period lies
     inside the bundle's declared `[from, to)` date range, the number of
     bundle rows whose `signedAt` falls in that period, AND the number of
@@ -516,7 +533,7 @@ The platform public key this build trusts is compiled into `src/platform-pubkey.
 as `PLATFORM_PUBLIC_KEY_DER_B64` / `PLATFORM_PUBLIC_KEY_FINGERPRINT` — **not** fetched
 at verify time (that would reintroduce the exact network dependency this tool exists
 to eliminate). Do not take the embedded bytes on faith: an npm-registry or CI-supply-chain
-compromise of *this package* is exactly the attack a customer's own second channel should
+compromise of _this package_ is exactly the attack a customer's own second channel should
 catch.
 
 - **Confirm the pin against a second, independently-operated channel** before trusting a
@@ -529,6 +546,12 @@ catch.
   the published fingerprint, byte-for-byte, against `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the
   exact tarball/commit you installed — `npm view @praesidia/audit-verifier@<version> --json |
   jq .dist` lets you confirm the tarball hash independently of `npm install`'s own trust.
+- **The release workflow requires a separate operator approval value.** Its protected
+  `audit-verifier-production` Environment supplies the independently confirmed lowercase
+  fingerprint; `prepack` rejects a missing value, a mismatch, a non-canonical key, or any EC curve
+  other than P-256. This prevents a key and its self-asserted fingerprint from being changed
+  together and silently treated as approved. Setup and ceremony details are in
+  `docs/trust-anchor-verification.md`, which is included in the published package.
 - **`npm publish --provenance`** (MIL-0002 F4) means `npm view @praesidia/audit-verifier
   provenance` shows a SLSA attestation binding the published tarball to the exact GitHub
   Actions run, commit, and source repository that built it — a second, cryptographic check
@@ -537,7 +560,7 @@ catch.
 - **Rotation does not (yet) avoid a CLI upgrade.** Today, rotating the platform key means
   cutting a new `@praesidia/audit-verifier` release and every auditor updating before
   verifying bundles signed under the new key — there is no in-band revocation for a
-  compromised *platform* key (as opposed to a per-tenant signing key, which already has
+  compromised _platform_ key (as opposed to a per-tenant signing key, which already has
   one — see invariant 4). A key-hierarchy design that removes this constraint (an offline
   root that cross-signs rotating operational keys) is written up, not yet built:
   `docs/design/platform-key-hierarchy.md` — including the concrete, stated limit that an
@@ -571,8 +594,9 @@ This package is intentionally **decoupled** from `be-core`:
 - The PKZIP reader in `src/zip.ts` reads STORED-method entries produced
   by `BundleExporterService`'s `ZipStreamWriter` (AGV-035).
 - **No network calls at all** — the Rekor receipt is verified offline
-  against a public key pinned into `src/rekor.ts` (SET signature +
-  inclusion proof), so even the transparency-log check needs no network.
+  against a public key pinned into `src/rekor.ts` (SET signature + signed
+  checkpoint + inclusion proof), so even the transparency-log check needs
+  no network.
 - No telemetry, no analytics, no payload logging — the verifier prints
   per-component pass/fail counts and the id of the first offending row.
 
@@ -609,8 +633,9 @@ This package is intentionally **decoupled** from `be-core`:
 - **`npm publish --provenance`**, `id-token: write` permission on the publish workflow — a
   customer can confirm the exact published tarball corresponds to a specific CI run/commit, not
   just trust an npm-token holder's say-so. The workflow's human gate is no longer a static
-  `if: false`: it now triggers only on an immutable `v*` tag whose value is checked against
-  `package.json` (a human still has to cut and push that tag), and `npm pack --dry-run` runs the
+  `if: false`: it now triggers only on a protected `v*` tag whose value is checked against
+  `package.json` and whose commit must be contained in `main` (a human still has to cut and push
+  that tag), and `npm pack --dry-run` runs the
   `prepack` hook — `scripts/assert-release-trust-anchor.mjs` — before the publish step, so the
   job still cannot ship a tarball while `PLATFORM_PUBLIC_KEY_DER_B64`/`_FINGERPRINT` are empty.
 - **`npm audit --audit-level=high`** added to CI (previously the only repo in the monorepo
@@ -830,8 +855,9 @@ This package is intentionally **decoupled** from `be-core`:
 - **Rekor receipts are now verified cryptographically (BUGHUNT-SDK-05).**
   The default Rekor check was previously `JSON.parse(receipt)` — it passed
   for any parseable JSON (even `{}`), so `rekor receipts OK` was false
-  assurance. The verifier now checks the receipt's SET signature against
-  the pinned Sigstore key and walks its inclusion proof to `rootHash`
+  assurance. The verifier now checks the receipt's SET signature and signed
+  checkpoint against the pinned Sigstore key and walks its inclusion proof
+  to the checkpoint-authenticated `rootHash`
   (fully offline, `src/rekor.ts`); a non-genuine receipt now fails. New
   optional `verifyBundle` option `rekorPublicKeyPem` pins a sovereign
   Rekor key. `report.rekor.checked` still counts one per anchor entry.
@@ -847,3 +873,7 @@ This package is intentionally **decoupled** from `be-core`:
 ## License
 
 Apache License 2.0 — see [LICENSE](./LICENSE).
+
+### Independently pinned HTTP target receipts
+
+Grade A now requires a verified `praesidia.http-receipt.v1` receipt with matching original request and observed result commitments. Signature presence alone is rejected. Supply `verifyBundle(zip, { targetPublicKeys: { "organizationId:targetId:keyId": ed25519PublicKeyPem } })`, or `--target-keys pins.json`. Obtain those pins separately from the bundle; platform attestation keys remain a separate trust input. Missing pins, changed request/result/closure, and invalid target signatures fail verification. A signed target assertion does not independently observe effects outside that target.

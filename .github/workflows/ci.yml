@@ -46,8 +46,14 @@ jobs:
       - name: Build (tsc)
         run: npm run build
 
+      - name: Typecheck test targets
+        run: npm run typecheck:spec
+
       - name: Trust-anchor CI regression check (PROD16 FINDING 5)
         run: node scripts/check-trust-anchor-ci.mjs
+
+      - name: Trust-anchor release-policy tests
+        run: npm run test:trust-anchor-policy
 
       - name: Test (vitest)
         run: npx vitest run

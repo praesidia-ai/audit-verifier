@@ -12,8 +12,16 @@ of *this package* is exactly the attack a customer's second channel should catch
   `PLATFORM_PUBLIC_KEY_FINGERPRINT` (SHA-256 hex of the DER bytes). These are compiled into the
   published `dist/platform-pubkey.js` — not fetched at verify time.
 - `scripts/assert-release-trust-anchor.mjs` (the package's `prepack` hook) refuses to build a
-  publishable artifact unless both constants are non-empty, internally consistent (fingerprint
-  matches DER bytes), and the key is EC — see that script for the exact checks.
+  publishable artifact unless both constants are non-empty, the DER is one canonical P-256 SPKI
+  public key, its SHA-256 fingerprint is canonical and internally consistent, and that fingerprint
+  exactly matches the separately supplied operator approval. A different EC curve is not accepted.
+- `.github/workflows/publish.yml` obtains that approval only from
+  `PRODUCTION_PLATFORM_KEY_FINGERPRINT` in the `audit-verifier-production` GitHub Environment and
+  passes it as `PRAESIDIA_RELEASE_APPROVED_PLATFORM_KEY_FINGERPRINT`. Configure the Environment
+  with required reviewers. An absent, malformed, uppercase, stale, or mismatched value blocks both
+  `npm pack` and `npm publish`; there is no source-code fallback.
+- `scripts/trust-anchor-policy.selftest.mjs` exercises the placeholder, partial-edit, malformed,
+  wrong-curve, wrong-fingerprint, missing-approval, mismatch, and valid P-256 cases in ordinary CI.
 - Confirm what shipped in a specific release with a registry query independent of `npm install`:
   `npm view @praesidia/audit-verifier@<version> --json | jq .dist` gives you the tarball hash;
   unpacking that tarball and inspecting `dist/platform-pubkey.js` gives you the exact bytes this
@@ -46,6 +54,31 @@ Two concrete candidates already scoped (pick one, or both, when the ceremony hap
 Whichever is chosen, put its exact URL/contact **in this file and in `README.md`'s "Trust
 anchor" section together**, in the same commit that pins the real key — never publish one
 without the other, or the pin exists with nothing to check it against.
+
+## Production release handoff
+
+The remaining input is one operator-approved production P-256 public key; private key material
+must stay inside KMS. The release operator must complete all of these views of that same input:
+
+1. Fetch the SPKI public bytes directly from the production KMS key during the approved ceremony.
+   Put the canonical base64 bytes and their lowercase SHA-256 fingerprint in
+   `src/platform-pubkey.ts`.
+2. Confirm the fingerprint through the independent channel above. A second operator then enters
+   that independently confirmed value into the protected `audit-verifier-production` Environment
+   variable `PRODUCTION_PLATFORM_KEY_FINGERPRINT`. Do not derive or copy this approval value from
+   the source diff under review; that would collapse two trust inputs back into one.
+3. Require reviewers on that Environment and protect release tags with the repository ruleset.
+   Repository configuration is operator-owned and cannot be made trustworthy by a file in the
+   repository itself.
+4. Push a version tag only after the key-bearing commit and independent publication are approved.
+   The tagged commit must be contained in `main`. The workflow builds and tests from that tag,
+   runs the release assertion explicitly and again during both dry-run pack and publish, and
+   publishes with npm provenance.
+
+The ordinary PR check intentionally permits the documented pair of empty constants so development
+can continue before the ceremony. That is not a release bypass: `prepack` always runs the stricter
+policy, where the empty pair and a missing operator approval both fail closed. Do not use
+`--ignore-scripts` for a release.
 
 ## What to actually compare
 

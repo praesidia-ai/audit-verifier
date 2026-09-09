@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd /Users/mihaiandreisoica/projects/praesidia_v3/core && .claude/bin/verify.sh audit-verifier 2>&1 | tail -3\\ngit status --short\"}",
+  "error": "Exit code 128\n{\"repo\":\"audit-verifier\",\"ok\":true,\"ms\":7000,\"failed\":[],\"skipped\":[],\"log\":\"/Users/mihaiandreisoica/projects/praesidia_v3/core/.claude/runs/_verify/audit-verifier.log\"}\nfatal: not a git repository (or any of the parent directories): .git",
+  "timestamp": "2026-08-20T15:02:34.427Z",
+  "retry_count": 1
+}
