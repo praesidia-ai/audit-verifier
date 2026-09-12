@@ -1,0 +1,78 @@
+# `@praesidia/audit-verifier` — operations
+
+Condensed build/test/CLI-usage reference. Full CLI flag reference, verdict-shape JSON schema, and
+trust-anchor ceremony detail live in the root `audit-verifier/README.md`.
+
+## Requirements
+
+Node.js `>=22.12` (`audit-verifier/README.md:12`). Zero runtime dependencies
+(`package.json`'s `dependencies: {}`).
+
+## Local development
+
+```bash
+cd core/audit-verifier
+npm install
+npm run build          # tsc -> dist/
+npm run typecheck
+npm run typecheck:spec
+npm test                # vitest run
+```
+
+(`package.json:33-42` — script list confirmed against the current manifest.)
+
+## Running the CLI locally against a bundle
+
+```bash
+npm run build
+node dist/cli.js <bundle.zip>                       # full verify
+node dist/cli.js <bundle.zip> --json                 # machine-readable VerifyReport
+node dist/cli.js <bundle.zip> --no-rekor             # skip offline Rekor receipt check
+node dist/cli.js <bundle.zip> --platform-key <file>  # trust an alternate pinned key
+node dist/cli.js --verify-set <bundle1.zip> <bundle2.zip> ...   # cross-bundle continuity (SCAN2-004)
+```
+
+Exit codes and the `--quiet`/`--allow-legacy-unattested` flags are documented in
+`audit-verifier/README.md:24-50`.
+
+## Trust-anchor release gate
+
+```bash
+npm run check:release-trust-anchor   # node scripts/assert-release-trust-anchor.mjs
+npm run check:trust-anchor-ci        # node scripts/check-trust-anchor-ci.mjs
+npm run test:trust-anchor-policy     # node --test scripts/trust-anchor-policy.selftest.mjs
+```
+
+`prepack` (`package.json:35`) runs build + `typecheck:spec` + `check:release-trust-anchor`
+automatically before packaging — a release with a missing/mismatched/non-P-256 operator-approved
+fingerprint cannot be packed (`audit-verifier/README.md:547-550`).
+
+## Contract-drift gate
+
+`scripts/contract-drift.mjs` (CD-0002/SCAN-AV-03) checks this package's assumptions about `be`'s
+signable-row/bundle contract. Run it as documented in that script's own header/CI wiring; it
+requires a sibling `be` checkout to diff against (this package has no runtime dependency on `be`
+at execution time — only this drift check reads its source).
+
+## Publishing (see `README.md`'s "Trust anchor" section for the full ceremony detail)
+
+Not yet published — `npm view @praesidia/audit-verifier` → `404` (re-confirmed live 2026-09-12,
+`.claude/tickets/CLOSE/TRIAGE-rest.md`'s `MKT-0002` row). `npm publish --provenance` (MIL-0002 F4)
+is configured so that once published, `npm view @praesidia/audit-verifier provenance` will show a
+SLSA attestation binding the tarball to the exact GitHub Actions run/commit that built it
+(`audit-verifier/README.md:555-556`).
+
+## Failure modes — what to check first
+
+| Symptom | Likely cause | Where to look |
+|---|---|---|
+| Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `audit-verifier/README.md:99-115` (verdict shape), `src/verify.ts` |
+| `--verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:644` `mainVerifySet`; `f13793e` pins this behavior |
+| Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:549` |
+| `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `audit-verifier/README.md:547-550` |
+| Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` |
+
+## Verification limits
+
+Commands verified against `package.json` and `README.md` this pass (2026-09-12); not
+independently re-run against a live bundle export/verify round-trip in this session.
