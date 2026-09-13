@@ -29,7 +29,13 @@ praesidia-verify <bundle.zip> [options]
 Options:
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
   --platform-key <file>
-               Trust this PEM or SPKI-DER platform public key.
+               Trust this PEM or SPKI-DER platform public key. Prints a
+               WARNING: the result is only as strong as that file's
+               provenance.
+  --platform-key-fingerprint <sha256hex>
+               Require --platform-key's SPKI DER to hash to this digest,
+               obtained from a channel independent of the bundle. Mismatch
+               exits 2.
   --allow-legacy-unattested
                Explicitly accept a pre-attestation legacy bundle.
   --quiet      Print only the final status word (OK/FAIL/INCOMPLETE).
@@ -557,6 +563,13 @@ to eliminate). Do not take the embedded bytes on faith: an npm-registry or CI-su
 compromise of _this package_ is exactly the attack a customer's own second channel should
 catch.
 
+- **A caller-supplied `--platform-key` makes the caller the trust anchor.** The CLI cannot
+  tell an operator-obtained key from one that arrived in the same email or ZIP as the bundle,
+  and with a caller key the attestation's `platformSigningKeyFingerprint` check degenerates to
+  hashing the key it was handed. Every run that uses the flag therefore prints a `WARNING:`
+  line. Pair it with `--platform-key-fingerprint <sha256hex>`, taken from a *different*
+  channel, so the key and its identity cannot both come from whoever produced the bundle; a
+  mismatch is a hard exit-2 error, not a warning.
 - **Confirm the pin against a second, independently-operated channel** before trusting a
   `RESULT: OK` for anything consequential — never take `PLATFORM_PUBLIC_KEY_FINGERPRINT`
   on the word of this package alone. Full detail on where the fingerprint lives, what the

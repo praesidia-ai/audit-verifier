@@ -33,6 +33,11 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- `--platform-key-fingerprint <sha256hex>` (SEC-2026-09-12 MCPSDK-03) — pins the
+  `--platform-key` file to a digest obtained through a second channel; mismatch
+  exits 2. The CLI now also prints a `WARNING:` line on every run that supplies
+  `--platform-key`, since with a caller-supplied anchor the attestation's own
+  fingerprint check is a tautology.
 - `verifyHttpReceipt`, `httpRequestCommitment`, and `httpTargetKeyFingerprint`,
   exported from `src/http-receipt.ts` — offline Ed25519 verification of
   HTTP-receipt-backed protected-action evidence (the `commitments-only.v1`

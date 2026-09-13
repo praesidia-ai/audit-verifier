@@ -33,6 +33,15 @@ interface CliArgs {
   json: boolean;
   help: boolean;
   platformKeyPath: string | null;
+  /**
+   * SEC-2026-09-12 (MCPSDK-03) — optional out-of-band sha256 (hex) of the
+   * SPKI DER of the key `--platform-key` points at. Supplying it forces the
+   * key and its identity to arrive through TWO channels: a forger who ships
+   * a bundle together with their own platform key cannot also produce the
+   * fingerprint the auditor got from Praesidia's published trust-anchor
+   * document. Mismatch is a hard exit-2 error, never a warning.
+   */
+  platformKeyFingerprint: string | null;
   targetKeysPath: string | null;
   allowLegacyUnattested: boolean;
 }
@@ -63,6 +72,12 @@ OPTIONS
                JSON map of organizationId:targetId:keyId to trusted Ed25519 PEM.
   --platform-key <file>
                Trust this PEM or SPKI-DER platform attestation public key.
+               The result is only as strong as the provenance of that file;
+               a WARNING line says so on every run that uses it.
+  --platform-key-fingerprint <sha256hex>
+               Require --platform-key's SPKI DER to hash to this digest.
+               Obtain it from a DIFFERENT channel than the bundle (e.g.
+               Praesidia's published trust-anchor document). Mismatch exits 2.
   --allow-legacy-unattested
                Explicitly accept bundles without platform attestation.
   --quiet      Print only the final OK/FAIL/INCOMPLETE summary line.
@@ -106,6 +121,7 @@ function newCommonFlags(): CommonFlags {
     json: false,
     help: false,
     platformKeyPath: null,
+    platformKeyFingerprint: null,
     targetKeysPath: null,
     allowLegacyUnattested: false,
   };
@@ -142,6 +158,20 @@ function parseCommonArgs(
         throw new Error('--platform-key requires a file path');
       }
       flags.platformKeyPath = value;
+      i += 1;
+    } else if (arg === '--platform-key-fingerprint') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) {
+        throw new Error(
+          '--platform-key-fingerprint requires a sha256 hex digest',
+        );
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+        throw new Error(
+          '--platform-key-fingerprint must be 64 hex characters (sha256 of the SPKI DER)',
+        );
+      }
+      flags.platformKeyFingerprint = value.toLowerCase();
       i += 1;
     } else if (arg.startsWith('-')) {
       // Unknown flag — surface as format error (exit 2) so silent
@@ -271,6 +301,7 @@ function printReport(
   report: VerifyReport,
   quiet: boolean,
   noRekor: boolean,
+  platformKeySupplied: boolean,
 ): void {
   if (quiet) {
     process.stdout.write(`${statusWord(report.status)}\n`);
@@ -345,6 +376,21 @@ function printReport(
   // platform-attestation entry at all is NOT platform-attested, and a
   // "RESULT: OK" must never read as "Praesidia's platform vouched for
   // this bundle" when that check was explicitly bypassed by the caller.
+  // SEC-2026-09-12 (MCPSDK-03) — with `--platform-key` the caller IS the
+  // trust anchor. Nothing here can tell an operator-obtained key from one
+  // that arrived in the same email/zip as the bundle, and the attestation's
+  // own `platformSigningKeyFingerprint` check degenerates to hashing the key
+  // it was handed. `--no-rekor` and `--allow-legacy-unattested` both announce
+  // themselves; this must too, or `[VALID] platform attest.` reads as an
+  // assurance Praesidia never gave.
+  if (platformKeySupplied) {
+    lines.push(
+      'WARNING: platform key supplied by caller — result is only as strong as ' +
+        'the provenance of that key file. Obtain it from Praesidia\'s published ' +
+        'trust-anchor document over a channel independent of this bundle, and ' +
+        'pin it with --platform-key-fingerprint <sha256hex>.',
+    );
+  }
   // SEC-2026-09-12 (MCPSDK-01) — a legacy attestation (no
   // `manifestDigest`/`manifestGeneratedAt`) still verifies, but it vouches
   // for the org's KEY SET, not for this specific export, so a genuine older
@@ -386,7 +432,10 @@ function fmtComponent(label: string, c: ComponentResult): string {
 }
 
 /** Shared by single-bundle mode and `verify-set` — loads/validates `--platform-key`. */
-async function resolvePlatformPublicKeyDerB64(platformKeyPath: string): Promise<string> {
+async function resolvePlatformPublicKeyDerB64(
+  platformKeyPath: string,
+  expectedFingerprint: string | null,
+): Promise<string> {
   const keyBytes = await readRegularFileBounded(
     path.resolve(platformKeyPath),
     MAX_PLATFORM_KEY_BYTES,
@@ -405,7 +454,20 @@ async function resolvePlatformPublicKeyDerB64(platformKeyPath: string): Promise<
   if (details?.namedCurve !== 'prime256v1') {
     throw new Error('platform key must use the P-256 curve');
   }
-  return Buffer.from(key.export({ type: 'spki', format: 'der' })).toString('base64');
+  const der = Buffer.from(key.export({ type: 'spki', format: 'der' }));
+  // SEC-2026-09-12 (MCPSDK-03) — second-channel check. Without it the
+  // "fingerprint check" inside verifyPlatformAttestation is a tautology for
+  // a caller-supplied key (it hashes the very key it was handed).
+  if (expectedFingerprint !== null) {
+    const actual = crypto.createHash('sha256').update(der).digest('hex');
+    if (actual !== expectedFingerprint) {
+      throw new Error(
+        `platform key fingerprint mismatch: file hashes to ${actual}, ` +
+          `--platform-key-fingerprint expects ${expectedFingerprint}`,
+      );
+    }
+  }
+  return der.toString('base64');
 }
 
 /** Shared by single-bundle mode and `verify-set` — loads/validates `--target-keys`. */
@@ -621,7 +683,12 @@ function verifySetExitCode(status: VerifySetReport['status']): number {
   }
 }
 
-function printVerifySetReport(report: VerifySetReport, quiet: boolean, noRekor: boolean): void {
+function printVerifySetReport(
+  report: VerifySetReport,
+  quiet: boolean,
+  noRekor: boolean,
+  platformKeySupplied: boolean,
+): void {
   if (quiet) {
     process.stdout.write(`${verifySetStatusWord(report.status)}\n`);
     return;
@@ -651,6 +718,13 @@ function printVerifySetReport(report: VerifySetReport, quiet: boolean, noRekor: 
   if (noRekor) {
     lines.push('NOTE: --no-rekor was passed — the external Rekor witness was NOT checked for any bundle in this set.');
   }
+  // SEC-2026-09-12 (MCPSDK-03) — same caveat as single-bundle mode.
+  if (platformKeySupplied) {
+    lines.push(
+      'WARNING: platform key supplied by caller — result is only as strong as ' +
+        'the provenance of that key file; pin it with --platform-key-fingerprint <sha256hex>.',
+    );
+  }
   process.stdout.write(lines.join('\n') + '\n');
 }
 
@@ -668,9 +742,18 @@ async function mainVerifySet(argv: string[]): Promise<number> {
   }
 
   let platformPublicKeyDerB64: string | undefined;
+  if (!args.platformKeyPath && args.platformKeyFingerprint) {
+    process.stderr.write(
+      'error: --platform-key-fingerprint requires --platform-key\n',
+    );
+    return 2;
+  }
   if (args.platformKeyPath) {
     try {
-      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(args.platformKeyPath);
+      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(
+        args.platformKeyPath,
+        args.platformKeyFingerprint,
+      );
     } catch (err) {
       process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
       return 2;
@@ -730,7 +813,12 @@ async function mainVerifySet(argv: string[]): Promise<number> {
   if (args.json) {
     process.stdout.write(`${JSON.stringify(setReport, null, 2)}\n`);
   } else {
-    printVerifySetReport(setReport, args.quiet, args.noRekor);
+    printVerifySetReport(
+      setReport,
+      args.quiet,
+      args.noRekor,
+      args.platformKeyPath !== null,
+    );
   }
   return verifySetExitCode(setReport.status);
 }
@@ -759,9 +847,18 @@ async function main(): Promise<number> {
   }
   let report: VerifyReport;
   let platformPublicKeyDerB64: string | undefined;
+  if (!args.platformKeyPath && args.platformKeyFingerprint) {
+    process.stderr.write(
+      'error: --platform-key-fingerprint requires --platform-key\n',
+    );
+    return 2;
+  }
   if (args.platformKeyPath) {
     try {
-      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(args.platformKeyPath);
+      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(
+        args.platformKeyPath,
+        args.platformKeyFingerprint,
+      );
     } catch (err) {
       process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
       return 2;
@@ -799,7 +896,7 @@ async function main(): Promise<number> {
     // parser. `--quiet` is ignored when `--json` is also passed.
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    printReport(report, args.quiet, args.noRekor);
+    printReport(report, args.quiet, args.noRekor, args.platformKeyPath !== null);
   }
   // PA-0009 (D15) — exit code is a function of `report.status`, not `ok`:
   // 0 valid, 1 invalid, 3 incomplete. `unsupported` never appears at the

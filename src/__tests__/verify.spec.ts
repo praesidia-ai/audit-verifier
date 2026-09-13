@@ -5409,6 +5409,160 @@ describe('verifyBundle', () => {
       return { tmpDir, bundlePath };
     }
 
+    describe('SEC-2026-09-12 (MCPSDK-03) — --platform-key provenance', () => {
+      function writeP256KeyFile(dir: string): {
+        keyPath: string;
+        fingerprint: string;
+      } {
+        const { publicKey } = crypto.generateKeyPairSync('ec', {
+          namedCurve: 'P-256',
+        });
+        const pem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+        const der = publicKey.export({ type: 'spki', format: 'der' }) as Buffer;
+        const keyPath = path.join(dir, 'platform.pem');
+        fs.writeFileSync(keyPath, pem);
+        return {
+          keyPath,
+          fingerprint: crypto.createHash('sha256').update(der).digest('hex'),
+        };
+      }
+
+      /**
+       * The CLI accepts ANY P-256 key as the platform trust anchor, and with
+       * a caller-supplied key the attestation's own
+       * `platformSigningKeyFingerprint` check degenerates to hashing the key
+       * it was handed. A forger who controls both the bundle and the key file
+       * would otherwise get an unqualified `[VALID] platform attest.`
+       */
+      it('prints a WARNING whenever --platform-key was supplied', () => {
+        const { zip } = buildBundleWithTamper({});
+        const cliPath = cliPathOrThrow();
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          const { keyPath } = writeP256KeyFile(tmpDir);
+          const stdout = execFileSync(
+            process.execPath,
+            [
+              cliPath,
+              bundlePath,
+              '--no-rekor',
+              '--allow-legacy-unattested',
+              '--platform-key',
+              keyPath,
+            ],
+            { encoding: 'utf8' },
+          );
+          expect(stdout).toContain('RESULT: OK');
+          expect(stdout).toContain(
+            'WARNING: platform key supplied by caller — result is only as strong as the provenance of that key file',
+          );
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it('prints no such WARNING when no --platform-key was supplied', () => {
+        const { zip } = buildBundleWithTamper({});
+        const cliPath = cliPathOrThrow();
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          const stdout = execFileSync(
+            process.execPath,
+            [cliPath, bundlePath, '--no-rekor', '--allow-legacy-unattested'],
+            { encoding: 'utf8' },
+          );
+          expect(stdout).not.toContain('platform key supplied by caller');
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it('accepts --platform-key-fingerprint when it matches the key file', () => {
+        const { zip } = buildBundleWithTamper({});
+        const cliPath = cliPathOrThrow();
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          const { keyPath, fingerprint } = writeP256KeyFile(tmpDir);
+          const stdout = execFileSync(
+            process.execPath,
+            [
+              cliPath,
+              bundlePath,
+              '--no-rekor',
+              '--allow-legacy-unattested',
+              '--platform-key',
+              keyPath,
+              '--platform-key-fingerprint',
+              fingerprint,
+            ],
+            { encoding: 'utf8' },
+          );
+          expect(stdout).toContain('RESULT: OK');
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it('exits 2 when --platform-key-fingerprint does not match the key file', () => {
+        const { zip } = buildBundleWithTamper({});
+        const cliPath = cliPathOrThrow();
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          const { keyPath } = writeP256KeyFile(tmpDir);
+          execFileSync(
+            process.execPath,
+            [
+              cliPath,
+              bundlePath,
+              '--no-rekor',
+              '--allow-legacy-unattested',
+              '--platform-key',
+              keyPath,
+              '--platform-key-fingerprint',
+              'a'.repeat(64),
+            ],
+            { encoding: 'utf8' },
+          );
+          throw new Error('expected exit code 2, process did not exit non-zero');
+        } catch (err) {
+          const e = err as { status?: number; stderr?: string };
+          expect(e.status).toBe(2);
+          expect(e.stderr ?? '').toContain('platform key fingerprint mismatch');
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it('exits 2 when --platform-key-fingerprint is given without --platform-key', () => {
+        const { zip } = buildBundleWithTamper({});
+        const cliPath = cliPathOrThrow();
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          execFileSync(
+            process.execPath,
+            [
+              cliPath,
+              bundlePath,
+              '--no-rekor',
+              '--allow-legacy-unattested',
+              '--platform-key-fingerprint',
+              'a'.repeat(64),
+            ],
+            { encoding: 'utf8' },
+          );
+          throw new Error('expected exit code 2, process did not exit non-zero');
+        } catch (err) {
+          const e = err as { status?: number; stderr?: string };
+          expect(e.status).toBe(2);
+          expect(e.stderr ?? '').toContain(
+            '--platform-key-fingerprint requires --platform-key',
+          );
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+    });
+
     it('--json emits a stable JSON report with status: valid and exits 0 on a pristine bundle', () => {
       const { zip } = buildBundleWithTamper({});
       const cliPath = cliPathOrThrow();
