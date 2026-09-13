@@ -1473,7 +1473,7 @@ export async function verifyBundle(
     verifyPlatformAttestation(
       byName.get('platform-attestation.json') ?? null,
       publicKeysRaw,
-      manifest.orgId,
+      manifest,
       options,
     ),
   );
@@ -1579,6 +1579,46 @@ export async function verifyBundle(
 // ════════════════════════════════════════════════════════════════════════
 // Component verifiers
 // ════════════════════════════════════════════════════════════════════════
+
+/**
+ * Reconstruct the manifest-sans-signature envelope and canonicalize it the
+ * same way the writer did. The two chainSeq fields join the signable set
+ * ONLY for version >= 3 — validated by `verifyManifest`'s version checks to
+ * be exactly the versions that carry them, so this is a closed selection,
+ * not a strip-and-reconstruct of whatever the wire object happens to hold.
+ *
+ * Extracted (SEC-2026-09-12, MCPSDK-01) so the platform attestation's
+ * optional `manifestDigest` is computed over the IDENTICAL bytes the
+ * manifest signature covers. Two copies of this selection would be a latent
+ * divergence: a digest over a slightly different preimage would either
+ * always fail or, worse, cover fewer fields than the signature does.
+ */
+function manifestSignableBytes(manifest: BundleManifest): Buffer {
+  const signable: Record<string, unknown> = {
+    version: manifest.version,
+    orgId: manifest.orgId,
+    from: manifest.from,
+    to: manifest.to,
+    rowCount: manifest.rowCount,
+    rootCount: manifest.rootCount,
+    keyVersions: manifest.keyVersions,
+    generatedAt: manifest.generatedAt,
+    signatureAlgorithm: manifest.signatureAlgorithm,
+  };
+  if (manifest.version >= 3) {
+    signable.chainSeqCeiling = manifest.chainSeqCeiling;
+    signable.chainSeqSnapshotAt = manifest.chainSeqSnapshotAt;
+  }
+  if (manifest.version >= 4) {
+    signable.integrityCheckpointCount = manifest.integrityCheckpointCount;
+  }
+  if (manifest.version >= 5) {
+    signable.actionEventCount = manifest.actionEventCount;
+    signable.captureScopeDigest = manifest.captureScopeDigest;
+    signable.evidenceGradeSummary = manifest.evidenceGradeSummary;
+  }
+  return canonicalJson(signable);
+}
 
 function verifyManifest(
   manifest: BundleManifest,
@@ -1735,35 +1775,7 @@ function verifyManifest(
     }
   }
 
-  // Reconstruct the manifest-sans-signature envelope and canonicalize
-  // it the same way the writer did. The two chainSeq fields join the
-  // signable set ONLY for version >= 3 — validated above to be exactly
-  // the versions that carry them, so this is a closed selection, not a
-  // strip-and-reconstruct of whatever the wire object happens to hold.
-  const signable: Record<string, unknown> = {
-    version: manifest.version,
-    orgId: manifest.orgId,
-    from: manifest.from,
-    to: manifest.to,
-    rowCount: manifest.rowCount,
-    rootCount: manifest.rootCount,
-    keyVersions: manifest.keyVersions,
-    generatedAt: manifest.generatedAt,
-    signatureAlgorithm: manifest.signatureAlgorithm,
-  };
-  if (manifest.version >= 3) {
-    signable.chainSeqCeiling = manifest.chainSeqCeiling;
-    signable.chainSeqSnapshotAt = manifest.chainSeqSnapshotAt;
-  }
-  if (manifest.version >= 4) {
-    signable.integrityCheckpointCount = manifest.integrityCheckpointCount;
-  }
-  if (manifest.version >= 5) {
-    signable.actionEventCount = manifest.actionEventCount;
-    signable.captureScopeDigest = manifest.captureScopeDigest;
-    signable.evidenceGradeSummary = manifest.evidenceGradeSummary;
-  }
-  const bytes = canonicalJson(signable);
+  const bytes = manifestSignableBytes(manifest);
   // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
   // A bundle whose `signatureAlgorithm` is ECDSA_P256_SHA256 is now
   // verifiable (was previously rejected outright).
@@ -4461,6 +4473,52 @@ function collectAnchorEntries(root: BundleRoot): AnchorReceiptEntry[] {
 }
 
 /**
+ * SEC-2026-09-12 (MCPSDK-01) — resolve the UPPER bound of the window a
+ * Rekor `integratedTime` must fall in, or `null` when the bundle records no
+ * genuine anchor time at all (no upper bound is then enforced).
+ *
+ * Deliberately does NOT use `entry.anchoredAt` unconditionally:
+ * `collectAnchorEntries` SYNTHESIZES that field as `root.anchoredAt ??
+ * root.signedAt` for legacy single-slot `anchorReceipt` roots, and treating
+ * that `signedAt` fallback as an anchor time would reject bundles whose old
+ * roots were legitimately anchored later by a backfill run. Only the
+ * multi-anchor array carries a per-provider anchor time the producer
+ * actually recorded.
+ *
+ * When both a root-level and a per-provider anchor time exist, the LATER one
+ * wins: `root.anchoredAt` may record only the first provider's anchor while
+ * a second provider legitimately anchored later.
+ */
+function anchorWindowUpperBound(
+  root: BundleRoot,
+  entry: AnchorReceiptEntry,
+): string | null {
+  const candidates: string[] = [];
+  if (typeof root.anchoredAt === 'string') candidates.push(root.anchoredAt);
+  if (
+    Array.isArray(root.anchorReceipts) &&
+    root.anchorReceipts.length > 0 &&
+    typeof entry.anchoredAt === 'string'
+  ) {
+    candidates.push(entry.anchoredAt);
+  }
+  let best: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const candidate of candidates) {
+    const ms = Date.parse(candidate);
+    // An unparseable value is impossible after `assertRootStructure`, but if
+    // one ever reaches here it must NOT silently widen the window — pass it
+    // through so `verifyRekorReceipt` fails closed on it.
+    if (Number.isNaN(ms)) return candidate;
+    if (ms > bestMs) {
+      bestMs = ms;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
  * AUDIT-2026-05-09 — Dispatch a single anchor receipt entry to the
  * appropriate verifier. The caller-supplied `anchorReceiptVerifier`
  * (when present) wins for ALL providers — auditors who need on-line
@@ -4508,6 +4566,10 @@ async function verifyAnchorReceipt(
     return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem, {
       rootHashB64: root.rootHash,
       signatureB64: root.signature,
+      // SEC-2026-09-12 (MCPSDK-01) — hand the root's own time window to the
+      // receipt verifier so Rekor's signed `integratedTime` bounds it.
+      signedAt: root.signedAt,
+      anchoredAt: anchorWindowUpperBound(root, entry),
     });
   }
   if (entry.provider === 's3') {
@@ -4552,6 +4614,17 @@ function verifyS3ReceiptShape(receipt: string): {
 // AUDIT-2026-05-30 — Platform key-binding attestation verifier
 // ════════════════════════════════════════════════════════════════════════
 
+/**
+ * SEC-2026-09-12 (MCPSDK-01) — permitted clock skew, in milliseconds,
+ * between the platform attestation's `issuedAt` and the manifest's
+ * `generatedAt`. Same rationale and same value as
+ * `rekor.ts`'s `REKOR_INTEGRATED_TIME_SKEW_MS`: wide enough for producer clock
+ * drift and for an attestation minted slightly ahead of the export it
+ * covers, narrow enough that replaying an attestation from a previous
+ * export (days/months old) fails closed. Not configurable.
+ */
+const ATTESTATION_TIME_SKEW_MS = 24 * 60 * 60 * 1000;
+
 interface PlatformAttestationBody {
   orgId: string;
   keyVersions: Array<{
@@ -4577,6 +4650,24 @@ interface PlatformAttestationBody {
    * interface field at all.
    */
   platformKeyVersion?: number;
+  /**
+   * SEC-2026-09-12 (MCPSDK-01) — additive, optional: the `generatedAt` of
+   * the manifest THIS attestation was minted for. Emitted by current `be`
+   * exporters; absent on every attestation produced before that change.
+   * When present it is verified (fail closed on mismatch); when absent the
+   * attestation is only weakly bound to the export (see the
+   * `attestation_unbound_legacy` note in `verifyPlatformAttestation`).
+   */
+  manifestGeneratedAt?: string;
+  /**
+   * SEC-2026-09-12 (MCPSDK-01) — additive, optional: lowercase sha256 hex
+   * over the manifest's canonical SIGNABLE bytes (see
+   * {@link manifestSignableBytes}) — i.e. exactly the preimage the tenant
+   * manifest signature covers. This is the strong form of the binding: it
+   * pins the attestation to one specific export, so a genuine
+   * pre-revocation attestation cannot be replayed onto a forged bundle.
+   */
+  manifestDigest?: string;
   signatureAlgorithm: 'ECDSA_P256_SHA256';
 }
 
@@ -4607,15 +4698,23 @@ interface PlatformAttestationEnvelope {
  *      the sha256 of the resolved pubkey's DER bytes — defends
  *      against an attacker who swaps the verifier's bundled pubkey
  *      bytes without re-signing the attestation.
+ *   6b. SEC-2026-09-12 (MCPSDK-01) — the attestation MUST be bound to
+ *      THIS export: `issuedAt` may not predate `manifest.generatedAt`
+ *      by more than `ATTESTATION_TIME_SKEW_MS`, and the optional
+ *      `manifestGeneratedAt` / `manifestDigest` fields, when present,
+ *      MUST match this manifest exactly. An attestation carrying
+ *      neither field is a legacy one: accepted, but flagged with the
+ *      `attestation_unbound_legacy` reason the CLI prints as a NOTE.
  *   7. Every `keyVersions[i].fingerprint` MUST match the sha256 of
  *      the corresponding entry in `public-keys.json`.
  */
 function verifyPlatformAttestation(
   entry: ZipEntry | null,
   publicKeysRaw: Record<string, unknown>,
-  manifestOrgId: string,
+  manifest: BundleManifest,
   options: VerifyOptions,
 ): RawComponentResult {
+  const manifestOrgId = manifest.orgId;
   // Missing external trust evidence is a verification failure by default. An
   // auditor may explicitly opt into legacy self-signed bundle semantics.
   if (!entry) {
@@ -4774,6 +4873,96 @@ function verifyPlatformAttestation(
     };
   }
 
+  // Step 6b (SEC-2026-09-12, MCPSDK-01) — bind the attestation to THIS
+  // export.
+  //
+  // The attestation is the only PLATFORM-signed input in the bundle; every
+  // other input (manifest, rows, roots, public-keys.json) is signed by the
+  // tenant key. Before this step the attestation was bound to an org and a
+  // key set but to no particular bundle and to no point in time, so a
+  // holder of a compromised-then-REVOKED tenant key could keep any genuine
+  // PRE-revocation attestation, forge a whole bundle that re-labels that
+  // key ACTIVE, and attach the old attestation: the key set matches
+  // (the forger mirrors the pre-revocation state) and everything verifies.
+  //
+  // Two bindings, strongest first:
+  //   (a) `manifestDigest` / `manifestGeneratedAt` — present on attestations
+  //       from current exporters; pin the attestation to one export.
+  //   (b) `issuedAt` vs `manifest.generatedAt` — always available. A
+  //       platform attestation cannot have been issued meaningfully before
+  //       the manifest it vouches for was generated.
+  const manifestGeneratedMs = Date.parse(manifest.generatedAt);
+  if (Number.isNaN(manifestGeneratedMs)) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason:
+        'malformed: manifest generatedAt is not a parseable timestamp, so the attestation cannot be bound to this export',
+    };
+  }
+  if (Date.parse(body.issuedAt) < manifestGeneratedMs - ATTESTATION_TIME_SKEW_MS) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `attestation_predates_manifest: attestation issuedAt ${
+        body.issuedAt
+      } is more than ${
+        ATTESTATION_TIME_SKEW_MS / 3_600_000
+      }h before manifest generatedAt ${
+        manifest.generatedAt
+      } — the platform cannot have vouched for an export that did not exist yet; this is what replaying an older attestation onto a newer (forged) bundle looks like`,
+    };
+  }
+  const boundGeneratedAt: unknown = body.manifestGeneratedAt;
+  const boundDigest: unknown = body.manifestDigest;
+  if (boundGeneratedAt !== undefined) {
+    if (
+      typeof boundGeneratedAt !== 'string' ||
+      Number.isNaN(Date.parse(boundGeneratedAt)) ||
+      Date.parse(boundGeneratedAt) !== manifestGeneratedMs
+    ) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `attestation_manifest_binding_mismatch: attestation is bound to a manifest generated at ${String(
+          boundGeneratedAt,
+        )} but this bundle's manifest declares ${manifest.generatedAt}`,
+      };
+    }
+  }
+  if (boundDigest !== undefined) {
+    const actualDigest = crypto
+      .createHash('sha256')
+      .update(manifestSignableBytes(manifest))
+      .digest('hex');
+    if (
+      typeof boundDigest !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(boundDigest) ||
+      boundDigest.toLowerCase() !== actualDigest
+    ) {
+      return {
+        ok: false,
+        checked: 1,
+        failed: 1,
+        reason: `attestation_manifest_binding_mismatch: attestation is bound to manifest digest ${String(
+          boundDigest,
+        )} but this bundle's manifest signable bytes hash to ${actualDigest}`,
+      };
+    }
+  }
+  // MIL-0002-style loud-but-not-fatal note: a legacy attestation carries no
+  // per-export binding at all. It is still accepted (customers verify
+  // archives, not just today's exports) but the auditor must be told that
+  // "platform attested" here means "attested for this ORG", not "attested
+  // for THIS bundle".
+  const bindingNote =
+    boundGeneratedAt === undefined && boundDigest === undefined
+      ? 'attestation_unbound_legacy: this attestation carries no manifestDigest/manifestGeneratedAt, so it vouches for the org key set, NOT for this specific export; upgrade the exporter'
+      : undefined;
+
   // Step 7 — require a one-to-one key set and bind fingerprint + lifecycle
   // metadata. Omitting a revoked key or relabelling it ACTIVE must not turn a
   // valid platform attestation into permission to trust that key.
@@ -4880,7 +5069,12 @@ function verifyPlatformAttestation(
     };
   }
 
-  return { ok: true, checked: 1, failed: 0 };
+  return {
+    ok: true,
+    checked: 1,
+    failed: 0,
+    ...(bindingNote !== undefined ? { reason: bindingNote } : {}),
+  };
 }
 
 // ════════════════════════════════════════════════════════════════════════

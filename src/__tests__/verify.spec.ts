@@ -2010,6 +2010,12 @@ describe('verifyBundle', () => {
       omitCheckpoint?: boolean;
       bundleStyleCheckpoint?: boolean;
       unrelatedRoot?: boolean;
+      /**
+       * SEC-2026-09-12 (MCPSDK-01) — override the log's signed
+       * `integratedTime` (epoch SECONDS) to model a receipt minted outside
+       * the root's own claimed time window.
+       */
+      integratedTime?: number;
     }): { receiptJson: string; publicKeyPem: string } {
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
         namedCurve: 'P-256',
@@ -2024,8 +2030,16 @@ describe('verifyBundle', () => {
       }) as Buffer;
       const logID = crypto.createHash('sha256').update(spkiDer).digest('hex');
       const logIndex = 0;
-      const integratedTime = 1748131200;
       const fixtureRoot = buildFixtureBundle().roots[0]!;
+      // SEC-2026-09-12 (MCPSDK-01) — a genuine log entry is integrated AFTER
+      // the root it witnesses was signed. The previous hard-coded constant
+      // (1748131200 = 2025-05-25) predated this fixture's `signedAt`
+      // (2026-05-01) by ~11 months, i.e. it modelled exactly the
+      // backdated-forgery shape the verifier now rejects; it passed only
+      // because nothing compared `integratedTime` to anything.
+      const integratedTime =
+        opts?.integratedTime ??
+        Math.floor(Date.parse(fixtureRoot.signedAt) / 1000) + 30;
       const rootHash = opts?.unrelatedRoot
         ? Buffer.alloc(32, 0xee).toString('base64')
         : fixtureRoot.rootHash;
@@ -2111,19 +2125,22 @@ describe('verifyBundle', () => {
     }
 
     /** Attach a rekor receipt to the pristine fixture's single root. */
-    function bundleWithRekorReceipt(receiptJson: string): Buffer {
+    function bundleWithRekorReceipt(
+      receiptJson: string,
+      anchoredAt = '2026-05-01T01:05:00.000Z',
+    ): Buffer {
       const base = buildFixtureBundle();
       const entries = readBundleEntries(base.zip);
       const root = base.roots[0]!;
       const patched: FixtureRoot = {
         ...root,
-        anchoredAt: '2026-05-01T01:00:00.000Z',
+        anchoredAt,
         anchorReceipt: null,
         anchorReceipts: [
           {
             provider: 'rekor',
             receipt: receiptJson,
-            anchoredAt: '2026-05-01T01:00:00.000Z',
+            anchoredAt,
           },
         ],
       };
@@ -2150,6 +2167,94 @@ describe('verifyBundle', () => {
       expect(report.rekor.checked).toBe(1);
       expect(report.rekor.failed).toBe(0);
       expect(report.ok).toBe(true);
+    });
+
+    describe('SEC-2026-09-12 (MCPSDK-01) — integratedTime bound to the root window', () => {
+      /**
+       * The revoked-key replay: a holder of a compromised (since-REVOKED)
+       * tenant key forges a bundle claiming an old period, re-anchors the
+       * forged root in public Rekor TODAY (anyone may submit a
+       * hashedrekord), and ships it. Every signature, the chain, the proofs
+       * and the Rekor receipt itself are internally consistent — the only
+       * artefact the forger cannot backdate is the log's own signed
+       * `integratedTime`, so that is what must be compared to the bundle's
+       * self-asserted window.
+       */
+      it('FAILS a receipt integrated months AFTER the root claims it was anchored', async () => {
+        const anchoredAt = '2026-05-01T01:05:00.000Z';
+        const { receiptJson, publicKeyPem } = buildRekorReceipt({
+          // ~3 months after `anchoredAt` — far outside the 24h skew.
+          integratedTime: Math.floor(
+            Date.parse('2026-08-01T01:05:00.000Z') / 1000,
+          ),
+        });
+        const zip = bundleWithRekorReceipt(receiptJson, anchoredAt);
+        const report = await verifyBundle(zip, {
+          rekorPublicKeyPem: publicKeyPem,
+        });
+        expect(report.rekor.ok).toBe(false);
+        expect(report.rekor.failed).toBe(1);
+        expect(report.rekor.reason).toMatch(
+          /rekor_integrated_time_out_of_window/,
+        );
+        expect(report.ok).toBe(false);
+        expect(report.status).toBe('invalid');
+      });
+
+      it('FAILS a receipt integrated BEFORE the root was signed', async () => {
+        const { receiptJson, publicKeyPem } = buildRekorReceipt({
+          integratedTime: Math.floor(
+            Date.parse('2026-04-01T00:00:00.000Z') / 1000,
+          ),
+        });
+        const zip = bundleWithRekorReceipt(receiptJson);
+        const report = await verifyBundle(zip, {
+          rekorPublicKeyPem: publicKeyPem,
+        });
+        expect(report.rekor.ok).toBe(false);
+        expect(report.rekor.reason).toMatch(
+          /rekor_integrated_time_out_of_window/,
+        );
+        expect(report.ok).toBe(false);
+      });
+
+      it('ACCEPTS a legacy single-slot receipt anchored later than signedAt (no anchoredAt recorded)', async () => {
+        // Back-compat: pre-multi-anchor bundles carry `anchorReceipt` with
+        // NO `anchoredAt`. A backfill run that anchored an old root months
+        // after it was signed is legitimate and must keep verifying — the
+        // upper bound only exists where the producer recorded a real anchor
+        // time.
+        const { receiptJson, publicKeyPem } = buildRekorReceipt({
+          integratedTime: Math.floor(
+            Date.parse('2026-09-01T00:00:00.000Z') / 1000,
+          ),
+        });
+        const base = buildFixtureBundle();
+        const entries = readBundleEntries(base.zip);
+        const patched: FixtureRoot = {
+          ...base.roots[0]!,
+          anchoredAt: null,
+          anchorReceipt: receiptJson,
+        };
+        const zip = writeZip([
+          { name: 'manifest.json', data: entries.get('manifest.json')! },
+          { name: 'rows.ndjson.gz', data: entries.get('rows.ndjson.gz')! },
+          {
+            name: 'roots.ndjson.gz',
+            data: gzipDeterministic(
+              Buffer.from(JSON.stringify(patched) + '\n', 'utf8'),
+            ),
+          },
+          { name: 'proofs.ndjson.gz', data: entries.get('proofs.ndjson.gz')! },
+          { name: 'public-keys.json', data: entries.get('public-keys.json')! },
+          { name: 'README.md', data: entries.get('README.md')! },
+        ]);
+        const report = await verifyBundle(zip, {
+          rekorPublicKeyPem: publicKeyPem,
+        });
+        expect(report.rekor.ok).toBe(true);
+        expect(report.rekor.checked).toBe(1);
+      });
     });
 
     it('accepts the Sigstore bundle-style checkpoint envelope object', async () => {
@@ -2650,6 +2755,19 @@ describe('verifyBundle', () => {
       tamperFingerprint?: boolean;
       omitEntry?: boolean;
       omitKeyVersion?: boolean;
+      /**
+       * SEC-2026-09-12 (MCPSDK-01) — emit a PRE-binding (legacy)
+       * attestation: no `manifestGeneratedAt`/`manifestDigest` at all.
+       * Every attestation minted before the binding change looks like this
+       * and must keep verifying (customers verify archives).
+       */
+      legacyUnbound?: boolean;
+      /** Bind to a digest that is not this manifest's. */
+      tamperManifestDigest?: boolean;
+      /** Bind to a `generatedAt` that is not this manifest's. */
+      tamperManifestGeneratedAt?: boolean;
+      /** Override the attestation's own `issuedAt`. */
+      issuedAt?: string;
     }): { zip: Buffer; platformPublicKeyDerB64: string } {
       const base = buildFixtureBundle();
       const entries = readBundleEntries(base.zip);
@@ -2658,7 +2776,19 @@ describe('verifyBundle', () => {
       ) as Record<string, string>;
       const manifest = JSON.parse(
         entries.get('manifest.json')!.toString('utf8'),
-      ) as { orgId: string };
+      ) as { orgId: string; generatedAt: string };
+      // SEC-2026-09-12 (MCPSDK-01) — sha256 over the manifest's canonical
+      // SIGNABLE bytes (everything except the signature envelope fields);
+      // this fixture's manifest is v1, whose signable set is exactly that.
+      const manifestSignable = { ...(JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as Record<string, unknown>) };
+      delete manifestSignable.signature;
+      delete manifestSignable.signatureKeyVersion;
+      const manifestDigest = crypto
+        .createHash('sha256')
+        .update(canonicalJson(manifestSignable))
+        .digest('hex');
 
       // Fresh platform keypair for THIS bundle. Pin it via options.
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', {
@@ -2692,8 +2822,21 @@ describe('verifyBundle', () => {
           ? '00000000-0000-0000-0000-0000DEADBEEF'
           : manifest.orgId,
         keyVersions,
-        issuedAt: '2026-05-01T01:00:00.000Z',
+        issuedAt: opts.issuedAt ?? '2026-05-01T01:00:00.000Z',
         platformSigningKeyFingerprint: platformFingerprint,
+        // Default models the CURRENT exporter: bound to this exact manifest.
+        // Every tamper below is re-signed, so the failure surface under test
+        // is the binding check itself, never the signature.
+        ...(opts.legacyUnbound
+          ? {}
+          : {
+              manifestGeneratedAt: opts.tamperManifestGeneratedAt
+                ? '2026-04-01T00:00:00.000Z'
+                : manifest.generatedAt,
+              manifestDigest: opts.tamperManifestDigest
+                ? '0'.repeat(64)
+                : manifestDigest,
+            }),
         signatureAlgorithm: 'ECDSA_P256_SHA256' as const,
       };
       const canonical = canonicalJson(attestation);
@@ -2812,6 +2955,110 @@ describe('verifyBundle', () => {
       expect(report.platformAttestation.reason).toBe(
         'platform_attestation_missing',
       );
+    });
+
+    describe('SEC-2026-09-12 (MCPSDK-01) — attestation bound to THIS export', () => {
+      /**
+       * The attestation is the only PLATFORM-signed input in a bundle.
+       * Before this binding it named an org and a key set but no particular
+       * export and no point in time, so a holder of a compromised
+       * (since-REVOKED) tenant key could forge a whole bundle that re-labels
+       * the key ACTIVE and staple on any genuine PRE-revocation attestation
+       * for that org — every check passed.
+       */
+      it('rejects an attestation issued BEFORE the manifest it vouches for was generated', async () => {
+        const { zip, platformPublicKeyDerB64 } =
+          buildBundleWithPlatformAttestation({
+            // Manifest generatedAt is 2026-05-01T01:00:30Z; a month earlier
+            // is far outside the 24h skew allowance.
+            issuedAt: '2026-04-01T00:00:00.000Z',
+            legacyUnbound: true,
+          });
+        const report = await verifyBundleStrict(zip, {
+          noRekor: true,
+          platformPublicKeyDerB64,
+        });
+        expect(report.ok).toBe(false);
+        expect(report.platformAttestation.ok).toBe(false);
+        expect(report.platformAttestation.reason).toMatch(
+          /attestation_predates_manifest/,
+        );
+      });
+
+      it('rejects an attestation bound to a different manifest digest', async () => {
+        const { zip, platformPublicKeyDerB64 } =
+          buildBundleWithPlatformAttestation({ tamperManifestDigest: true });
+        const report = await verifyBundleStrict(zip, {
+          noRekor: true,
+          platformPublicKeyDerB64,
+        });
+        expect(report.ok).toBe(false);
+        expect(report.platformAttestation.ok).toBe(false);
+        expect(report.platformAttestation.reason).toMatch(
+          /attestation_manifest_binding_mismatch/,
+        );
+      });
+
+      it('rejects an attestation bound to a different manifest generatedAt', async () => {
+        const { zip, platformPublicKeyDerB64 } =
+          buildBundleWithPlatformAttestation({
+            tamperManifestGeneratedAt: true,
+          });
+        const report = await verifyBundleStrict(zip, {
+          noRekor: true,
+          platformPublicKeyDerB64,
+        });
+        expect(report.ok).toBe(false);
+        expect(report.platformAttestation.reason).toMatch(
+          /attestation_manifest_binding_mismatch/,
+        );
+      });
+
+      it('verifies a bound attestation with no note', async () => {
+        const { zip, platformPublicKeyDerB64 } =
+          buildBundleWithPlatformAttestation({});
+        const report = await verifyBundleStrict(zip, {
+          noRekor: true,
+          platformPublicKeyDerB64,
+        });
+        expect(report.ok).toBe(true);
+        expect(report.platformAttestation.reason).toBeUndefined();
+      });
+
+      it('ACCEPTS a legacy unbound attestation but flags it, and the CLI prints a NOTE', () => {
+        const { zip, platformPublicKeyDerB64 } =
+          buildBundleWithPlatformAttestation({ legacyUnbound: true });
+        const testDir = path.dirname(fileURLToPath(import.meta.url));
+        const cliPath = path.resolve(testDir, '../../dist/cli.js');
+        if (!fs.existsSync(cliPath)) {
+          throw new Error(
+            'dist/cli.js not found — `npm run build` must run before `npm test`.',
+          );
+        }
+        const tmpDir = fs.mkdtempSync(
+          path.join(os.tmpdir(), 'audit-verifier-attest-note-'),
+        );
+        try {
+          const bundlePath = path.join(tmpDir, 'bundle.zip');
+          const keyPath = path.join(tmpDir, 'platform.der');
+          fs.writeFileSync(bundlePath, zip);
+          fs.writeFileSync(
+            keyPath,
+            Buffer.from(platformPublicKeyDerB64, 'base64'),
+          );
+          const stdout = execFileSync(
+            process.execPath,
+            [cliPath, bundlePath, '--no-rekor', '--platform-key', keyPath],
+            { encoding: 'utf8' },
+          );
+          expect(stdout).toContain('RESULT: OK');
+          expect(stdout).toContain(
+            'NOTE: this bundle\'s platform attestation is not bound to this manifest',
+          );
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
     });
 
     it('accepts a missing attestation only with explicit legacy opt-in', async () => {

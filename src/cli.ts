@@ -345,6 +345,19 @@ function printReport(
   // platform-attestation entry at all is NOT platform-attested, and a
   // "RESULT: OK" must never read as "Praesidia's platform vouched for
   // this bundle" when that check was explicitly bypassed by the caller.
+  // SEC-2026-09-12 (MCPSDK-01) — a legacy attestation (no
+  // `manifestDigest`/`manifestGeneratedAt`) still verifies, but it vouches
+  // for the org's KEY SET, not for this specific export, so a genuine older
+  // attestation can accompany a bundle it was never minted for. Say so.
+  if (
+    report.platformAttestation.reason?.startsWith('attestation_unbound_legacy')
+  ) {
+    lines.push(
+      'NOTE: this bundle\'s platform attestation is not bound to this manifest ' +
+        '(no manifestDigest/manifestGeneratedAt) — it attests the org key set, ' +
+        'not this specific export; upgrade the exporter.',
+    );
+  }
   if (report.platformAttestation.reason === 'missing_legacy_explicitly_allowed') {
     lines.push(
       'WARNING: --allow-legacy-unattested was passed and this bundle carries NO ' +

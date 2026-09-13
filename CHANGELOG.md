@@ -10,6 +10,28 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 
 ## [0.11.0] — Unreleased
 
+### Security
+- **Rekor `integratedTime` is now bound to the root's own time window**
+  (SEC-2026-09-12 MCPSDK-01). The log's signed integration time was previously
+  used only to rebuild the SET payload and was never compared to anything, so a
+  bundle forged under a compromised (since-REVOKED) tenant key could be anchored
+  in public Rekor *today* while claiming an old period and verify green. A
+  receipt whose `integratedTime` precedes `root.signedAt`, or exceeds the anchor
+  time the bundle records, by more than a fixed 24h skew allowance now fails with
+  `rekor_integrated_time_out_of_window`. Roots that carry a receipt but record no
+  anchor time keep their (unbounded-above) legacy behaviour, so archives anchored
+  by a later backfill run still verify.
+- **The platform attestation is now bound to the export it vouches for**
+  (SEC-2026-09-12 MCPSDK-01). `issuedAt` may not precede `manifest.generatedAt`
+  by more than 24h (`attestation_predates_manifest`). Attestations carrying the
+  new optional `manifestGeneratedAt` / `manifestDigest` fields (emitted by
+  current `be` exporters; `manifestDigest` = sha256 hex over the manifest's
+  canonical *signable* bytes) are verified against this manifest and fail closed
+  on mismatch (`attestation_manifest_binding_mismatch`). Attestations without
+  those fields remain **valid** but are flagged `attestation_unbound_legacy`,
+  which the CLI surfaces as an explicit `NOTE:` — they attest the org key set,
+  not this specific export.
+
 ### Added
 - `verifyHttpReceipt`, `httpRequestCommitment`, and `httpTargetKeyFingerprint`,
   exported from `src/http-receipt.ts` — offline Ed25519 verification of
@@ -22,6 +44,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `verifyTargetAck`.
 
 ### Compatibility
+- The two new time bindings above are a deliberate **strictness increase**. They
+  are additive for every genuine bundle (a real anchor is integrated after the
+  root is signed and at/near the recorded anchor time; a real attestation is
+  issued for the export it accompanies), and the legacy shapes that cannot carry
+  the evidence — receipts with no recorded anchor time, attestations with no
+  manifest binding — are explicitly preserved rather than rejected. A bundle that
+  now fails one of these checks was always evidence of a backdated artefact.
 - Fully backward compatible. `src/verify.ts` branches on
   `proposal.payload.evidenceContent === 'commitments-only.v1'` for the new
   producer shape and keeps the pre-existing body-bearing shape in the `else`

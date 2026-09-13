@@ -187,6 +187,15 @@ checks every cryptographic invariant the bundle commits to:
    Legacy receipts that omit `inclusionProof.checkpoint` fail closed with
    `checkpoint_missing`; producers must persist the log's signed checkpoint,
    not only the unauthenticated `treeSize`/`rootHash` proof fields.
+   The log's **signed `integratedTime` is bound to the root's own claimed
+   time window**: it must not be earlier than `root.signedAt`, nor later
+   than the anchor time the bundle records (`root.anchoredAt`, or the
+   per-provider `anchorReceipts[].anchoredAt`), by more than a fixed **24h**
+   skew allowance — otherwise `rekor_integrated_time_out_of_window`.
+   `integratedTime` is the only clock in the artefact an attacker cannot
+   backdate, so a freshly-anchored forgery claiming an old period fails
+   here. A legacy root that carries a receipt but records **no** anchor time
+   has no upper bound (a later backfill anchoring run is legitimate).
    - **A root with no anchor receipt at all still fails closed** — an
      unwitnessed root does not get the benefit of the doubt. The `reason`
      distinguishes two different situations rather than reporting them
@@ -220,6 +229,18 @@ checks every cryptographic invariant the bundle commits to:
    accepted only with explicit `--allow-legacy-unattested`. The attestation
    must cover every bundled key exactly once and binds its fingerprint,
    lifecycle status, and revocation timestamp.
+   It is also bound to **this export**: `issuedAt` may not precede
+   `manifest.generatedAt` by more than 24h (`attestation_predates_manifest`),
+   and when the attestation carries the optional `manifestGeneratedAt` /
+   `manifestDigest` fields (`manifestDigest` = sha256 hex over the manifest's
+   canonical *signable* bytes — the same preimage the manifest signature
+   covers) they must match this manifest exactly
+   (`attestation_manifest_binding_mismatch`). An attestation carrying
+   neither field is a pre-binding **legacy** one: still accepted, but the
+   component reports `attestation_unbound_legacy` and the CLI prints a
+   `NOTE:` — it vouches for the org's key set, not for this specific export,
+   so a genuine older attestation can accompany a bundle it was never minted
+   for. Upgrade the exporter to close that gap.
 9. **Archive integrity and resource bounds** — duplicate filenames,
    local/central-header disagreement, invalid UTF-8 names, CRC mismatches,
    unsupported encryption, malformed ZIP64, and excessive decompression are

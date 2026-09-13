@@ -26,6 +26,9 @@
  *   4. Decode the hashedrekord body and bind its digest and signature to
  *      the exact Merkle root being verified. A genuine unrelated Rekor
  *      receipt therefore cannot be reattached to another bundle root.
+ *   5. SEC-2026-09-12 (MCPSDK-01) — bind the log's SIGNED `integratedTime`
+ *      to the root's self-asserted `signedAt`/`anchoredAt` window, so a
+ *      freshly-anchored forgery cannot claim an old period.
  */
 
 import * as crypto from 'node:crypto';
@@ -37,6 +40,22 @@ const MAX_REKOR_RECEIPT_BYTES = 1024 * 1024;
 const MAX_CHECKPOINT_BYTES = 64 * 1024;
 const MAX_CHECKPOINT_SIGNATURES = 32;
 const MAX_INCLUSION_HASHES = 64;
+
+/**
+ * SEC-2026-09-12 (MCPSDK-01) — permitted clock skew, in milliseconds,
+ * between the bundle's SELF-ASSERTED timestamps (`root.signedAt`,
+ * `root.anchoredAt` — both attacker-controllable in a forged bundle) and
+ * Rekor's `integratedTime`, which is signed by the log and is therefore
+ * the only honest clock in the whole artefact.
+ *
+ * 24h is deliberately generous: it absorbs producer/log clock drift, a
+ * queued/retried anchor submission, and an anchor run that straddles a
+ * maintenance window, while still making a MONTHS-late backdated forgery
+ * (the attack this bound exists to stop — re-anchoring freshly forged
+ * roots that claim an old `periodEnd`) fail closed. It is intentionally
+ * NOT configurable: a caller-tunable skew is a caller-tunable bypass.
+ */
+export const REKOR_INTEGRATED_TIME_SKEW_MS = 24 * 60 * 60 * 1000;
 
 // ── Pinned Sigstore Rekor signing key ────────────────────────────────────
 //
@@ -121,6 +140,25 @@ export type RekorVerifyResult = { ok: boolean; reason?: string };
 export interface ExpectedRekorRoot {
   rootHashB64: string;
   signatureB64: string;
+  /**
+   * SEC-2026-09-12 (MCPSDK-01) — the root's own `signedAt` (ISO-8601).
+   * A genuine transparency-log entry for this root CANNOT have been
+   * integrated before the root was signed, so `integratedTime` is
+   * required to be >= `signedAt - REKOR_INTEGRATED_TIME_SKEW_MS`.
+   * Supplying it is what turns Rekor's signed clock into a bound on the
+   * bundle's self-asserted timestamps; `verifyBundle` ALWAYS supplies it.
+   * Omitted (direct library callers only) = lower bound not enforced.
+   */
+  signedAt?: string;
+  /**
+   * SEC-2026-09-12 (MCPSDK-01) — the time the producer recorded for this
+   * anchor (ISO-8601), when one is genuinely recorded. `integratedTime`
+   * must then be <= `anchoredAt + REKOR_INTEGRATED_TIME_SKEW_MS`.
+   * `null`/omitted = no upper bound (legacy roots that carry a receipt but
+   * no anchor timestamp — a later backfill anchoring run is legitimate and
+   * must keep verifying).
+   */
+  anchoredAt?: string | null;
 }
 
 interface AuthenticatedCheckpoint {
@@ -531,6 +569,67 @@ function verifyBodyBinding(
   return { ok: true };
 }
 
+/**
+ * SEC-2026-09-12 (MCPSDK-01) — bind the log's SIGNED `integratedTime` to
+ * the bundle's own claimed time window.
+ *
+ * Before this check `integratedTime` was only ever used to rebuild the SET
+ * payload; it was never compared to anything. That left a hole: a holder of
+ * a compromised (and since-REVOKED) tenant key could forge a whole bundle
+ * that claims an old period, anchor the forged roots in public Rekor today
+ * (anyone may submit a hashedrekord), and every component — including the
+ * genuine, root-bound Rekor receipt — would verify. The only artefact in the
+ * bundle the forger cannot backdate is Rekor's own clock, so it must be
+ * compared against the timestamps the forger DOES control.
+ *
+ * Fails closed on an unparseable timestamp: an un-evaluable window is a
+ * failure, not a skip.
+ */
+function verifyIntegratedTimeWindow(
+  integratedTime: number,
+  expected: ExpectedRekorRoot,
+): RekorVerifyResult {
+  const integratedMs = integratedTime * 1000;
+  const integratedIso = new Date(integratedMs).toISOString();
+  if (expected.signedAt !== undefined) {
+    const signedMs = Date.parse(expected.signedAt);
+    if (Number.isNaN(signedMs)) {
+      return {
+        ok: false,
+        reason:
+          'rekor_integrated_time_window_unverifiable: root signedAt is not a parseable timestamp',
+      };
+    }
+    if (integratedMs < signedMs - REKOR_INTEGRATED_TIME_SKEW_MS) {
+      return {
+        ok: false,
+        reason: `rekor_integrated_time_out_of_window: log integrated this entry at ${integratedIso}, BEFORE the root claims to have been signed (${expected.signedAt}) by more than the ${
+          REKOR_INTEGRATED_TIME_SKEW_MS / 3_600_000
+        }h skew allowance — a transparency-log entry cannot predate the thing it witnesses`,
+      };
+    }
+  }
+  if (expected.anchoredAt !== undefined && expected.anchoredAt !== null) {
+    const anchoredMs = Date.parse(expected.anchoredAt);
+    if (Number.isNaN(anchoredMs)) {
+      return {
+        ok: false,
+        reason:
+          'rekor_integrated_time_window_unverifiable: root anchoredAt is not a parseable timestamp',
+      };
+    }
+    if (integratedMs > anchoredMs + REKOR_INTEGRATED_TIME_SKEW_MS) {
+      return {
+        ok: false,
+        reason: `rekor_integrated_time_out_of_window: log integrated this entry at ${integratedIso}, AFTER the anchor time the bundle records (${expected.anchoredAt}) by more than the ${
+          REKOR_INTEGRATED_TIME_SKEW_MS / 3_600_000
+        }h skew allowance — the receipt was created later than the bundle claims, which is what backdating a forged export looks like`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 // ── Public entry point ─────────────────────────────────────────────────────
 
 /**
@@ -626,6 +725,14 @@ export function verifyRekorReceipt(
   if (expectedRoot) {
     const bindingResult = verifyBodyBinding(entry.body, expectedRoot);
     if (!bindingResult.ok) return bindingResult;
+    // SEC-2026-09-12 (MCPSDK-01) — the entry is genuine AND bound to this
+    // root; the remaining question is whether the log's signed clock agrees
+    // with the time window the bundle claims for itself.
+    const windowResult = verifyIntegratedTimeWindow(
+      entry.integratedTime,
+      expectedRoot,
+    );
+    if (!windowResult.ok) return windowResult;
   }
 
   return { ok: true };

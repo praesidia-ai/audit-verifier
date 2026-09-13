@@ -36,8 +36,9 @@
  *   B. Manifest SIGNED PREIMAGE — be's `manifestSansSignature` fields plus
  *      `signatureAlgorithm` (the manifest's actual signed bytes,
  *      `bundle-exporter.service.ts`) vs this verifier's `signable`
- *      reconstruction in `verifyManifest` at the newest manifest version
- *      (`verify.ts`).
+ *      reconstruction in `manifestSignableBytes()` (called by
+ *      `verifyManifest`, and by the platform attestation's `manifestDigest`
+ *      binding) at the newest manifest version (`verify.ts`).
  *   C. Action-event WIRE shape — be's `serializeActionEvent` emitted fields
  *      vs `BundleActionEvent`'s declared fields (`verify.ts:212-235`).
  *   D. Manifest WIRE shape — be's manifest builder (`manifestSansSignature`
@@ -256,7 +257,7 @@ function extractFunctionBody(source, signatureRegex) {
 
 /** `identifier.field = ` assignments anywhere in `body`, e.g. the
  * version-gated `signable.actionEventCount = manifest.actionEventCount;`
- * lines in `verifyManifest`. */
+ * lines in `manifestSignableBytes`. */
 function extractDottedAssignments(body, identifier) {
   const keys = new Set();
   const re = new RegExp(`\\b${identifier}\\.([A-Za-z_]\\w*)\\s*=(?!=)`, 'g');
@@ -363,26 +364,30 @@ function main() {
     bundleExporterSrc,
     /const manifestSansSignature\s*=\s*{/,
   );
-  const verifyManifestFn = extractFunctionBody(
+  // SEC-2026-09-12 (MCPSDK-01) — the reconstruction moved OUT of
+  // `verifyManifest` into `manifestSignableBytes()` so the platform
+  // attestation's `manifestDigest` is computed over the identical preimage.
+  // This check follows it; the contract it guards is unchanged.
+  const manifestSignableFn = extractFunctionBody(
     verifyTsSrc,
-    /function verifyManifest\([^)]*\)[^{]*{/,
+    /function manifestSignableBytes\([^)]*\)[^{]*{/,
   );
   if (!manifestSansSignatureFields) {
     failures.push(
       '[B] manifestSansSignature literal not found in bundle-exporter.service.ts (renamed or moved?)',
     );
-  } else if (!verifyManifestFn) {
-    failures.push('[B] verifyManifest() not found in verify.ts (renamed or moved?)');
+  } else if (!manifestSignableFn) {
+    failures.push('[B] manifestSignableBytes() not found in verify.ts (renamed or moved?)');
   } else {
     const signableDeclMatch = /const signable:\s*Record<string,\s*unknown>\s*=\s*{/.exec(
-      verifyManifestFn,
+      manifestSignableFn,
     );
     if (!signableDeclMatch) {
-      failures.push("[B] verifyManifest()'s `signable` reconstruction object not found");
+      failures.push("[B] manifestSignableBytes()'s `signable` reconstruction object not found");
     } else {
-      const openBrace = verifyManifestFn.indexOf('{', signableDeclMatch.index + signableDeclMatch[0].length - 1);
-      const baseSignableFields = extractDepth1Keys(verifyManifestFn, openBrace);
-      const gatedSignableFields = extractDottedAssignments(verifyManifestFn, 'signable');
+      const openBrace = manifestSignableFn.indexOf('{', signableDeclMatch.index + signableDeclMatch[0].length - 1);
+      const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace);
+      const gatedSignableFields = extractDottedAssignments(manifestSignableFn, 'signable');
       const verifierSignableFields = new Set([...baseSignableFields, ...gatedSignableFields]);
       // be always builds the LATEST manifest version unconditionally (see
       // bundle-exporter.service.ts's own comment: "the manifest is always
@@ -396,7 +401,7 @@ function main() {
       for (const failure of diffSets(
         "be's manifest signed preimage (manifestSansSignature + signatureAlgorithm)",
         beSignableFields,
-        "verify.ts's verifyManifest() `signable` reconstruction (newest version)",
+        "verify.ts's manifestSignableBytes() `signable` reconstruction (newest version)",
         verifierSignableFields,
       )) {
         failures.push(`[B] ${failure}`);
@@ -647,7 +652,7 @@ function main() {
   }
 
   console.log('ok  [A] action-event signed-preimage fields match (SignableProtectedActionEventRow <-> signableActionEvent)');
-  console.log('ok  [B] manifest signed-preimage fields match (manifestSansSignature+signatureAlgorithm <-> verifyManifest signable)');
+  console.log('ok  [B] manifest signed-preimage fields match (manifestSansSignature+signatureAlgorithm <-> manifestSignableBytes signable)');
   console.log('ok  [C] action-event wire fields match (serializeActionEvent <-> BundleActionEvent)');
   console.log('ok  [D] manifest wire fields match (manifest builder <-> BundleManifest)');
   console.log('ok  [E] platform-attestation required fields match (no hard drift); additive fields, if any, warned below');
