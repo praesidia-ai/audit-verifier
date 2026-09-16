@@ -13,6 +13,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY tsconfig.json tsconfig.spec.json ./
 COPY src ./src
+COPY test-fixtures ./test-fixtures
 COPY README.md LICENSE ./
 RUN npm run build && npm run typecheck:spec && npx vitest run
 
