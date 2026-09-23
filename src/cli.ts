@@ -84,6 +84,13 @@ USAGE
   platform-attested, else exit 1; its non-REVOKED attested tenant keys
   become the pins, and the AIBOM must name the bundle's org.
 
+  AV-0005 — for a verified AIBOM with an \`anchorProof\`, the anchor is
+  checked offline: the signed anchor-request audit row, its Merkle
+  inclusion proof and signed root (same pins), and the root's Rekor receipt
+  against the PINNED Sigstore log key. The \`anchor:\` line reports
+  verified_rekor with the log's signed time, or UNVERIFIED with a reason.
+  The anchor never changes the exit status.
+
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
   --target-keys <file>
@@ -1006,7 +1013,9 @@ async function mainAibom(argv: string[]): Promise<number> {
         pinNote +
         (report.valid
           ? `NOTE: ${AIBOM_UNAUTHENTICATED_FIELDS.join(', ')} are not covered by the signature.\n` +
-            'NOTE: AIBOM anchoring was NOT checked: an anchorStatus in the file is the exporting server\'s unsigned claim.\n'
+            (report.anchorStatus === 'verified_rekor'
+              ? `anchor: verified_rekor at ${report.anchoredAt} (the pinned Rekor log's signed integratedTime)\n`
+              : `anchor: UNVERIFIED (${report.anchorReason}): the digest is not proven anchored; exit status reflects the signature only.\n`)
           : ''),
     );
   }

@@ -74,8 +74,24 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   anchor status, outside the signed document. They do not change the verdict, and no report
   field describes an AIBOM anchor. The `aibom` human output lists them among the unsigned fields
   and adds `NOTE: AIBOM anchoring was NOT checked`. Verification behaviour unchanged.
+  Superseded in this release by AV-0005.
+- Offline AIBOM anchor verification (AV-0005, be BE-1255). For a verified AIBOM,
+  `anchorProof` is checked with `be`'s procedure A2-A10. The checks cover the signed
+  anchor-request row, its Merkle inclusion proof and signed root (pinned tenant keys), and the
+  root's Rekor receipt against a pinned log key. `AibomVerifyReport` gains `anchorStatus`
+  (`verified_rekor` | `unverified`), `anchoredAt` (the log's signed `integratedTime`) and
+  `anchorReason`, with verdicts and reasons equal to `be`'s. `AibomVerifyOptions` gains
+  `rekorPublicKeysPem`, which defaults to the pinned Sigstore key. The four `anchor*` labels leave
+  `AIBOM_UNAUTHENTICATED_FIELDS`: each must now agree with the proof. The `aibom` human output
+  prints `anchor: verified_rekor at <time>` or `anchor: UNVERIFIED (<reason>)` instead of the
+  NOTE. Exit codes are unchanged.
 
 ### Compatibility
+- AV-0005 adds verification without weakening any. The anchor is informational: `valid`, the
+  verdict and the exit status are computed exactly as before. An AIBOM without `anchorProof`
+  (every export before BE-1255) verifies as before and reports `unverified` /
+  `aibom_not_anchored`. `AibomVerifyReport.anchorStatus` is a new required field, so code that
+  *builds* such a report object must add it. Code that only reads reports is unaffected.
 - The two new time bindings above are a deliberate **strictness increase**. They
   are additive for every genuine bundle (a real anchor is integrated after the
   root is signed and at/near the recorded anchor time; a real attestation is

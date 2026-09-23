@@ -147,16 +147,40 @@ and enforces three fail-closed checks. `be` DOCS-0590 wrote the first two into t
 All but `non_canonical_encoding` are `be`'s own verdicts (`verifyAibomAttestation` in
 `be/src/aibom/aibom-attestation.ts`); `non_canonical_encoding` is this verifier's addition. For
 an unmodified export and a correct pin both verifiers agree. Not covered by the signature and never reported as verified: `snapshotId`, `version`,
-`generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`, `anchorReference`, `anchorStatus`,
-`anchoredAt`, `anchorReason`.
+`generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`.
 
-**AIBOM anchoring is not checked.** When anchoring is on, `be` adds the four `anchor*` labels
-(BE-0738): the digest's anchor status as the exporting server resolved it at export time. They
-sit outside the signed `document`, so anyone can write `"anchorStatus":"verified_rekor"` into a
-file. This verifier has no Rekor step for AIBOMs and never reports an AIBOM anchor. The labels do
-not change the verdict, the report says nothing about an anchor, and the human output prints
-`NOTE: AIBOM anchoring was NOT checked`. Library use:
-`verifyAibomAttestation(bytes, { trustedKeyFingerprints })`.
+**AIBOM anchoring (AV-0005).** When anchoring is on, `be` adds the four `anchor*` labels
+(BE-0738) and, since BE-1255, an `anchorProof`. The labels are unsigned. They are never taken
+as the anchor: each must agree with the proof. For a bundle that verifies, the proof is checked
+offline with the envelope's procedure A2-A10. The anchor-request audit row must be signed by a
+pinned tenant key and bind this `digest` and `aiSystemId`. Its Merkle inclusion proof must fold
+to a root signed by a pinned tenant key. That root's Rekor receipt must verify against a Rekor
+log key you pinned (SET, signed checkpoint, inclusion proof, and a `hashedrekord` body naming
+this root). No key or log the file ships is ever trusted. The report carries:
+
+| `anchorStatus` | When |
+|---|---|
+| `verified_rekor` | Every step passed. `anchoredAt` is the log's SET-signed `integratedTime`, never a label |
+| `unverified` | Anything else. `anchorReason` says why |
+
+Reasons are `be`'s own. `aibom_not_anchored`: no `anchorProof` (never anchored, or exported
+before BE-1255), or the bundle itself did not verify. `unsigned`: an unsigned bundle.
+`not_yet_rooted` / `anchor_status_unavailable`: the exporting server had no proof yet.
+`anchoring_pending`: no receipt. `s3_anchor_not_offline_verifiable`: object storage cannot be
+checked offline. `legacy_receipt_unverified`: a `rekor:<index>` receipt. `unknown_log_id`: the
+receipt's log is not pinned. `anchor_label_mismatch`, `anchor_row_unbound`,
+`anchor_untrusted_key`, `anchor_row_signature_invalid`, `anchor_inclusion_invalid`,
+`anchor_root_signature_invalid`, `anchor_proof_malformed`, or a Rekor receipt failure such as
+`set_signature_invalid` or `body_root_mismatch`: a proof that does not hold. For a receipt that is
+malformed or tampered inside, the Rekor failure name can differ from `be`'s, because this package's
+Rekor verifier checks structure first. `unverified` is the same either way.
+
+The anchor is informational. It never changes `valid` or the exit status. The human output prints
+`anchor: verified_rekor at <time>` or `anchor: UNVERIFIED (<reason>)`. The CLI trusts only the
+Sigstore public-good log key this package pins. Library use:
+`verifyAibomAttestation(bytes, { trustedKeyFingerprints, rekorPublicKeysPem? })`. Omit
+`rekorPublicKeysPem` to use that same pinned key, or pass the PEM keys of a private Rekor log. `[]`
+trusts no log.
 
 ### Getting the pin from a verified compliance bundle (AV-0002)
 

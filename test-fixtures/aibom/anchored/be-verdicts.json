@@ -1,0 +1,82 @@
+{
+  "anchored-rekor": {
+    "pinned": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "verified_rekor",
+      "anchoredAt": "2026-09-01T10:04:58.000Z"
+    },
+    "sigstoreOnly": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "unknown_log_id"
+    }
+  },
+  "anchored-commitment": {
+    "pinned": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "verified_rekor",
+      "anchoredAt": "2026-09-01T10:04:58.000Z"
+    },
+    "sigstoreOnly": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "unknown_log_id"
+    }
+  },
+  "anchor-pending": {
+    "pinned": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "anchoring_pending"
+    },
+    "sigstoreOnly": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "anchoring_pending"
+    }
+  },
+  "anchor-not-yet-rooted": {
+    "pinned": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "not_yet_rooted"
+    },
+    "sigstoreOnly": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "not_yet_rooted"
+    }
+  },
+  "anchor-redacted": {
+    "pinned": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "anchor_status_unavailable"
+    },
+    "sigstoreOnly": {
+      "valid": true,
+      "reason": "verified",
+      "chainOk": true,
+      "anchorStatus": "unverified",
+      "anchorReason": "anchor_status_unavailable"
+    }
+  }
+}

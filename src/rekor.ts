@@ -103,7 +103,7 @@ const REKOR_HISTORICAL_KEYS: ReadonlyArray<RekorPinnedKey> = [];
  * Returns `null` when no pinned key matches — the caller MUST fail
  * closed (never silently fall back to a default key).
  */
-function resolvePinnedRekorPem(logIdHex: string): string | null {
+export function resolvePinnedRekorPem(logIdHex: string): string | null {
   if (typeof logIdHex !== 'string' || logIdHex.length === 0) return null;
   const needle = logIdHex.toLowerCase();
   const ring: RekorPinnedKey[] = [

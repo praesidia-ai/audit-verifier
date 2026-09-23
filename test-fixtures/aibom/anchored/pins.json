@@ -1,0 +1,10 @@
+{
+  "trustedKeyFingerprints": [
+    "dd514ec082411e168a4b17f975641a40abe663791ec4a65c9d2e7bebc0dc120f"
+  ],
+  "rekorPublicKeysPem": [
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiNfNmy0gMYAF21DVlusz2RpdzdUz\njy0B+zQ4aXDRPMdmj3hJO4mZf1s0j/L7+yZmWRjs2zNJWSSxgXsjpqtQpA==\n-----END PUBLIC KEY-----\n",
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOvPkVRuFakKAfVpc4IvJv2e3bpSz\nt3e6Hguh9B7K636qR32I9uA4aIPFIvTQ52SgpaxKHvPBtgCAz6aA9NYjJw==\n-----END PUBLIC KEY-----\n",
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpuBfMsNs3labtj3JVIzWl4dsZxNk\nKD81gApBN2CKM5sGZuam66kVSPeefAvNxis/X75VHaXn4x6AsVrBiz+Dog==\n-----END PUBLIC KEY-----\n"
+  ]
+}

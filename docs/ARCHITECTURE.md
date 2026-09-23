@@ -53,9 +53,12 @@ code must produce and check the **exact same bytes** `be` produces when it expor
 - `src/aibom.ts` ↔ `be`'s `aibom-canonical.ts` + `aibom-attestation.ts` (BE-0155) — fixtures in
   `test-fixtures/aibom/` are real `be` exports from `scripts/make-aibom-fixtures.cts`. Envelope
   fields outside the signed `document` are `AIBOM_UNAUTHENTICATED_FIELDS` and are never reported
-  as verified. That includes BE-0738's `anchorReference`, `anchorStatus`, `anchoredAt` and
-  `anchorReason`: the anchor status `be` resolved at export time. They are unsigned, and AIBOM
-  anchoring is not checked here (AV-0004).
+  as verified. BE-0738's `anchorReference`, `anchorStatus`, `anchoredAt` and `anchorReason`
+  are unsigned. Since AV-0005 each must agree with BE-1255's `anchorProof`, which is checked
+  offline with `be`'s A2-A10 procedure (`verifyAnchorProof` in `src/aibom.ts`, reusing
+  `rekor.ts`'s `verifyRekorReceipt` with a pinned log key). The fixtures in
+  `test-fixtures/aibom/anchored/` come from `scripts/make-aibom-anchor-fixtures.cts`, with `be`'s
+  own verdicts in `be-verdicts.json`.
 - Merkle root computation ↔ `be`'s `MerkleRootService` (AGV-033) — same RFC 6962
   domain-separation bytes.
 - `src/zip.ts`'s reader ↔ `be`'s `BundleExporterService`'s `ZipStreamWriter` (AGV-035) — reads
