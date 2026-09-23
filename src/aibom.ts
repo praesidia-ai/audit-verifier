@@ -1,8 +1,9 @@
 /**
  * AV-0001 — offline verification of be's `attested` AIBOM export
  * (`praesidia-aibom-attestation/v1`, produced by `be/src/aibom/
- * aibom-attestation.ts`). Implements the envelope's own 7-step procedure,
- * with three fail-closed additions be's in-repo reference verifier lacks:
+ * aibom-attestation.ts`). Implements the envelope's own procedure (9 steps
+ * since be DOCS-0590; archived 7-step exports verify identically, since the
+ * added steps were already these checks) with three fail-closed checks:
  *
  * - `untrusted_key`: the embedded `publicKey` must hash (sha256 over the
  *   decoded bytes — the same fingerprint a compliance bundle's platform
@@ -17,8 +18,7 @@
  *   show other JSON readers content the digest does not cover.
  *
  * Not authenticated by the signature, never reported as verified:
- * `snapshotId`, `version`, `generatedAt`, `signedAt`, `signingKeyVersion`,
- * `procedure`.
+ * {@link AIBOM_UNAUTHENTICATED_FIELDS}.
  */
 import { canonicalJson, decodeBase64Strict, sha256, verifySignature, type BundleSignatureAlgorithm } from './crypto.js';
 import type { VerifyReport } from './verify.js';
@@ -27,6 +27,17 @@ export const AIBOM_ATTESTATION_FORMAT = 'praesidia-aibom-attestation/v1';
 export const AIBOM_SIGNING_DOMAIN = 'praesidia:aibom-snapshot:v1';
 /** be refuses to write a larger export (`AIBOM_EXPORT_MAX_BYTES`). */
 export const MAX_AIBOM_ENVELOPE_BYTES = 8 * 1024 * 1024;
+/**
+ * AV-0003 — the only `signingAlgorithm` values accepted. Must equal the
+ * union on be's `AibomAttestationEnvelope` (`scripts/contract-drift.mjs` [H]).
+ */
+export const AIBOM_SIGNING_ALGORITHMS: readonly BundleSignatureAlgorithm[] = ['Ed25519', 'ECDSA_P256_SHA256'];
+/**
+ * AV-0003 — envelope fields the signature does not cover, so never reported
+ * as verified. Every field of be's `AibomAttestationEnvelope` must be either
+ * read by {@link verifyAibomAttestation} or listed here (contract-drift [H]).
+ */
+export const AIBOM_UNAUTHENTICATED_FIELDS = ['snapshotId', 'version', 'generatedAt', 'signedAt', 'signingKeyVersion', 'procedure'] as const;
 
 export type AibomVerdict =
   | 'verified'
@@ -84,7 +95,7 @@ export function verifyAibomAttestation(
       : typeof digest !== 'string' || !/^[0-9a-f]{64}$/.test(digest) ? 'digest is not 64 lowercase hex characters'
       : typeof env.organizationId !== 'string' || typeof env.aiSystemId !== 'string' ? 'organizationId/aiSystemId missing'
       : signature !== null && typeof signature !== 'string' ? 'signature is neither null nor a string'
-      : alg !== null && alg !== 'Ed25519' && alg !== 'ECDSA_P256_SHA256' ? `unknown signingAlgorithm ${JSON.stringify(alg)}`
+      : alg !== null && !(AIBOM_SIGNING_ALGORITHMS as readonly unknown[]).includes(alg) ? `unknown signingAlgorithm ${JSON.stringify(alg)}`
       : keyVersion !== null && !(Number.isSafeInteger(keyVersion) && (keyVersion as number) >= 1) ? 'signingKeyVersion is not a positive integer'
       : publicKey !== null && decodeBase64Strict(publicKey) === null ? 'publicKey is neither null nor canonical base64'
       : null;

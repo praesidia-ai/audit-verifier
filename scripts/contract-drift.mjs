@@ -114,12 +114,20 @@
  *     does not declare in EITHER category is a hard failure — unlike [E],
  *     there is no wholesale-canonicalization safety net here.
  *
+ * [H] AIBOM attestation envelope (AV-0003; hard failure, both directions):
+ * `be/src/aibom/aibom-attestation.ts` vs `src/aibom.ts` — the
+ * `attestationFormat` literal and `AIBOM_SIGNING_DOMAIN` must be equal; every
+ * `AibomAttestationEnvelope` key must be read by `verifyAibomAttestation` or
+ * listed in `AIBOM_UNAUTHENTICATED_FIELDS`, and the verifier may know no key
+ * be does not declare; the `signingAlgorithm` union must equal
+ * `AIBOM_SIGNING_ALGORITHMS`.
+ *
  * Usage
  * -----
  *   node scripts/contract-drift.mjs <path-to-be-core-checkout>
  *
- * Exits non-zero, listing every offending field, when A-D disagree or when
- * [E] finds a hard failure. Warnings (safe [E] drift) print but do not
+ * Exits non-zero, listing every offending field, when A-D, F, G or H
+ * disagree or when [E] finds a hard failure. Warnings (safe [E] drift) print but do not
  * affect the exit code.
  */
 
@@ -309,12 +317,17 @@ function main() {
     'src/audit/audit-canonical.helper.ts',
   );
   const verifyTsPath = path.join(__dirname, '../src/verify.ts');
+  // AV-0003 — the AIBOM attestation envelope, a second producer/consumer pair.
+  const beAibomAttestationPath = path.join(beRoot, 'src/aibom/aibom-attestation.ts');
+  const aibomTsPath = path.join(__dirname, '../src/aibom.ts');
 
   let bundleExporterSrc,
     canonicalHelperSrc,
     platformAttestationSrc,
     auditCanonicalHelperSrc,
-    verifyTsSrc;
+    verifyTsSrc,
+    beAibomSrc,
+    aibomTsSrc;
   try {
     bundleExporterSrc = stripComments(readFileSync(bundleExporterPath, 'utf8'));
     canonicalHelperSrc = stripComments(readFileSync(canonicalHelperPath, 'utf8'));
@@ -323,6 +336,8 @@ function main() {
       readFileSync(auditCanonicalHelperPath, 'utf8'),
     );
     verifyTsSrc = stripComments(readFileSync(verifyTsPath, 'utf8'));
+    beAibomSrc = stripComments(readFileSync(beAibomAttestationPath, 'utf8'));
+    aibomTsSrc = stripComments(readFileSync(aibomTsPath, 'utf8'));
   } catch (error) {
     console.error(`::error::could not read a required source file: ${error.message}`);
     return 2;
@@ -632,6 +647,67 @@ function main() {
     }
   }
 
+  // ── H. AIBOM attestation envelope (AV-0003) ────────────────────────────
+  // A second consumer, `src/aibom.ts`, verifies be's `attested` AIBOM
+  // export. The envelope is JSON, not a signed preimage, but a renamed or
+  // re-typed field makes every genuine export fail (or a new field go
+  // unchecked), so all three parts are hard failures:
+  //   - `attestationFormat` literal and `AIBOM_SIGNING_DOMAIN` equal;
+  //   - every `AibomAttestationEnvelope` key is read by
+  //     `verifyAibomAttestation` or listed in `AIBOM_UNAUTHENTICATED_FIELDS`,
+  //     and the verifier knows no key be does not declare;
+  //   - the `signingAlgorithm` union equals `AIBOM_SIGNING_ALGORITHMS`.
+  const literals = (text) => new Set([...(text ?? '').matchAll(/'([^']*)'/g)].map((m) => m[1]));
+  const envelopeBody = extractFunctionBody(beAibomSrc, /\binterface AibomAttestationEnvelope\b[^{]*{/);
+  const verifyAibomBody = extractFunctionBody(aibomTsSrc, /\bexport function verifyAibomAttestation\(/);
+  if (!envelopeBody) {
+    failures.push('[H] AibomAttestationEnvelope interface not found in be/src/aibom/aibom-attestation.ts (renamed or moved?)');
+  } else if (!verifyAibomBody) {
+    failures.push('[H] verifyAibomAttestation() not found in src/aibom.ts (renamed or moved?)');
+  } else {
+    const constant = (src, name) => new RegExp(`\\bexport const ${name}\\b[^=]*=\\s*('[^']*'|\\[[^\\]]*\\])`).exec(src)?.[1] ?? null;
+    const pairs = [
+      ['attestationFormat', /\battestationFormat\s*:\s*('[^']*')\s*;/.exec(envelopeBody)?.[1], 'AIBOM_ATTESTATION_FORMAT', constant(aibomTsSrc, 'AIBOM_ATTESTATION_FORMAT')],
+      ['AIBOM_SIGNING_DOMAIN', constant(beAibomSrc, 'AIBOM_SIGNING_DOMAIN'), 'AIBOM_SIGNING_DOMAIN', constant(aibomTsSrc, 'AIBOM_SIGNING_DOMAIN')],
+    ];
+    for (const [beName, beValue, avName, avValue] of pairs) {
+      if (!beValue || !avValue || beValue !== avValue) {
+        failures.push(`[H] be ${beName} = ${beValue ?? '(not found)'} but src/aibom.ts ${avName} = ${avValue ?? '(not found)'}`);
+      }
+    }
+
+    // `readonly name: T` would otherwise hide `name` from the depth-1 walk.
+    const envelopeKeys = extractDepth1Keys(envelopeBody.replace(/\breadonly\s+(?=\w+\s*[?!]?\s*:)/g, ''), 0, { allowShorthand: false });
+    const destructured = /const\s*{([^}]*)}\s*=\s*env\s*;/.exec(verifyAibomBody)?.[1] ?? '';
+    const verifierKeys = new Set([
+      ...[...verifyAibomBody.matchAll(/(?<![\w.$])env\.([A-Za-z_]\w*)/g)].map((m) => m[1]),
+      ...destructured.split(',').map((part) => part.split(/[:=]/)[0].trim()).filter(Boolean),
+      ...literals(constant(aibomTsSrc, 'AIBOM_UNAUTHENTICATED_FIELDS')),
+    ]);
+    for (const failure of diffSets(
+      "be's AibomAttestationEnvelope",
+      envelopeKeys,
+      'src/aibom.ts (fields verifyAibomAttestation reads + AIBOM_UNAUTHENTICATED_FIELDS)',
+      verifierKeys,
+    )) {
+      failures.push(`[H] ${failure}`);
+    }
+
+    const union = /\bsigningAlgorithm\s*:\s*([^;]+);/.exec(envelopeBody)?.[1] ?? null;
+    if (!union || union.replace(/'[^']*'|\bnull\b|\|/g, '').trim() !== '') {
+      failures.push(`[H] be's signingAlgorithm is not an inline string-literal union (${union ?? 'not found'}); update this check`);
+    } else {
+      for (const failure of diffSets(
+        "be's AibomAttestationEnvelope.signingAlgorithm",
+        literals(union),
+        "src/aibom.ts's AIBOM_SIGNING_ALGORITHMS",
+        literals(constant(aibomTsSrc, 'AIBOM_SIGNING_ALGORITHMS')),
+      )) {
+        failures.push(`[H] ${failure}`);
+      }
+    }
+  }
+
   if (failures.length > 0) {
     console.error('audit-verifier <-> be bundle-schema contract drift detected:\n');
     for (const failure of failures) {
@@ -646,7 +722,10 @@ function main() {
         '`BundleRow` / `signableRow` to match, then re-run. A field entering the SIGNED preimage ' +
         'on one side only ([A]/[B]/[F]) means signatures are unverifiable offline for the affected ' +
         'rows — see SEC-PA01-DISCOVERED-01 (action-events) and SCAN-AV-01 (audit rows). A [E]/[G] ' +
-        'hard failure means a bundle every genuine producer emits will be rejected or mis-signed.',
+        'hard failure means a bundle every genuine producer emits will be rejected or mis-signed. ' +
+        'A [H] failure means the AIBOM envelope (be `AibomAttestationEnvelope` / ' +
+        '`AIBOM_SIGNING_DOMAIN` vs `src/aibom.ts`) drifted: update both, then refresh ' +
+        '`test-fixtures/aibom/` with `scripts/make-aibom-fixtures.cts`.',
     );
     return 1;
   }
@@ -658,6 +737,7 @@ function main() {
   console.log('ok  [E] platform-attestation required fields match (no hard drift); additive fields, if any, warned below');
   console.log('ok  [F] audit-row signed-preimage fields match (SignableAuditRow <-> signableRow)');
   console.log('ok  [G] audit-row wire fields match (serializeRow <-> BundleRow); optional not-yet-emitted fields are not drift');
+  console.log('ok  [H] AIBOM envelope matches (format, domain, AibomAttestationEnvelope keys, signingAlgorithm <-> src/aibom.ts)');
   for (const warning of warnings) {
     console.warn(`::warning::${warning}`);
   }

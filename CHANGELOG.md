@@ -62,6 +62,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 - `verifiedHttpTarget` wiring in `src/verify.ts` so bundle verification now
   covers the new HTTP-receipt evidence type end-to-end, called from
   `verifyTargetAck`.
+- `scripts/contract-drift.mjs` check [H] (AV-0003): fails CI when `be`'s
+  `AibomAttestationEnvelope` / `AIBOM_SIGNING_DOMAIN` and `src/aibom.ts` disagree on
+  the format or domain string, the envelope field set, or the `signingAlgorithm` set.
+  `test-fixtures/aibom/` regenerated from `be` DOCS-0590 (9-step procedure; since then
+  `be`'s reference verifier also makes the `untrusted_key` and `envelope_mismatch`
+  checks). The previous 7-step exports are kept in `archive-7-step/` and still verify.
+  Verification behaviour unchanged.
 
 ### Compatibility
 - The two new time bindings above are a deliberate **strictness increase**. They

@@ -51,6 +51,19 @@ describe('AV-0001 aibom — be-produced fixtures get be’s verdict', () => {
     }
     expect(reasonOf(Buffer.from('not json'))).toBe('unsupported_format');
   });
+
+  // AV-0003 — customers verify archives: exports be produced before
+  // DOCS-0590 carry the 7-step procedure (the envelope's unsigned label) and
+  // must keep verifying exactly as before.
+  it.each(['verified-ed25519', 'verified-ecdsa-p256'])('archived 7-step export %s still verifies', (name) => {
+    const archive = path.join(dir, 'archive-7-step');
+    const bytes = fs.readFileSync(path.join(archive, `${name}.attested.json`));
+    const oldPins = JSON.parse(fs.readFileSync(path.join(archive, 'trusted-keys.json'), 'utf8')) as typeof pins;
+    expect((envOf(bytes).procedure as string[]).length).toBe(7);
+    expect((envOf(load(name)).procedure as string[]).length).toBe(9);
+    expect(reasonOf(bytes, { trustedKeyFingerprints: [oldPins.ed25519, oldPins.ecdsaP256] })).toBe('verified');
+    expect(reasonOf(bytes)).toBe('untrusted_key');
+  });
 });
 
 describe('AV-0001 aibom — one-byte mutation sweep over the signed content', () => {

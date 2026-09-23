@@ -115,9 +115,10 @@ praesidia-verify aibom aibom-<aiSystemId>-v<n>.attested.json \
   --tenant-key-fingerprint <sha256hex> [--tenant-key-fingerprint <sha256hex> ...] [--json | --quiet]
 ```
 
-It runs the 7-step procedure the envelope carries (canonical JSON of `document` → SHA-256 must
+It runs the procedure the envelope carries (canonical JSON of `document` → SHA-256 must
 equal `digest`; Ed25519 or low-s ECDSA-P256 signature over `praesidia:aibom-snapshot:v1:<digest>`)
-and adds three fail-closed checks the written procedure does not make:
+and enforces three fail-closed checks. `be` DOCS-0590 wrote the first two into the procedure
+(7 steps became 9); the verifier already made them, so archived 7-step exports verify exactly as before:
 
 - **The signing key must be pinned by you.** The envelope ships its own `publicKey`, so checking
   the signature against it proves integrity, never origin: anyone can edit the document, re-hash
@@ -143,8 +144,8 @@ and adds three fail-closed checks the written procedure does not make:
 | `non_canonical_encoding` | Bytes differ from the canonical encoding — re-serialized or edited | 1 |
 | `unsupported_format` | Not a v1 envelope, unknown domain or algorithm, malformed field | 2 |
 
-Six of these verdicts are `be`'s own (`verifyAibomAttestation` in `be/src/aibom/aibom-attestation.ts`);
-`envelope_mismatch`, `untrusted_key` and `non_canonical_encoding` are this verifier's additions. For
+All but `non_canonical_encoding` are `be`'s own verdicts (`verifyAibomAttestation` in
+`be/src/aibom/aibom-attestation.ts`); `non_canonical_encoding` is this verifier's addition. For
 an unmodified export and a correct pin both verifiers agree. Not covered by the signature and never reported as verified: `snapshotId`, `version`,
 `generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`. AIBOM digests are not anchored
 (`be` reports `aibom_not_anchored`), so there is no Rekor step. Library use:
@@ -683,7 +684,10 @@ catch.
   against this package's `BundleActionEvent`/`BundleManifest`/`signableActionEvent`/
   `verifyManifest` on every PR to either repository, specifically prioritizing the fields
   that enter the SIGNED preimage — the exact class of bug that made action-event
-  signatures unverifiable for one release (`SEC-PA01-DISCOVERED-01`).
+  signatures unverifiable for one release (`SEC-PA01-DISCOVERED-01`). Check [H] (AV-0003)
+  diffs `be`'s AIBOM attestation envelope against `src/aibom.ts` the same way: format and
+  domain strings, the envelope field set (each read or declared unauthenticated) and the
+  `signingAlgorithm` set.
 
 ## Architecture
 
