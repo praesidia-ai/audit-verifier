@@ -30,6 +30,7 @@ node dist/cli.js <bundle.zip> --json                 # machine-readable VerifyRe
 node dist/cli.js <bundle.zip> --no-rekor             # skip offline Rekor receipt check
 node dist/cli.js <bundle.zip> --platform-key <file>  # trust an alternate pinned key
 node dist/cli.js --verify-set <bundle1.zip> <bundle2.zip> ...   # cross-bundle continuity (SCAN2-004)
+node dist/cli.js aibom <file.attested.json> --tenant-key-fingerprint <hex>  # AIBOM export (AV-0001)
 ```
 
 Exit codes and the `--quiet`/`--allow-legacy-unattested` flags are documented in

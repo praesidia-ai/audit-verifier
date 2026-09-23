@@ -27,6 +27,8 @@ src/platform-pubkey.ts    # PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FI
 src/http-receipt.ts       # HTTP_RECEIPT_VERSION (:4), httpTargetKeyFingerprint (:32),
                           # httpRequestCommitment (:37), verifyHttpReceipt (:41) — verifies
                           # independently-pinned HTTP target receipts (README.md:877)
+src/aibom.ts              # verifyAibomAttestation — be's attested AIBOM envelope
+                          # (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001)
 src/index.ts              # package's public export surface
 ```
 
@@ -48,6 +50,8 @@ code must produce and check the **exact same bytes** `be` produces when it expor
 - `src/crypto.ts` ↔ `be`'s `CryptoUtilsService` (AGV-003) — same DER prefixes.
 - `src/jcs-canonical.ts` ↔ `be`'s `canonicalJson` (AGV-030) — same key-ordering rules, including
   the `__proto__`-key edge case (SCAN-AV-02, pinned by `433ebef`).
+- `src/aibom.ts` ↔ `be`'s `aibom-canonical.ts` + `aibom-attestation.ts` (BE-0155) — fixtures in
+  `test-fixtures/aibom/` are real `be` exports from `scripts/make-aibom-fixtures.cts`.
 - Merkle root computation ↔ `be`'s `MerkleRootService` (AGV-033) — same RFC 6962
   domain-separation bytes.
 - `src/zip.ts`'s reader ↔ `be`'s `BundleExporterService`'s `ZipStreamWriter` (AGV-035) — reads

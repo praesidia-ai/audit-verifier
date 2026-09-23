@@ -25,6 +25,7 @@ import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport, type ComponentResult } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
+import { verifyAibomAttestation, MAX_AIBOM_ENVELOPE_BYTES } from './aibom.js';
 
 interface CliArgs {
   bundlePath: string | null;
@@ -54,6 +55,7 @@ const HELP = `praesidia-verify — offline verifier for Praesidia compliance bun
 USAGE
   praesidia-verify <bundle.zip> [options]
   praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
+  praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex> [...]
 
   SCAN2-004 — \`verify-set\` checks that TWO OR MORE bundles for the same
   org form one continuous history: it sorts them by manifest \`from\`,
@@ -65,6 +67,15 @@ USAGE
   caught, not just a date gap). Every discontinuity is a NAMED finding —
   never silence. Does not change the single-bundle command above in any
   way.
+
+  AV-0001 — \`aibom\` verifies one attested AIBOM export
+  (praesidia-aibom-attestation/v1): the document digest, the Ed25519 /
+  ECDSA-P256 signature, and that the embedded public key hashes to a
+  --tenant-key-fingerprint obtained independently of the file (e.g. the
+  keyVersions[].fingerprint in a verified compliance bundle's platform
+  attestation for the same org). Repeat the flag to pin several key
+  versions. Accepts --json and --quiet. Exit 0 verified, 1 any failed
+  check, 2 I/O, usage or unsupported-format error.
 
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
@@ -918,9 +929,61 @@ async function main(): Promise<number> {
  * single-bundle `main()` unchanged.
  */
 function runCli(): Promise<number> {
+  if (process.argv[2] === 'aibom') return mainAibom(process.argv.slice(3));
   return process.argv[2] === 'verify-set'
     ? mainVerifySet(process.argv.slice(3))
     : main();
+}
+
+/** AV-0001 — `aibom <envelope> --tenant-key-fingerprint <hex>...`; see HELP. */
+async function mainAibom(argv: string[]): Promise<number> {
+  const usage = (msg: string): number => {
+    process.stderr.write(`error: ${msg}\n\n${HELP}`);
+    return 2;
+  };
+  const pins: string[] = [];
+  const files: string[] = [];
+  let json = false;
+  let quiet = false;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!;
+    if (arg === '--json') json = true;
+    else if (arg === '--quiet') quiet = true;
+    else if (arg === '--help' || arg === '-h') {
+      process.stdout.write(HELP);
+      return 0;
+    } else if (arg === '--tenant-key-fingerprint') {
+      const value = argv[(i += 1)] ?? '';
+      if (!/^[0-9a-fA-F]{64}$/.test(value)) {
+        return usage('--tenant-key-fingerprint requires a sha256 hex digest (64 characters)');
+      }
+      pins.push(value.toLowerCase());
+    } else if (arg.startsWith('-')) return usage(`unknown option: ${arg}`);
+    else files.push(arg);
+  }
+  if (files.length !== 1) return usage('aibom requires exactly one envelope path');
+  // Fail closed: the embedded key alone proves integrity, never origin.
+  if (pins.length === 0) return usage('aibom requires --tenant-key-fingerprint <sha256hex>');
+  let bytes: Buffer;
+  try {
+    bytes = await readRegularFileBounded(path.resolve(files[0]!), MAX_AIBOM_ENVELOPE_BYTES, 'envelope');
+  } catch (err) {
+    process.stderr.write(`error: cannot read envelope: ${(err as Error).message}\n`);
+    return 2;
+  }
+  const report = verifyAibomAttestation(bytes, { trustedKeyFingerprints: pins });
+  if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  else if (quiet) process.stdout.write(report.valid ? 'OK\n' : 'FAIL\n');
+  else {
+    process.stdout.write(
+      `AIBOM attestation: ${report.valid ? 'OK' : 'FAIL'} (${report.reason})\n${report.detail}\n` +
+        (report.valid
+          ? 'NOTE: snapshotId, version, generatedAt, signedAt, signingKeyVersion and procedure are not covered by the signature.\n'
+          : ''),
+    );
+  }
+  if (report.valid) return 0;
+  return report.reason === 'unsupported_format' ? 2 : 1;
 }
 
 runCli().then(

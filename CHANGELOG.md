@@ -33,6 +33,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- `praesidia-verify aibom <file> --tenant-key-fingerprint <sha256hex>` and
+  `verifyAibomAttestation()` (AV-0001) — offline verification of `be`'s attested
+  AIBOM export (`praesidia-aibom-attestation/v1`) with `be`'s verdict set, plus three
+  fail-closed checks `be`'s reference verifier does not make: the embedded key must
+  match a caller-supplied pin (`untrusted_key`), envelope identity must match the
+  signed document (`envelope_mismatch`), and the file must be the exact canonical
+  export (`non_canonical_encoding`). New surface only; bundle verification unchanged.
 - `--platform-key-fingerprint <sha256hex>` (SEC-2026-09-12 MCPSDK-03) — pins the
   `--platform-key` file to a digest obtained through a second channel; mismatch
   exits 2. The CLI now also prints a `WARNING:` line on every run that supplies

@@ -25,6 +25,8 @@ npx @praesidia/audit-verifier bundle.zip
 
 ```bash
 praesidia-verify <bundle.zip> [options]
+praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex>
+               # AIBOM attested export — see "AIBOM attestations" below
 
 Options:
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
@@ -101,6 +103,51 @@ Detecting a **withheld** bundle (one never handed to the auditor at all,
 as opposed to a gap visible across two bundles the auditor does have) is
 out of scope for this mode — it needs a platform-side signed export ledger
 to reconcile against, which is a separate, larger design.
+
+## AIBOM attestations (`aibom`)
+
+`be`'s `attested` AIBOM export (`GET /organizations/:orgId/ai-systems/:aiSystemId/aibom/:snapshotId/export?format=attested`,
+envelope `praesidia-aibom-attestation/v1`) is verified offline, one file per run:
+
+```bash
+praesidia-verify aibom aibom-<aiSystemId>-v<n>.attested.json \
+  --tenant-key-fingerprint <sha256hex> [--tenant-key-fingerprint <sha256hex> ...] [--json | --quiet]
+```
+
+It runs the 7-step procedure the envelope carries (canonical JSON of `document` → SHA-256 must
+equal `digest`; Ed25519 or low-s ECDSA-P256 signature over `praesidia:aibom-snapshot:v1:<digest>`)
+and adds three fail-closed checks the written procedure does not make:
+
+- **The signing key must be pinned by you.** The envelope ships its own `publicKey`, so checking
+  the signature against it proves integrity, never origin: anyone can edit the document, re-hash
+  it and re-sign with their own key. `--tenant-key-fingerprint` is the lowercase sha256 hex of the
+  tenant public-key bytes (raw 32 bytes for Ed25519, SPKI DER for P-256) — the value a compliance
+  bundle's platform attestation lists as `keyVersions[].fingerprint`, so a bundle this CLI has
+  verified for the same organization is a source independent of the AIBOM file. Repeat the flag
+  to pin several key versions (rotation). The flag is required; there is no unpinned mode.
+- **The envelope's `organizationId` / `aiSystemId` must equal the signed document's own fields.**
+- **The file must be the exact canonical export.** `be` emits canonical JSON and the UI downloads
+  it untouched. A re-serialized file (whitespace, re-escaping, duplicate keys that other JSON
+  readers may resolve differently than the digest did) fails.
+
+| `reason` | Meaning | Exit |
+|---|---|---|
+| `verified` | All checks hold | 0 |
+| `unsigned` | No signature (snapshot predates signing or the signer was down) — proves nothing about origin | 1 |
+| `digest_mismatch` | The document was altered after signing | 1 |
+| `envelope_mismatch` | Envelope identity differs from the signed document | 1 |
+| `key_unavailable` | No public key in the envelope (key version revoked or unknown at export) | 1 |
+| `untrusted_key` | The embedded key is not one you pinned | 1 |
+| `signature_invalid` | The signature does not verify under the pinned key | 1 |
+| `non_canonical_encoding` | Bytes differ from the canonical encoding — re-serialized or edited | 1 |
+| `unsupported_format` | Not a v1 envelope, unknown domain or algorithm, malformed field | 2 |
+
+Six of these verdicts are `be`'s own (`verifyAibomAttestation` in `be/src/aibom/aibom-attestation.ts`);
+`envelope_mismatch`, `untrusted_key` and `non_canonical_encoding` are this verifier's additions. For
+an unmodified export and a correct pin both verifiers agree. Not covered by the signature and never reported as verified: `snapshotId`, `version`,
+`generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`. AIBOM digests are not anchored
+(`be` reports `aibom_not_anchored`), so there is no Rekor step. Library use:
+`verifyAibomAttestation(bytes, { trustedKeyFingerprints })`.
 
 ## Verdict shape
 
