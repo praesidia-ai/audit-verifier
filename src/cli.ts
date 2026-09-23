@@ -25,7 +25,7 @@ import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport, type ComponentResult, type VerifyOptions } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
-import { verifyAibomAttestation, aibomTrustFromBundle, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
+import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
   bundlePath: string | null;
@@ -1005,7 +1005,8 @@ async function mainAibom(argv: string[]): Promise<number> {
       `AIBOM attestation: ${report.valid ? 'OK' : 'FAIL'} (${report.reason})\n${report.detail}\n` +
         pinNote +
         (report.valid
-          ? 'NOTE: snapshotId, version, generatedAt, signedAt, signingKeyVersion and procedure are not covered by the signature.\n'
+          ? `NOTE: ${AIBOM_UNAUTHENTICATED_FIELDS.join(', ')} are not covered by the signature.\n` +
+            'NOTE: AIBOM anchoring was NOT checked: an anchorStatus in the file is the exporting server\'s unsigned claim.\n'
           : ''),
     );
   }

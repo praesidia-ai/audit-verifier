@@ -69,6 +69,11 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `be`'s reference verifier also makes the `untrusted_key` and `envelope_mismatch`
   checks). The previous 7-step exports are kept in `archive-7-step/` and still verify.
   Verification behaviour unchanged.
+- `be`'s AIBOM anchor labels (AV-0004, be BE-0738): `anchorReference`, `anchorStatus`,
+  `anchoredAt` and `anchorReason` are declared unauthenticated. They are the server-resolved
+  anchor status, outside the signed document. They do not change the verdict, and no report
+  field describes an AIBOM anchor. The `aibom` human output lists them among the unsigned fields
+  and adds `NOTE: AIBOM anchoring was NOT checked`. Verification behaviour unchanged.
 
 ### Compatibility
 - The two new time bindings above are a deliberate **strictness increase**. They

@@ -13,7 +13,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { verifyAibomAttestation, type AibomVerdict } from '../aibom.js';
+import { AIBOM_UNAUTHENTICATED_FIELDS, verifyAibomAttestation, type AibomVerdict } from '../aibom.js';
 import { canonicalJson } from '../crypto.js';
 
 const dir = path.resolve(process.cwd(), 'test-fixtures/aibom');
@@ -173,6 +173,27 @@ describe('AV-0001 aibom — trust comes from the caller’s pin, never the bundl
   });
 });
 
+// AV-0004 — be BE-0738 adds the anchor status the SERVER resolved at export
+// time, outside the signed document. Anyone can write these labels.
+const genuineEd = load('verified-ed25519');
+const anchorLabels = {
+  anchorReference: 'audit:00000000-0000-4000-8000-000000000001',
+  anchorStatus: 'verified_rekor',
+  anchoredAt: '2026-09-23T00:00:00.000Z',
+  anchorReason: 'forged',
+};
+const labelled = canonicalJson({ ...envOf(genuineEd), ...anchorLabels });
+
+describe('AV-0004 aibom — be’s anchor labels are unsigned, never an anchor verdict', () => {
+  it('lists them as unauthenticated; they do not change the report, which says nothing of an anchor', () => {
+    expect(AIBOM_UNAUTHENTICATED_FIELDS).toEqual(expect.arrayContaining(Object.keys(anchorLabels)));
+    const report = verifyAibomAttestation(labelled, trusted);
+    expect(report.reason).toBe('verified');
+    expect(report).toEqual(verifyAibomAttestation(genuineEd, trusted));
+    expect(JSON.stringify(report)).not.toMatch(/anchor|rekor/i);
+  });
+});
+
 describe('AV-0001 aibom — CLI (`praesidia-verify aibom`)', () => {
   const cli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
   const run = (args: string[]): { code: number; stdout: string } => {
@@ -205,6 +226,21 @@ describe('AV-0001 aibom — CLI (`praesidia-verify aibom`)', () => {
     const wrong = run([file('verified-ed25519'), '--tenant-key-fingerprint', pins.ecdsaP256, '--json']);
     expect(wrong.code).toBe(1);
     expect(JSON.parse(wrong.stdout).reason).toBe('untrusted_key');
+  });
+
+  it('AV-0004: an envelope claiming verified_rekor verifies, and the CLI says the anchor was not checked', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-0004-'));
+    try {
+      const p = path.join(tmp, 'a.json');
+      fs.writeFileSync(p, labelled);
+      const human = run([p, '--tenant-key-fingerprint', pins.ed25519]);
+      expect(human.code).toBe(0);
+      expect(human.stdout).toMatch(/anchorStatus, anchoredAt, anchorReason are not covered by the signature/);
+      expect(human.stdout).toMatch(/^NOTE: AIBOM anchoring was NOT checked/m);
+      expect(run([p, '--tenant-key-fingerprint', pins.ed25519, '--json']).stdout).not.toMatch(/anchor|rekor/i);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it('exits 2 without a pin and on an unsupported format', () => {

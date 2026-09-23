@@ -36,8 +36,14 @@ export const AIBOM_SIGNING_ALGORITHMS: readonly BundleSignatureAlgorithm[] = ['E
  * AV-0003 — envelope fields the signature does not cover, so never reported
  * as verified. Every field of be's `AibomAttestationEnvelope` must be either
  * read by {@link verifyAibomAttestation} or listed here (contract-drift [H]).
+ * AV-0004: the `anchor*` labels (be BE-0738) are the anchor status the
+ * exporting server resolved, not a proof. This verifier does not check
+ * AIBOM anchoring, so it never reports one.
  */
-export const AIBOM_UNAUTHENTICATED_FIELDS = ['snapshotId', 'version', 'generatedAt', 'signedAt', 'signingKeyVersion', 'procedure'] as const;
+export const AIBOM_UNAUTHENTICATED_FIELDS = [
+  'snapshotId', 'version', 'generatedAt', 'signedAt', 'signingKeyVersion', 'procedure',
+  'anchorReference', 'anchorStatus', 'anchoredAt', 'anchorReason',
+] as const;
 
 export type AibomVerdict =
   | 'verified'

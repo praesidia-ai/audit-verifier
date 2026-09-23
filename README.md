@@ -147,8 +147,15 @@ and enforces three fail-closed checks. `be` DOCS-0590 wrote the first two into t
 All but `non_canonical_encoding` are `be`'s own verdicts (`verifyAibomAttestation` in
 `be/src/aibom/aibom-attestation.ts`); `non_canonical_encoding` is this verifier's addition. For
 an unmodified export and a correct pin both verifiers agree. Not covered by the signature and never reported as verified: `snapshotId`, `version`,
-`generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`. AIBOM digests are not anchored
-(`be` reports `aibom_not_anchored`), so there is no Rekor step. Library use:
+`generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`, `anchorReference`, `anchorStatus`,
+`anchoredAt`, `anchorReason`.
+
+**AIBOM anchoring is not checked.** When anchoring is on, `be` adds the four `anchor*` labels
+(BE-0738): the digest's anchor status as the exporting server resolved it at export time. They
+sit outside the signed `document`, so anyone can write `"anchorStatus":"verified_rekor"` into a
+file. This verifier has no Rekor step for AIBOMs and never reports an AIBOM anchor. The labels do
+not change the verdict, the report says nothing about an anchor, and the human output prints
+`NOTE: AIBOM anchoring was NOT checked`. Library use:
 `verifyAibomAttestation(bytes, { trustedKeyFingerprints })`.
 
 ### Getting the pin from a verified compliance bundle (AV-0002)
