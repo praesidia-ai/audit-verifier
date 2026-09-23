@@ -8,7 +8,8 @@
  *   decoded bytes — the same fingerprint a compliance bundle's platform
  *   attestation lists per tenant key version) to a caller-supplied pin.
  *   Checking the signature only against the key the bundle ships would let
- *   anyone re-sign an edited document with their own key.
+ *   anyone re-sign an edited document with their own key. With
+ *   `organizationId` set (AV-0002), a document naming another org also fails.
  * - `envelope_mismatch`: the envelope's `organizationId`/`aiSystemId` are
  *   unsigned; they must equal the signed document's own fields.
  * - `non_canonical_encoding`: be emits the canonical bytes; anything else
@@ -20,6 +21,7 @@
  * `procedure`.
  */
 import { canonicalJson, decodeBase64Strict, sha256, verifySignature, type BundleSignatureAlgorithm } from './crypto.js';
+import type { VerifyReport } from './verify.js';
 
 export const AIBOM_ATTESTATION_FORMAT = 'praesidia-aibom-attestation/v1';
 export const AIBOM_SIGNING_DOMAIN = 'praesidia:aibom-snapshot:v1';
@@ -40,6 +42,12 @@ export type AibomVerdict =
 export interface AibomVerifyOptions {
   /** sha256 hex of each trusted tenant public key, obtained independently of the bundle. */
   trustedKeyFingerprints: readonly string[];
+  /**
+   * AV-0002 — the organization those fingerprints belong to. When set, the
+   * signed document's `organizationId` must equal it (`untrusted_key`
+   * otherwise): a key pinned for one org is not trusted for another's AIBOM.
+   */
+  organizationId?: string;
 }
 
 export interface AibomVerifyReport {
@@ -101,6 +109,9 @@ export function verifyAibomAttestation(
     }
     const key = decodeBase64Strict(publicKey)!;
     const fingerprint = sha256(key).toString('hex');
+    if (options.organizationId !== undefined && doc.organizationId !== options.organizationId) {
+      return fail('untrusted_key', `pinned keys belong to org ${options.organizationId}, but the signed document names org ${String(doc.organizationId)}`, true, fingerprint);
+    }
     if (!options.trustedKeyFingerprints.some((pin) => pin.toLowerCase() === fingerprint)) {
       return fail('untrusted_key', `embedded public key sha256 ${fingerprint} is not a pinned tenant key`, true, fingerprint);
     }
@@ -121,4 +132,21 @@ export function verifyAibomAttestation(
   } catch (err) {
     return fail('unsupported_format', `unreadable envelope: ${(err as Error).message}`);
   }
+}
+
+/**
+ * AV-0002 — the pin for {@link verifyAibomAttestation}, taken from a
+ * compliance-bundle report this package produced. Throws (fail closed)
+ * unless the whole bundle is `valid` AND carries a verified platform
+ * attestation. REVOKED keys are never pinned: an AIBOM signing time is
+ * unauthenticated, so a signature cannot be dated before the revocation.
+ */
+export function aibomTrustFromBundle(report: VerifyReport): Required<AibomVerifyOptions> {
+  if (report.status !== 'valid') throw new Error(`audit bundle status is ${report.status}, not valid`);
+  const keys = report.bundle.attestedTenantKeys;
+  if (!keys) throw new Error('audit bundle has no verified platform attestation, so its tenant keys are not attested');
+  return {
+    trustedKeyFingerprints: keys.filter((k) => k.status !== 'REVOKED').map((k) => k.fingerprint),
+    organizationId: report.bundle.orgId,
+  };
 }

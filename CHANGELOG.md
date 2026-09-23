@@ -40,6 +40,14 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   match a caller-supplied pin (`untrusted_key`), envelope identity must match the
   signed document (`envelope_mismatch`), and the file must be the exact canonical
   export (`non_canonical_encoding`). New surface only; bundle verification unchanged.
+- AIBOM pin from a verified bundle (AV-0002). `VerifyReport.bundle.attestedTenantKeys`
+  (`keyVersion`, `status`, `fingerprint`, `attestedAt`) and a `tenant key v<n>:` line in the human report,
+  present only when the platform attestation verified. `praesidia-verify aibom <file>
+  --audit-bundle <bundle.zip> [bundle options]` and `aibomTrustFromBundle(report)` take the pin
+  from a bundle only when its report is `valid` and platform-attested. They pin its non-REVOKED
+  keys and require the AIBOM's signed `organizationId` to equal the bundle org. The new optional
+  `AibomVerifyOptions.organizationId` enforces that as `untrusted_key`. Additive: existing
+  bundles verify exactly as before, and an unset `organizationId` changes nothing.
 - `--platform-key-fingerprint <sha256hex>` (SEC-2026-09-12 MCPSDK-03) — pins the
   `--platform-key` file to a digest obtained through a second channel; mismatch
   exits 2. The CLI now also prints a `WARNING:` line on every run that supplies

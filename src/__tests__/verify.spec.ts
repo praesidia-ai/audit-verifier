@@ -49,6 +49,7 @@ import {
   readZip,
 } from '../zip.js';
 import { verifyRekorReceipt } from '../rekor.js';
+import { aibomTrustFromBundle, verifyAibomAttestation } from '../aibom.js';
 
 // Most fixtures intentionally model pre-attestation legacy bundles. Their
 // crypto assertions opt in explicitly; dedicated trust-boundary tests below
@@ -3072,6 +3073,117 @@ describe('verifyBundle', () => {
       expect(report.platformAttestation.reason).toBe(
         'missing_legacy_explicitly_allowed',
       );
+    });
+
+    /**
+     * AV-0002 — a verified bundle's platform attestation is the customer's
+     * verifier-produced source for the AIBOM tenant-key pin. The AIBOM is
+     * be's real `verified-ed25519` export, re-homed to an org and re-signed
+     * with `buildFixtureBundle`'s tenant key (be's generator discards its
+     * private keys, so no be fixture shares a key with a bundle fixture).
+     */
+    describe('AV-0002 — the verified bundle is the AIBOM tenant-key pin source', () => {
+      const bundleKey = keypairFromSeed(Buffer.alloc(32, 7));
+      const bundleOrg = '00000000-0000-0000-0000-000000000001';
+      const otherOrg = '4b0f5a3e-2c1d-4e8f-9a7b-0c1d2e3f4a5b';
+      const fp = sha256(bundleKey.publicKey).toString('hex');
+      function aibomFor(orgId: string): Buffer {
+        const env = JSON.parse(
+          fs.readFileSync(path.resolve(process.cwd(), 'test-fixtures/aibom/verified-ed25519.attested.json'), 'utf8'),
+        ) as Record<string, unknown> & { document: Record<string, unknown>; digest: string };
+        env.organizationId = orgId;
+        env.document = { ...env.document, organizationId: orgId };
+        env.digest = sha256(canonicalJson(env.document)).toString('hex');
+        env.publicKey = Buffer.from(bundleKey.publicKey).toString('base64');
+        env.signature = signEd25519(Buffer.from(`praesidia:aibom-snapshot:v1:${env.digest}`), bundleKey.privateKey);
+        return canonicalJson(env);
+      }
+      async function attested(opts: { tamperSignature?: boolean } = {}) {
+        const { zip, platformPublicKeyDerB64 } = buildBundleWithPlatformAttestation(opts);
+        const report = await verifyBundleStrict(zip, { noRekor: true, platformPublicKeyDerB64 });
+        return { zip, platformPublicKeyDerB64, report };
+      }
+      async function unattested() {
+        return verifyBundleStrict(buildBundleWithTamper({}).zip, { noRekor: true, allowLegacyUnattested: true });
+      }
+
+      it('lists keyVersion, status and fingerprint only when the platform attestation verified', async () => {
+        expect((await attested()).report.bundle.attestedTenantKeys).toEqual([
+          { keyVersion: 1, status: 'ACTIVE', fingerprint: fp, attestedAt: '2026-05-01T01:00:00.000Z' },
+        ]);
+        expect((await attested({ tamperSignature: true })).report.bundle.attestedTenantKeys).toBeUndefined();
+        const legacy = await unattested();
+        expect(legacy.ok).toBe(true);
+        expect(legacy.bundle.attestedTenantKeys).toBeUndefined();
+      });
+
+      it('verifies an AIBOM of the same org; another org fails closed even though the key matches', async () => {
+        const trust = aibomTrustFromBundle((await attested()).report);
+        expect(trust).toEqual({ trustedKeyFingerprints: [fp], organizationId: bundleOrg });
+        expect(verifyAibomAttestation(aibomFor(bundleOrg), trust)).toMatchObject({ valid: true, reason: 'verified' });
+        // Same key, other org: the fingerprint alone would accept it.
+        expect(verifyAibomAttestation(aibomFor(otherOrg), { trustedKeyFingerprints: [fp] }).valid).toBe(true);
+        const cross = verifyAibomAttestation(aibomFor(otherOrg), trust);
+        expect(cross).toMatchObject({ valid: false, reason: 'untrusted_key' });
+        expect(cross.detail).toContain(`pinned keys belong to org ${bundleOrg}`);
+      });
+
+      it('refuses an unattested, invalid or incomplete bundle as a pin source, and never pins a REVOKED key', async () => {
+        const legacy = await unattested();
+        const broken = (await attested({ tamperSignature: true })).report;
+        expect(() => aibomTrustFromBundle(legacy)).toThrow(/no verified platform attestation/);
+        expect(() => aibomTrustFromBundle(broken)).toThrow(/status is invalid/);
+        const { report } = await attested();
+        expect(() => aibomTrustFromBundle({ ...report, status: 'incomplete' })).toThrow(/status is incomplete/);
+        const revoked = aibomTrustFromBundle({
+          ...report,
+          bundle: { ...report.bundle, attestedTenantKeys: [{ ...report.bundle.attestedTenantKeys![0]!, status: 'REVOKED' }] },
+        });
+        expect(revoked.trustedKeyFingerprints).toEqual([]);
+        expect(verifyAibomAttestation(aibomFor(bundleOrg), revoked).reason).toBe('untrusted_key');
+      });
+
+      it('CLI: `aibom --audit-bundle` pins from the verified bundle and fails closed otherwise', async () => {
+        const cliPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
+        expect(fs.existsSync(cliPath), 'npm run build must run before npm test').toBe(true);
+        const run = (args: string[]) => {
+          try {
+            return { code: 0, stdout: execFileSync(process.execPath, [cliPath, ...args], { encoding: 'utf8', stdio: 'pipe' }), stderr: '' };
+          } catch (e) {
+            const err = e as { status: number; stdout: string; stderr: string };
+            return { code: err.status, stdout: err.stdout, stderr: err.stderr };
+          }
+        };
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-0002-'));
+        try {
+          const { zip, platformPublicKeyDerB64 } = await attested();
+          const f = (name: string, data: Buffer) => (fs.writeFileSync(path.join(tmp, name), data), path.join(tmp, name));
+          const bundle = f('bundle.zip', zip);
+          const legacy = f('legacy.zip', buildBundleWithTamper({}).zip);
+          const key = f('platform.der', Buffer.from(platformPublicKeyDerB64, 'base64'));
+          const same = f('same.json', aibomFor(bundleOrg));
+          const other = f('other.json', aibomFor(otherOrg));
+          const trustFlags = ['--no-rekor', '--platform-key', key];
+
+          expect(run([bundle, ...trustFlags]).stdout).toContain(`tenant key v1:  ACTIVE  sha256 ${fp} (platform-attested 2026-05-01T01:00:00.000Z)`);
+          expect(run(['aibom', same, '--audit-bundle', bundle, ...trustFlags, '--quiet'])).toMatchObject({ code: 0, stdout: 'OK\n' });
+          const human = run(['aibom', same, '--audit-bundle', bundle, ...trustFlags]).stdout;
+          expect(human).toContain(`pin source: verified audit bundle for org ${bundleOrg}: 1 non-revoked tenant key(s), status as attested at 2026-05-01T01:00:00.000Z`);
+          expect(human).toContain('WARNING: platform key supplied by caller');
+          const cross = run(['aibom', other, '--audit-bundle', bundle, ...trustFlags, '--json']);
+          expect(cross.code).toBe(1);
+          expect(JSON.parse(cross.stdout).reason).toBe('untrusted_key');
+          for (const extra of [[], ['--allow-legacy-unattested']]) {
+            const res = run(['aibom', same, '--audit-bundle', legacy, '--no-rekor', ...extra]);
+            expect(res.code).toBe(1);
+            expect(res.stderr).toContain('--audit-bundle is not a pin source');
+          }
+          expect(run(['aibom', same, '--audit-bundle', bundle, '--tenant-key-fingerprint', fp]).code).toBe(2);
+          expect(run(['aibom', same, '--tenant-key-fingerprint', fp, '--no-rekor']).code).toBe(2);
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
+      });
     });
   });
 

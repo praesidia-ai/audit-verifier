@@ -22,10 +22,10 @@ import * as fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { verifyBundle, type VerifyReport, type ComponentResult } from './verify.js';
+import { verifyBundle, type VerifyReport, type ComponentResult, type VerifyOptions } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
-import { verifyAibomAttestation, MAX_AIBOM_ENVELOPE_BYTES } from './aibom.js';
+import { verifyAibomAttestation, aibomTrustFromBundle, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
   bundlePath: string | null;
@@ -56,6 +56,7 @@ USAGE
   praesidia-verify <bundle.zip> [options]
   praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
   praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex> [...]
+  praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
 
   SCAN2-004 — \`verify-set\` checks that TWO OR MORE bundles for the same
   org form one continuous history: it sorts them by manifest \`from\`,
@@ -76,6 +77,12 @@ USAGE
   attestation for the same org). Repeat the flag to pin several key
   versions. Accepts --json and --quiet. Exit 0 verified, 1 any failed
   check, 2 I/O, usage or unsupported-format error.
+
+  AV-0002 — \`--audit-bundle\` replaces the pin: the compliance bundle is
+  verified first (with --no-rekor / --platform-key / --platform-key-
+  fingerprint / --target-keys as above) and must be valid AND
+  platform-attested, else exit 1; its non-REVOKED attested tenant keys
+  become the pins, and the AIBOM must name the bundle's org.
 
 OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
@@ -339,6 +346,10 @@ function printReport(
       `sealed purges:   ${report.bundle.sealedPurgesVerified}/${report.bundle.sealedPurgesSeen} (verified/seen)`,
     );
   }
+  // AV-0002 — present only when the platform attestation verified.
+  for (const k of report.bundle.attestedTenantKeys ?? []) {
+    lines.push(`tenant key v${k.keyVersion}:  ${k.status.padEnd(7)} sha256 ${k.fingerprint} (platform-attested ${k.attestedAt})`);
+  }
   lines.push('');
   lines.push(fmtComponent('manifest          ', report.manifest));
   lines.push(fmtComponent('row signatures    ', report.rowSignatures));
@@ -479,6 +490,27 @@ async function resolvePlatformPublicKeyDerB64(
     }
   }
   return der.toString('base64');
+}
+
+/** Every mode that verifies a bundle: `VerifyOptions` from the common flags. Throws on a bad key file. */
+async function bundleVerifyOptions(flags: CommonFlags): Promise<VerifyOptions> {
+  if (!flags.platformKeyPath && flags.platformKeyFingerprint) {
+    throw new Error('--platform-key-fingerprint requires --platform-key');
+  }
+  const load = async <T>(what: string, read: () => Promise<T>): Promise<T> =>
+    read().catch((err: Error) => {
+      throw new Error(`cannot load ${what}: ${err.message}`);
+    });
+  return {
+    noRekor: flags.noRekor,
+    allowLegacyUnattested: flags.allowLegacyUnattested,
+    ...(flags.platformKeyPath
+      ? { platformPublicKeyDerB64: await load('platform key', () => resolvePlatformPublicKeyDerB64(flags.platformKeyPath!, flags.platformKeyFingerprint)) }
+      : {}),
+    ...(flags.targetKeysPath
+      ? { targetPublicKeys: await load('target keys', () => resolveTargetPublicKeys(flags.targetKeysPath!)) }
+      : {}),
+  };
 }
 
 /** Shared by single-bundle mode and `verify-set` — loads/validates `--target-keys`. */
@@ -752,32 +784,12 @@ async function mainVerifySet(argv: string[]): Promise<number> {
     return 0;
   }
 
-  let platformPublicKeyDerB64: string | undefined;
-  if (!args.platformKeyPath && args.platformKeyFingerprint) {
-    process.stderr.write(
-      'error: --platform-key-fingerprint requires --platform-key\n',
-    );
+  let options: VerifyOptions;
+  try {
+    options = await bundleVerifyOptions(args);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
     return 2;
-  }
-  if (args.platformKeyPath) {
-    try {
-      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(
-        args.platformKeyPath,
-        args.platformKeyFingerprint,
-      );
-    } catch (err) {
-      process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
-      return 2;
-    }
-  }
-  let targetPublicKeys: Record<string, string> | undefined;
-  if (args.targetKeysPath) {
-    try {
-      targetPublicKeys = await resolveTargetPublicKeys(args.targetKeysPath);
-    } catch (err) {
-      process.stderr.write(`error: cannot load target keys: ${(err as Error).message}\n`);
-      return 2;
-    }
   }
 
   const entries: Array<{ path: string; report: VerifyReport }> = [];
@@ -792,12 +804,7 @@ async function mainVerifySet(argv: string[]): Promise<number> {
       return 2;
     }
     try {
-      const report = await verifyBundle(buffer, {
-        noRekor: args.noRekor,
-        ...(targetPublicKeys ? { targetPublicKeys } : {}),
-        allowLegacyUnattested: args.allowLegacyUnattested,
-        ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
-      });
+      const report = await verifyBundle(buffer, options);
       entries.push({ path: bundlePath, report });
     } catch (err) {
       process.stderr.write(
@@ -857,40 +864,15 @@ async function main(): Promise<number> {
     return 2;
   }
   let report: VerifyReport;
-  let platformPublicKeyDerB64: string | undefined;
-  if (!args.platformKeyPath && args.platformKeyFingerprint) {
-    process.stderr.write(
-      'error: --platform-key-fingerprint requires --platform-key\n',
-    );
+  let options: VerifyOptions;
+  try {
+    options = await bundleVerifyOptions(args);
+  } catch (err) {
+    process.stderr.write(`error: ${(err as Error).message}\n`);
     return 2;
   }
-  if (args.platformKeyPath) {
-    try {
-      platformPublicKeyDerB64 = await resolvePlatformPublicKeyDerB64(
-        args.platformKeyPath,
-        args.platformKeyFingerprint,
-      );
-    } catch (err) {
-      process.stderr.write(`error: cannot load platform key: ${(err as Error).message}\n`);
-      return 2;
-    }
-  }
-  let targetPublicKeys: Record<string, string> | undefined;
-  if (args.targetKeysPath) {
-    try {
-      targetPublicKeys = await resolveTargetPublicKeys(args.targetKeysPath);
-    } catch (err) {
-      process.stderr.write(`error: cannot load target keys: ${(err as Error).message}\n`);
-      return 2;
-    }
-  }
   try {
-    report = await verifyBundle(buffer, {
-      noRekor: args.noRekor,
-      ...(targetPublicKeys ? { targetPublicKeys } : {}),
-      allowLegacyUnattested: args.allowLegacyUnattested,
-      ...(platformPublicKeyDerB64 ? { platformPublicKeyDerB64 } : {}),
-    });
+    report = await verifyBundle(buffer, options);
   } catch (err) {
     // verifyBundle throws ONLY on I/O / format errors. Verification
     // failures come through as `report.ok === false`.
@@ -935,35 +917,54 @@ function runCli(): Promise<number> {
     : main();
 }
 
-/** AV-0001 — `aibom <envelope> --tenant-key-fingerprint <hex>...`; see HELP. */
+/**
+ * AV-0001 — `aibom <envelope> --tenant-key-fingerprint <hex>...`; AV-0002 —
+ * or `--audit-bundle <zip> [bundle trust flags]` as the pin source. See HELP.
+ */
 async function mainAibom(argv: string[]): Promise<number> {
   const usage = (msg: string): number => {
     process.stderr.write(`error: ${msg}\n\n${HELP}`);
     return 2;
   };
   const pins: string[] = [];
-  const files: string[] = [];
-  let json = false;
-  let quiet = false;
+  let auditBundle: string | null = null;
+  const rest: string[] = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
-    if (arg === '--json') json = true;
-    else if (arg === '--quiet') quiet = true;
-    else if (arg === '--help' || arg === '-h') {
-      process.stdout.write(HELP);
-      return 0;
-    } else if (arg === '--tenant-key-fingerprint') {
+    if (arg === '--tenant-key-fingerprint') {
       const value = argv[(i += 1)] ?? '';
       if (!/^[0-9a-fA-F]{64}$/.test(value)) {
         return usage('--tenant-key-fingerprint requires a sha256 hex digest (64 characters)');
       }
       pins.push(value.toLowerCase());
-    } else if (arg.startsWith('-')) return usage(`unknown option: ${arg}`);
-    else files.push(arg);
+    } else if (arg === '--audit-bundle') {
+      auditBundle = argv[(i += 1)] ?? '';
+      if (auditBundle === '' || auditBundle.startsWith('-')) return usage('--audit-bundle requires a file path');
+    } else rest.push(arg);
+  }
+  const flags = newCommonFlags();
+  const files: string[] = [];
+  try {
+    parseCommonArgs(rest, flags, files);
+  } catch (err) {
+    return usage((err as Error).message);
+  }
+  const { json, quiet } = flags;
+  if (flags.help) {
+    process.stdout.write(HELP);
+    return 0;
   }
   if (files.length !== 1) return usage('aibom requires exactly one envelope path');
   // Fail closed: the embedded key alone proves integrity, never origin.
-  if (pins.length === 0) return usage('aibom requires --tenant-key-fingerprint <sha256hex>');
+  if ((pins.length > 0) === (auditBundle !== null)) {
+    return usage('aibom requires exactly one pin source: --tenant-key-fingerprint <sha256hex> or --audit-bundle <bundle.zip>');
+  }
+  if (
+    auditBundle === null &&
+    (flags.noRekor || flags.allowLegacyUnattested || flags.platformKeyPath || flags.platformKeyFingerprint || flags.targetKeysPath)
+  ) {
+    return usage('bundle options require --audit-bundle');
+  }
   let bytes: Buffer;
   try {
     bytes = await readRegularFileBounded(path.resolve(files[0]!), MAX_AIBOM_ENVELOPE_BYTES, 'envelope');
@@ -971,12 +972,38 @@ async function mainAibom(argv: string[]): Promise<number> {
     process.stderr.write(`error: cannot read envelope: ${(err as Error).message}\n`);
     return 2;
   }
-  const report = verifyAibomAttestation(bytes, { trustedKeyFingerprints: pins });
+  let trust: AibomVerifyOptions = { trustedKeyFingerprints: pins };
+  let pinNote = '';
+  if (auditBundle !== null) {
+    let bundleReport: VerifyReport;
+    try {
+      const options = await bundleVerifyOptions(flags);
+      bundleReport = await verifyBundle(await readBundleFileBounded(path.resolve(auditBundle)), options);
+    } catch (err) {
+      process.stderr.write(`error: cannot verify --audit-bundle: ${(err as Error).message}\n`);
+      return 2;
+    }
+    try {
+      trust = aibomTrustFromBundle(bundleReport);
+    } catch (err) {
+      process.stderr.write(`error: --audit-bundle is not a pin source: ${(err as Error).message}\n`);
+      if (quiet && !json) process.stdout.write('FAIL\n');
+      return 1;
+    }
+    pinNote =
+      `pin source: verified audit bundle for org ${trust.organizationId}: ${trust.trustedKeyFingerprints.length} non-revoked tenant key(s), ` +
+      `status as attested at ${bundleReport.bundle.attestedTenantKeys![0]!.attestedAt}\n` +
+      (flags.platformKeyPath
+        ? 'WARNING: platform key supplied by caller — the pin is only as strong as the provenance of that key file.\n'
+        : '');
+  }
+  const report = verifyAibomAttestation(bytes, trust);
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else if (quiet) process.stdout.write(report.valid ? 'OK\n' : 'FAIL\n');
   else {
     process.stdout.write(
       `AIBOM attestation: ${report.valid ? 'OK' : 'FAIL'} (${report.reason})\n${report.detail}\n` +
+        pinNote +
         (report.valid
           ? 'NOTE: snapshotId, version, generatedAt, signedAt, signingKeyVersion and procedure are not covered by the signature.\n'
           : ''),

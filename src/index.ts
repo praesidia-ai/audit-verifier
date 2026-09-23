@@ -16,10 +16,11 @@ export type {
   VerifyResourceLimits,
   AnchorReceiptEntry,
   ExpectedAnchorRoot,
+  AttestedTenantKey,
 } from './verify.js';
 
 export { verifyHttpReceipt, httpRequestCommitment, httpTargetKeyFingerprint } from './http-receipt.js';
 export type { SignedHttpReceipt, HttpReceiptStatement, HttpRequestEnvelope, HttpReceiptExpected } from './http-receipt.js';
 
-export { verifyAibomAttestation, AIBOM_ATTESTATION_FORMAT, AIBOM_SIGNING_DOMAIN } from './aibom.js';
+export { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_ATTESTATION_FORMAT, AIBOM_SIGNING_DOMAIN } from './aibom.js';
 export type { AibomVerdict, AibomVerifyOptions, AibomVerifyReport } from './aibom.js';

@@ -26,6 +26,7 @@ npx @praesidia/audit-verifier bundle.zip
 ```bash
 praesidia-verify <bundle.zip> [options]
 praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex>
+praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
                # AIBOM attested export — see "AIBOM attestations" below
 
 Options:
@@ -124,7 +125,7 @@ and adds three fail-closed checks the written procedure does not make:
   tenant public-key bytes (raw 32 bytes for Ed25519, SPKI DER for P-256) — the value a compliance
   bundle's platform attestation lists as `keyVersions[].fingerprint`, so a bundle this CLI has
   verified for the same organization is a source independent of the AIBOM file. Repeat the flag
-  to pin several key versions (rotation). The flag is required; there is no unpinned mode.
+  to pin several key versions (rotation). A pin source is required; there is no unpinned mode.
 - **The envelope's `organizationId` / `aiSystemId` must equal the signed document's own fields.**
 - **The file must be the exact canonical export.** `be` emits canonical JSON and the UI downloads
   it untouched. A re-serialized file (whitespace, re-escaping, duplicate keys that other JSON
@@ -137,7 +138,7 @@ and adds three fail-closed checks the written procedure does not make:
 | `digest_mismatch` | The document was altered after signing | 1 |
 | `envelope_mismatch` | Envelope identity differs from the signed document | 1 |
 | `key_unavailable` | No public key in the envelope (key version revoked or unknown at export) | 1 |
-| `untrusted_key` | The embedded key is not one you pinned | 1 |
+| `untrusted_key` | The embedded key is not one you pinned, or (with `--audit-bundle`) the document names another org | 1 |
 | `signature_invalid` | The signature does not verify under the pinned key | 1 |
 | `non_canonical_encoding` | Bytes differ from the canonical encoding — re-serialized or edited | 1 |
 | `unsupported_format` | Not a v1 envelope, unknown domain or algorithm, malformed field | 2 |
@@ -148,6 +149,30 @@ an unmodified export and a correct pin both verifiers agree. Not covered by the 
 `generatedAt`, `signedAt`, `signingKeyVersion`, `procedure`. AIBOM digests are not anchored
 (`be` reports `aibom_not_anchored`), so there is no Rekor step. Library use:
 `verifyAibomAttestation(bytes, { trustedKeyFingerprints })`.
+
+### Getting the pin from a verified compliance bundle (AV-0002)
+
+Verifying a compliance bundle prints each tenant key its platform attestation vouches for
+(`tenant key v<n>:  <status> sha256 <fingerprint> (platform-attested <issuedAt>)`; `--json`:
+`bundle.attestedTenantKeys[]` with `keyVersion`, `status`, `fingerprint`, `attestedAt`). These appear only when
+the platform attestation itself verified, never under `--allow-legacy-unattested`. Or let the CLI
+do both steps:
+
+```bash
+praesidia-verify aibom aibom-<aiSystemId>-v<n>.attested.json --audit-bundle bundle.zip \
+  [--no-rekor] [--platform-key <file> [--platform-key-fingerprint <sha256hex>]] [--target-keys <file>]
+```
+
+The bundle is verified first with the same trust options as the bundle command. It is a pin source
+only if its whole report is `valid` and it carries a verified platform attestation; otherwise the
+command exits 1 (`--audit-bundle is not a pin source` on stderr). Its attested ACTIVE and ROTATED
+keys become the pins; REVOKED keys never do, because an AIBOM's signing time is not authenticated,
+so a signature cannot be shown to predate the revocation. The signed document's `organizationId`
+must equal the bundle's org (`untrusted_key` otherwise). Key status is as of the attestation's
+platform-signed `issuedAt` (printed as `status as attested at`), not today: use a freshly exported
+bundle, since a key revoked after that time still pins. `--audit-bundle` and `--tenant-key-fingerprint` are mutually
+exclusive. Library use: `verifyAibomAttestation(bytes, aibomTrustFromBundle(await verifyBundle(zip)))`,
+which throws on a bundle that is not a pin source.
 
 ## Verdict shape
 

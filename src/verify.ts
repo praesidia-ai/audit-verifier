@@ -593,6 +593,17 @@ function reduceStatus(
   return 'valid';
 }
 
+/** AV-0002 — one entry of `VerifyReport.bundle.attestedTenantKeys`. */
+export interface AttestedTenantKey {
+  keyVersion: number;
+  /** Lifecycle as of `attestedAt`, not today. */
+  status: 'ACTIVE' | 'ROTATED' | 'REVOKED';
+  /** Lowercase sha256 hex of the decoded tenant public-key bytes. */
+  fingerprint: string;
+  /** The attestation's platform-signed `issuedAt`: the only authenticated "as of" for `status`. */
+  attestedAt: string;
+}
+
 export interface VerifyReport {
   ok: boolean;
   /**
@@ -876,6 +887,15 @@ export interface VerifyReport {
     sealedPurgesVerified: number;
     /** PA-0010 — count of lines in `action-events.ndjson.gz` (0 when `manifest.version < 5` — the entry does not exist). */
     actionEventsSeen: number;
+    /**
+     * AV-0002 — the tenant keys `platform-attestation.json` vouches for,
+     * each fingerprint already checked against `public-keys.json`. Present
+     * ONLY when `platformAttestation` verified an actual attestation (never
+     * under `allowLegacyUnattested`). The verifier-produced pin source for
+     * `verifyAibomAttestation` — use it via `aibomTrustFromBundle`, which
+     * also requires the whole report to be `valid`.
+     */
+    attestedTenantKeys?: AttestedTenantKey[];
     /**
      * SCAN2-004 — chain endpoints, present only when `rowsSeen > 0` AND
      * `chain.status !== 'invalid'` (an unhealthy in-bundle chain has no
@@ -1469,14 +1489,13 @@ export async function verifyBundle(
   // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
   // The entry remains optional in the ZIP grammar for backwards parsing,
   // but its absence fails verification unless explicitly allowed.
-  const platformResult = withStatus(
-    verifyPlatformAttestation(
-      byName.get('platform-attestation.json') ?? null,
-      publicKeysRaw,
-      manifest,
-      options,
-    ),
+  const { attestedKeys, ...platformRaw } = verifyPlatformAttestation(
+    byName.get('platform-attestation.json') ?? null,
+    publicKeysRaw,
+    manifest,
+    options,
   );
+  const platformResult = withStatus(platformRaw);
 
   // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
   // match what is actually present, or a trailing-truncation attack
@@ -1564,6 +1583,7 @@ export async function verifyBundle(
       sealedPurgesSeen: sealedPurges.length,
       sealedPurgesVerified: verifiedSeals.length,
       actionEventsSeen: actionEvents.length,
+      ...(attestedKeys ? { attestedTenantKeys: attestedKeys } : {}),
       ...(rows.length > 0 && chainResult.status !== 'invalid'
         ? {
             chainHeadRowId: chainRaw.headRowId,
@@ -4713,7 +4733,7 @@ function verifyPlatformAttestation(
   publicKeysRaw: Record<string, unknown>,
   manifest: BundleManifest,
   options: VerifyOptions,
-): RawComponentResult {
+): RawComponentResult & { attestedKeys?: AttestedTenantKey[] } {
   const manifestOrgId = manifest.orgId;
   // Missing external trust evidence is a verification failure by default. An
   // auditor may explicitly opt into legacy self-signed bundle semantics.
@@ -5074,6 +5094,15 @@ function verifyPlatformAttestation(
     checked: 1,
     failed: 0,
     ...(bindingNote !== undefined ? { reason: bindingNote } : {}),
+    // AV-0002 — only this fully-verified path yields the key set.
+    attestedKeys: body.keyVersions
+      .map(({ keyVersion, status, fingerprint }) => ({
+        keyVersion,
+        status: status as AttestedTenantKey['status'],
+        fingerprint,
+        attestedAt: body.issuedAt,
+      }))
+      .sort((a, b) => a.keyVersion - b.keyVersion),
   };
 }
 
