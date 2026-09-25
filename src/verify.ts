@@ -508,6 +508,11 @@ interface BundleProofEntry {
  *                   (e.g. a manifest version below the one that introduces
  *                   it, or a capture scope that never produces this
  *                   evidence class). Never counted as a failure.
+ * - `not_present` — AV-0008: the component applies, but the bundle carries
+ *                   none of its evidence (ok with 0 checked), e.g. a v5
+ *                   bundle with no TARGET_ACKNOWLEDGED events. Never
+ *                   rendered as VALID. Mandatory components (manifest,
+ *                   completeness, keyBinding) never take this status.
  *
  * As of this change none of the 11 pre-existing components ever produce
  * `incomplete` or `unsupported` — their pass/fail semantics are preserved
@@ -521,7 +526,8 @@ export type ComponentStatus =
   | 'valid'
   | 'invalid'
   | 'incomplete'
-  | 'unsupported';
+  | 'unsupported'
+  | 'not_present';
 
 export interface ComponentResult {
   /**
@@ -580,16 +586,35 @@ function withStatus(
 }
 
 /**
+ * AV-0008 — `withStatus` for an optional-evidence component: a pass with
+ * nothing checked is `not_present`, never `valid`. Only a would-be `valid`
+ * is rewritten; `invalid`/`incomplete`/`unsupported` stand as they are.
+ */
+function withEvidenceStatus(
+  result: RawComponentResult,
+  status?: ComponentStatus,
+): ComponentResult {
+  const r = withStatus(result, status);
+  return r.status === 'valid' && r.checked === 0
+    ? { ...r, status: 'not_present', ok: false }
+    : r;
+}
+
+/**
  * Top-level reduction (`PA01-DECISIONS.md` D15) — NOT "any component
  * failed". `invalid` if any component is invalid; else `incomplete` if any
- * is incomplete; else `valid`. `unsupported` components are excluded from
- * the reduction entirely — they never drag the overall verdict down.
+ * is incomplete; else `valid`. `unsupported` and `not_present` components
+ * are excluded from the reduction — they never drag the overall verdict
+ * down. AV-0008: but when NO evidence component is `valid` (a zero-row
+ * bundle), there is nothing the verdict vouches for, so it is `incomplete`.
  */
 function reduceStatus(
   results: readonly ComponentResult[],
-): Exclude<ComponentStatus, 'unsupported'> {
+  evidence: readonly ComponentResult[],
+): Exclude<ComponentStatus, 'unsupported' | 'not_present'> {
   if (results.some((r) => r.status === 'invalid')) return 'invalid';
   if (results.some((r) => r.status === 'incomplete')) return 'incomplete';
+  if (!evidence.some((r) => r.status === 'valid')) return 'incomplete';
   return 'valid';
 }
 
@@ -608,10 +633,10 @@ export interface VerifyReport {
   ok: boolean;
   /**
    * PA-0009 — real reduction over every component's `status`, see
-   * `reduceStatus`. Never `unsupported` at the top level (D15) — that
-   * status only ever appears per-component.
+   * `reduceStatus`. Never `unsupported` or `not_present` at the top level
+   * (D15, AV-0008) — those statuses only ever appear per-component.
    */
-  status: Exclude<ComponentStatus, 'unsupported'>;
+  status: Exclude<ComponentStatus, 'unsupported' | 'not_present'>;
   manifest: ComponentResult;
   rowSignatures: ComponentResult;
   chain: ComponentResult;
@@ -1339,7 +1364,7 @@ export async function verifyBundle(
   // row + root signature checks. Every signature in a bundle uses
   // the same algorithm as the manifest (be-core's producer never
   // mixes algorithms within one bundle).
-  const rowSigResult = withStatus(
+  const rowSigResult = withEvidenceStatus(
     verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm),
   );
   // SCAN2-004 — `chainRaw` carries the head/tail endpoint fields
@@ -1348,7 +1373,7 @@ export async function verifyBundle(
   // the public `chain: ComponentResult` surface. They are surfaced
   // separately, on `bundle`, for `verify-set` to consume.
   const chainRaw = verifyChain(rows);
-  const chainResult = withStatus({
+  const chainResult = withEvidenceStatus({
     ok: chainRaw.ok,
     checked: chainRaw.checked,
     failed: chainRaw.failed,
@@ -1376,7 +1401,7 @@ export async function verifyBundle(
       );
     }
   }
-  const rootSigResult = withStatus(
+  const rootSigResult = withEvidenceStatus(
     verifyRootSignatures(roots, publicKeys, manifest.signatureAlgorithm),
   );
 
@@ -1386,7 +1411,7 @@ export async function verifyBundle(
     resourceLimits.maxProofs,
   );
   assertProofsStructure(proofs);
-  const proofResult = withStatus(verifyInclusionProofs(rows, roots, proofs));
+  const proofResult = withEvidenceStatus(verifyInclusionProofs(rows, roots, proofs));
 
   // 6b) FIX01 F5(b) — parse + verify integrity checkpoints (v4+ only; an
   // empty array for every earlier version).
@@ -1418,7 +1443,7 @@ export async function verifyBundle(
   assertSealedPurgesStructure(sealedPurges, manifest.orgId);
   const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys);
 
-  const integrityCheckpointsResult = withStatus(
+  const integrityCheckpointsResult = withEvidenceStatus(
     verifyIntegrityCheckpoints(
       manifest,
       rows,
@@ -1441,7 +1466,7 @@ export async function verifyBundle(
   const actionEventsSupported = manifest.version >= 5;
 
   const actionEventChainResult = actionEventsSupported
-    ? withStatus(
+    ? withEvidenceStatus(
         verifyActionEventChain(
           actionEvents,
           publicKeys,
@@ -1450,41 +1475,41 @@ export async function verifyBundle(
       )
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const permitBindingResult = actionEventsSupported
-    ? withStatus(verifyPermitBinding(actionEvents))
+    ? withEvidenceStatus(verifyPermitBinding(actionEvents))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const requestBindingResult = actionEventsSupported
-    ? withStatus(verifyRequestBinding(actionEvents))
+    ? withEvidenceStatus(verifyRequestBinding(actionEvents))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const dispatchIntegrityResult = actionEventsSupported
-    ? withStatus(verifyDispatchIntegrity(actionEvents))
+    ? withEvidenceStatus(verifyDispatchIntegrity(actionEvents))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const targetAckRaw = actionEventsSupported
     ? verifyTargetAck(actionEvents, options.targetPublicKeys)
     : null;
   const targetAckResult = actionEventsSupported
-    ? withStatus(targetAckRaw!.result, targetAckRaw!.status)
+    ? withEvidenceStatus(targetAckRaw!.result, targetAckRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const callerResultRaw = actionEventsSupported
     ? verifyCallerResult(actionEvents)
     : null;
   const callerResultResult = actionEventsSupported
-    ? withStatus(callerResultRaw!.result, callerResultRaw!.status)
+    ? withEvidenceStatus(callerResultRaw!.result, callerResultRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const closureLegalityRaw = actionEventsSupported
     ? verifyClosureLegality(actionEvents)
     : null;
   const closureLegalityResult = actionEventsSupported
-    ? withStatus(closureLegalityRaw!.result, closureLegalityRaw!.status)
+    ? withEvidenceStatus(closureLegalityRaw!.result, closureLegalityRaw!.status)
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const evidenceGradeResult = actionEventsSupported
-    ? withStatus(verifyEvidenceGrade(actionEvents, manifest, options.targetPublicKeys))
+    ? withEvidenceStatus(verifyEvidenceGrade(actionEvents, manifest, options.targetPublicKeys))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
   const actionCompletenessResult = actionEventsSupported
-    ? withStatus(verifyActionCompleteness(manifest, actionEvents))
+    ? withEvidenceStatus(verifyActionCompleteness(manifest, actionEvents))
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
 
   // 7) Optional Rekor fetch.
-  const rekorResult = withStatus(await verifyRekorReceipts(roots, options));
+  const rekorResult = withEvidenceStatus(await verifyRekorReceipts(roots, options));
 
   // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
   // The entry remains optional in the ZIP grammar for backwards parsing,
@@ -1495,7 +1520,7 @@ export async function verifyBundle(
     manifest,
     options,
   );
-  const platformResult = withStatus(platformRaw);
+  const platformResult = withEvidenceStatus(platformRaw);
 
   // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
   // match what is actually present, or a trailing-truncation attack
@@ -1515,14 +1540,14 @@ export async function verifyBundle(
   // SIGNED rowCount to the bundle's own row/proof counts for that period,
   // closing the trailing-suffix-deletion gap `completeness` cannot see
   // (see the `rootCoverage` field doc comment above).
-  const rootCoverageResult = withStatus(
+  const rootCoverageResult = withEvidenceStatus(
     verifyRootCoverage(manifest, rows, roots, proofs, verifiedSeals),
   );
 
   // PA-0009 (D15) — real reduction over `status`, not an AND of `ok`. See
   // `reduceStatus` doc comment: `invalid` beats `incomplete` beats `valid`,
-  // and `unsupported` components (none exist among these 11 yet) are
-  // excluded entirely rather than counted as failure.
+  // and `unsupported`/`not_present` components are excluded rather than
+  // counted as failure (AV-0008: unless no evidence component is valid).
   const allResults = [
     manifestResult,
     rowSigResult,
@@ -1545,7 +1570,13 @@ export async function verifyBundle(
     evidenceGradeResult,
     actionCompletenessResult,
   ];
-  const status = reduceStatus(allResults);
+  // AV-0008 — the components that carry audit evidence (every
+  // optional-evidence component except platformAttestation, which is key
+  // provenance, not evidence). None `valid` → top level `incomplete`.
+  const evidenceResults = allResults.filter(
+    (r) => r !== manifestResult && r !== platformResult && r !== completenessResult && r !== keyBindingResult,
+  );
+  const status = reduceStatus(allResults, evidenceResults);
   const ok = status === 'valid';
 
   return {

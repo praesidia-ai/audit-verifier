@@ -523,15 +523,18 @@ describe('verifyBundle', () => {
       report.chain,
       report.rootSignatures,
       report.inclusionProofs,
-      report.rekor,
       report.completeness,
       report.keyBinding,
       report.rootCoverage,
-      report.integrityCheckpoints,
     ]) {
       expect(component.status).toBe('valid');
       expect(component.ok).toBe(true);
     }
+    // AV-0008 — 0-checked components are not_present, never valid: a v1
+    // bundle carries no integrity checkpoints, and the fixture root has no
+    // anchor receipt (skipped under --no-rekor).
+    expect(report.integrityCheckpoints.status).toBe('not_present');
+    expect(report.rekor.status).toBe('not_present');
   });
 
   it('reports status: invalid at both component and top level when a component fails, never incomplete/unsupported', async () => {
@@ -3069,7 +3072,8 @@ describe('verifyBundle', () => {
         allowLegacyUnattested: true,
       });
       expect(report.ok).toBe(true);
-      expect(report.platformAttestation.ok).toBe(true);
+      // AV-0008 — opted-out missing attestation is absent evidence.
+      expect(report.platformAttestation.status).toBe('not_present');
       expect(report.platformAttestation.reason).toBe(
         'missing_legacy_explicitly_allowed',
       );
@@ -3387,8 +3391,10 @@ describe('verifyBundle', () => {
       expect(report.completeness.ok).toBe(true);
       // Exempted: root-1's periodEnd exceeds the bundle's declared `to`,
       // so it is a boundary/partial root, not fully contained.
-      expect(report.rootCoverage.ok).toBe(true);
+      // AV-0008 — no fully-contained root to cover: not_present, not valid.
+      expect(report.rootCoverage.status).toBe('not_present');
       expect(report.rootCoverage.checked).toBe(0);
+      expect(report.ok).toBe(true);
     });
   });
 
@@ -3850,6 +3856,54 @@ describe('verifyBundle', () => {
       expect(report.bundle.sealedPurgesVerified).toBe(0);
       expect(report.ok).toBe(false);
     });
+
+    // AV-0008 — a correctly signed bundle that carries no evidence at all
+    // must not read as VALID: every evidence component is `not_present`
+    // and the top level is `incomplete` (CLI exit 3), never `valid`.
+    it('AV-0008: a zero-row, zero-root bundle is incomplete, never valid; evidence components are not_present', async () => {
+      const base = buildFixtureBundle();
+      const { privateKey } = keypairFromSeed(Buffer.alloc(32, 7));
+      const entries = readBundleEntries(base.zip);
+      const originalManifest = JSON.parse(
+        entries.get('manifest.json')!.toString('utf8'),
+      ) as { orgId: string; from: string; to: string };
+      const publicKeys = JSON.parse(
+        entries.get('public-keys.json')!.toString('utf8'),
+      ) as Record<string, unknown>;
+      const manifestJson = reSignManifestV1({
+        orgId: originalManifest.orgId,
+        rowCount: 0,
+        rootCount: 0,
+        from: originalManifest.from,
+        to: originalManifest.to,
+        publicKeyB64: publicKeys['1'] as string,
+        keyVersion: 1,
+        privateKey,
+      });
+      const report = await verifyBundle(
+        packBundleWithSeals(manifestJson, [], [], [], publicKeys, []),
+        { noRekor: true },
+      );
+
+      expect(report.status).toBe('incomplete');
+      expect(report.ok).toBe(false);
+      for (const c of [
+        report.rowSignatures,
+        report.chain,
+        report.rootSignatures,
+        report.inclusionProofs,
+        report.rekor,
+        report.rootCoverage,
+      ]) {
+        expect(c.status).toBe('not_present');
+        expect(c.ok).toBe(false); // ok is DERIVED: status === 'valid'
+        expect(c.checked).toBe(0);
+      }
+      // Mandatory components are still decided, never not_present.
+      expect(report.manifest.status).toBe('valid');
+      expect(report.completeness.status).toBe('valid');
+      expect(report.keyBinding.status).toBe('valid');
+    });
   });
 
   /**
@@ -4064,7 +4118,8 @@ describe('verifyBundle', () => {
       });
       const report = await verifyBundle(zip, { noRekor: true });
       expect(report.rowSignatures.ok).toBe(true);
-      expect(report.chain.ok).toBe(true);
+      // AV-0008 — single-row fixture: no inter-row link to assert (0 checked).
+      expect(report.chain.status).toBe('not_present');
       expect(report.inclusionProofs.ok).toBe(true);
       expect(report.ok).toBe(true);
     });
@@ -4289,7 +4344,8 @@ describe('verifyBundle', () => {
       });
       const report = await verifyBundle(zip, { noRekor: true });
       expect(report.rowSignatures.ok).toBe(true);
-      expect(report.chain.ok).toBe(true);
+      // AV-0008 — single-row fixture: no inter-row link to assert (0 checked).
+      expect(report.chain.status).toBe('not_present');
       expect(report.inclusionProofs.ok).toBe(true);
       expect(report.ok).toBe(true);
     });
@@ -5184,10 +5240,10 @@ describe('verifyBundle', () => {
       expect(report.ok).toBe(false);
     });
 
-    it('v1-v3 bundles (no checkpoints file at all) verify integrityCheckpoints as a trivial pass', async () => {
+    it('v1-v3 bundles (no checkpoints file at all) report integrityCheckpoints not_present without failing the bundle (AV-0008)', async () => {
       const { zip } = buildBundleWithTamper({});
       const report = await verifyBundle(zip, { noRekor: true });
-      expect(report.integrityCheckpoints.ok).toBe(true);
+      expect(report.integrityCheckpoints.status).toBe('not_present');
       expect(report.integrityCheckpoints.checked).toBe(0);
       expect(report.ok).toBe(true);
     });
@@ -6180,7 +6236,7 @@ describe('verifyBundle', () => {
       ];
     }
 
-    it('round-trips a genuine v5 bundle end to end — all nine new components valid', async () => {
+    it('round-trips a genuine v5 bundle end to end — eight new components valid, targetAck not_present (AV-0008: no TARGET_ACKNOWLEDGED event)', async () => {
       const { zip } = buildV5Bundle({
         events: successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000001'),
         evidenceGradeSummaryOverride: {
@@ -6197,12 +6253,35 @@ describe('verifyBundle', () => {
       expect(report.permitBinding.status).toBe('valid');
       expect(report.requestBinding.status).toBe('valid');
       expect(report.dispatchIntegrity.status).toBe('valid');
-      expect(report.targetAck.status).toBe('valid');
+      expect(report.targetAck.status).toBe('not_present');
       expect(report.callerResult.status).toBe('valid');
       expect(report.closureLegality.status).toBe('valid');
       expect(report.evidenceGrade.status).toBe('valid');
       expect(report.actionCompleteness.status).toBe('valid');
       expect(report.bundle.actionEventsSeen).toBe(6);
+    });
+
+    // AV-0008 — the successful-action fixture carries no TARGET_ACKNOWLEDGED
+    // event: targetAck checked 0 and must say so (not_present), while the
+    // bundle as a whole, which does carry evidence, stays valid.
+    it('AV-0008: a v5 bundle without target receipts reports targetAck not_present and the top level stays valid', async () => {
+      const { zip } = buildV5Bundle({
+        events: successfulActionEvents('aaaaaaaa-0000-7000-8000-000000000001'),
+        evidenceGradeSummaryOverride: {
+          A: 0,
+          B: 0,
+          C: 1,
+          D: 0,
+          enforcementMode: 'observe',
+        },
+      });
+      const report = await verifyBundle(zip, { noRekor: true });
+      expect(report.targetAck.status).toBe('not_present');
+      expect(report.targetAck.checked).toBe(0);
+      expect(report.targetAck.ok).toBe(false);
+      expect(report.chain.status).toBe('valid');
+      expect(report.status).toBe('valid');
+      expect(report.ok).toBe(true);
     });
 
     it('a v1 bundle (buildFixtureBundle) reports every new component as unsupported, never dragging the verdict down', async () => {

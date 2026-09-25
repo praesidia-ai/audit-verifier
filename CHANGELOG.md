@@ -86,7 +86,21 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   prints `anchor: verified_rekor at <time>` or `anchor: UNVERIFIED (<reason>)` instead of the
   NOTE. Exit codes are unchanged.
 
+- **`not_present` component status (AV-0008).** A component that applies but found
+  nothing to check (`ok` with `checked: 0`) now reports `status: 'not_present'` (CLI
+  `[NOT_PRESENT]`) instead of `valid`, so `[VALID] target ack 0 checked` no longer
+  claims evidence that is absent. `not_present` is excluded from the top-level
+  reduction, except that a bundle where **no** evidence component is `valid` (zero
+  rows, zero roots, no action events) is `incomplete` (exit 3), not `valid`.
+  `manifest`, `completeness` and `keyBinding` never report it.
+
 ### Compatibility
+- AV-0008 is a **strictness increase** and a new enum value. JSON / library consumers that
+  switch exhaustively on `ComponentStatus` must handle `'not_present'`; a 0-checked
+  component's derived `ok` is now `false`. Top-level verdicts are unchanged for every bundle
+  that carries any rows, roots or action events; a zero-evidence bundle moves from `valid`
+  (exit 0) to `incomplete` (exit 3), and so does a `verify-set` containing one, and
+  `aibomTrustFromBundle` no longer accepts one as a pin source.
 - AV-0005 adds verification without weakening any. The anchor is informational: `valid`, the
   verdict and the exit status are computed exactly as before. An AIBOM without `anchorProof`
   (every export before BE-1255) verifies as before and reports `unverified` /

@@ -319,6 +319,8 @@ function statusWord(status: VerifyReport['status'] | ComponentResult['status']):
       return 'INCOMPLETE';
     case 'unsupported':
       return 'UNSUPPORTED';
+    case 'not_present':
+      return 'NOT_PRESENT';
   }
 }
 

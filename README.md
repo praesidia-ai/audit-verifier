@@ -51,7 +51,8 @@ Exit codes:
   1   status: invalid — a real verification failure.
   2   I/O or bundle-format error (malformed zip, missing file, etc.).
   3   status: incomplete — evidence present is insufficient to decide
-      (distinct from a failure). The `targetAck`/`callerResult` components
+      (distinct from a failure). Also returned for a bundle that carries no
+      evidence at all (every evidence component NOT_PRESENT). The `targetAck`/`callerResult` components
       produce this when a piece of evidence was legitimately redacted
       (`payload: null` with a `payloadCommitment` present) rather than
       illegitimately stripped — see "Verdict shape" below.
@@ -210,7 +211,7 @@ which throws on a bundle that is not a pin source.
 
 Every component result (`report.manifest`, `report.rowSignatures`, ...) and
 the top-level report both carry a `status: 'valid' | 'invalid' | 'incomplete'
-| 'unsupported'` field (`ok: boolean` is kept for backward compatibility,
+| 'unsupported' | 'not_present'` field (`ok: boolean` is kept for backward compatibility,
 always derived as `status === 'valid'`). The top-level `status` is a real
 reduction, not "any component failed": `invalid` if any component is
 `invalid`; else `incomplete` if any is `incomplete`; else `valid`. A
@@ -220,8 +221,19 @@ down. The nine action-evidence components (invariants 13-21 below) report
 `unsupported` on every bundle below `manifest.version: 5` (there is no
 action-event evidence to check at all), and `targetAck`/`callerResult`
 report `incomplete` when the relevant evidence event is legitimately
-redacted. Every other component in this release only ever produces
-`valid`/`invalid`.
+redacted.
+
+A component that applies to the bundle but found nothing to check (a pass
+with `checked: 0`) reports `not_present` (CLI `[NOT_PRESENT]`), never
+`valid`: e.g. `targetAck` on a bundle with no `TARGET_ACKNOWLEDGED` event,
+`chain` on a single-row bundle (no link to assert), `rekor` for unanchored
+roots under `--no-rekor`, `integrityCheckpoints` below `manifest.version: 4`,
+or `platformAttestation` absent under `--allow-legacy-unattested`. Like
+`unsupported` it never drags the verdict down, but if **no** evidence
+component is `valid` (a zero-row, zero-root bundle) the top level is
+`incomplete` (exit 3), not `valid`. `manifest`, `completeness` and
+`keyBinding` are mandatory and never report `not_present`. Neither
+`unsupported` nor `not_present` appears at the top level.
 
 ## What it verifies
 

@@ -43,6 +43,16 @@ cross-bundle continuity entrypoint (`verify-set`, SCAN2-004) that checks chain f
 across a *set* of bundles rather than one — it fails closed when chain fields are absent
 (pinned by a dedicated test, `f13793e`).
 
+Component statuses (`ComponentStatus`, `verify.ts`; README "Verdict shape"):
+
+| status | meaning | top-level effect |
+|---|---|---|
+| `valid` | checked, all passed | — |
+| `invalid` | a check failed | `invalid` |
+| `incomplete` | evidence present but insufficient (e.g. redacted) | `incomplete` |
+| `unsupported` | component does not apply to this manifest version | ignored |
+| `not_present` | applies, but 0 items to check (AV-0008, `withEvidenceStatus`) | ignored, unless no evidence component is `valid` → `incomplete` |
+
 ## Byte-for-byte compatibility with `be`
 
 This is the load-bearing correctness property of the whole package: its vendored crypto/JCS/zip
