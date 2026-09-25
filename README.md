@@ -26,6 +26,7 @@ npx @praesidia/audit-verifier bundle.zip
 ```bash
 praesidia-verify <bundle.zip> [options]
 praesidia-verify verify <bundle.zip> [options]   # alias of the form above
+praesidia-verify <audit-package.zip> [options]   # be audit package, verified directly (AV-0007)
 praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex>
 praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
                # AIBOM attested export — see "AIBOM attestations" below
@@ -58,6 +59,17 @@ Exit codes:
       (`payload: null` with a `payloadCommitment` present) rather than
       illegitimately stripped — see "Verdict shape" below.
 ```
+
+## Audit packages (AV-0007)
+
+The audit package (`GET audit/packages/:id/download`) is an outer zip holding the
+signed bundle at `evidence/audit-bundle.zip`, an unsigned `verification.txt`
+receipt (its SHA-256 and byte count) and unsigned reports (PDF, JSON, CSV). Pass the
+package itself: the verifier checks the receipt against the inner bundle's bytes
+(mismatch or unparseable receipt → `invalid`, exit 1; receipt missing →
+`incomplete`, exit 3), then verifies the inner bundle exactly as a direct bundle.
+Only the inner bundle's signatures authenticate anything; every other entry is
+listed under `package.sideArtifacts` as **not verified**.
 
 ## Cross-bundle continuity (`verify-set`)
 

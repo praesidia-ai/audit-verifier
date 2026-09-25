@@ -93,6 +93,16 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   reduction, except that a bundle where **no** evidence component is `valid` (zero
   rows, zero roots, no action events) is `incomplete` (exit 3), not `valid`.
   `manifest`, `completeness` and `keyBinding` never report it.
+- **`praesidia-verify <audit-package.zip>` (AV-0007).** A zip with
+  `evidence/audit-bundle.zip` and no `manifest.json` (be's audit package) is verified
+  directly. The inner bundle's SHA-256 and byte count must match `verification.txt`
+  (mismatch or an unparseable receipt → `invalid`, exit 1; receipt missing →
+  `incomplete`, exit 3), then the inner bundle is verified exactly as a direct bundle.
+  The report gains `package: {status, sha256Matches, byteCountMatches, reason?,
+  sideArtifacts[]}` and a `package:` line; every other package entry is listed as an
+  unsigned side artifact, never verified. Library: `verifyAuditPackage()`,
+  `isAuditPackage()`. Additive: a direct bundle verifies byte-for-byte as before (the
+  `verify-set` and `aibom --audit-bundle` inputs still take the inner bundle only).
 
 ### Fixed
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command

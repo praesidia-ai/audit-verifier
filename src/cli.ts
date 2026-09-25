@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyReport, type ComponentResult, type VerifyOptions } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
+import { isAuditPackage, verifyAuditPackage, type PackageIntegrity } from './package.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
@@ -55,6 +56,7 @@ const HELP = `praesidia-verify — offline verifier for Praesidia compliance bun
 USAGE
   praesidia-verify <bundle.zip> [options]
   praesidia-verify verify <bundle.zip> [options]   (alias of the form above)
+  praesidia-verify <audit-package.zip> [options]   (AV-0007, see below)
   praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
   praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex> [...]
   praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
@@ -69,6 +71,13 @@ USAGE
   caught, not just a date gap). Every discontinuity is a NAMED finding —
   never silence. Does not change the single-bundle command above in any
   way.
+
+  AV-0007 — an audit package (a zip with evidence/audit-bundle.zip and no
+  manifest.json) is verified directly: the inner bundle's SHA-256 and byte
+  count must match the package's verification.txt (mismatch or unparseable
+  receipt → invalid, exit 1; receipt missing → incomplete, exit 3), then the
+  inner bundle is verified exactly as above. Every other package entry is an
+  unsigned side artifact and is listed, never verified.
 
   AV-0001 — \`aibom\` verifies one attested AIBOM export
   (praesidia-aibom-attestation/v1): the document digest, the Ed25519 /
@@ -326,7 +335,7 @@ function statusWord(status: VerifyReport['status'] | ComponentResult['status']):
 }
 
 function printReport(
-  report: VerifyReport,
+  report: VerifyReport & { package?: PackageIntegrity },
   quiet: boolean,
   noRekor: boolean,
   platformKeySupplied: boolean,
@@ -338,6 +347,12 @@ function printReport(
   const lines: string[] = [];
   lines.push('Praesidia compliance bundle verification');
   lines.push('────────────────────────────────────────');
+  // AV-0007 — audit package: receipt binding + unsigned side artifacts.
+  if (report.package) {
+    const p = report.package;
+    lines.push(`package:         ${p.status.toUpperCase()}  evidence/audit-bundle.zip vs verification.txt (unsigned receipt)${p.reason ? `  (${p.reason})` : ''}`);
+    lines.push(`                 unsigned side artifacts (not verified): ${p.sideArtifacts.join(', ') || 'none'}`);
+  }
   lines.push(`org:             ${report.bundle.orgId}`);
   lines.push(`from:            ${report.bundle.from}`);
   lines.push(`to:              ${report.bundle.to}`);
@@ -873,7 +888,7 @@ async function main(argv: string[]): Promise<number> {
     );
     return 2;
   }
-  let report: VerifyReport;
+  let report: VerifyReport & { package?: PackageIntegrity };
   let options: VerifyOptions;
   try {
     options = await bundleVerifyOptions(args);
@@ -882,7 +897,9 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
   try {
-    report = await verifyBundle(buffer, options);
+    report = isAuditPackage(buffer)
+      ? await verifyAuditPackage(buffer, options)
+      : await verifyBundle(buffer, options);
   } catch (err) {
     // verifyBundle throws ONLY on I/O / format errors. Verification
     // failures come through as `report.ok === false`.

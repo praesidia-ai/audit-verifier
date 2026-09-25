@@ -5938,6 +5938,99 @@ describe('verifyBundle', () => {
         expect(r.stdout).toContain('praesidia-verify verify <bundle.zip>');
       });
     });
+
+    // AV-0007 — the audit package (be `audit-package.service.ts`) wraps the
+    // signed bundle at evidence/audit-bundle.zip next to an UNSIGNED
+    // verification.txt receipt stating its sha256 + byte count.
+    describe('AV-0007 — `praesidia-verify audit-package.zip`', () => {
+      const run = (args: string[]) =>
+        spawnSync(process.execPath, [cliPathOrThrow(), ...args], { encoding: 'utf8' });
+      const flags = ['--no-rekor', '--allow-legacy-unattested'];
+      const receipt = (inner: Buffer) =>
+        Buffer.from(
+          [
+            'Praesidia Audit Package — Verification Receipt',
+            'Evidence archive: evidence/audit-bundle.zip',
+            `Evidence archive SHA-256: ${crypto.createHash('sha256').update(inner).digest('hex')}`,
+            `Evidence archive bytes: ${inner.length}`,
+            '',
+          ].join('\n'),
+          'utf8',
+        );
+      const pkg = (inner: Buffer, verificationTxt: Buffer | null) =>
+        writeZip([
+          { name: 'executive-summary.pdf', data: Buffer.from('%PDF-1.4\n') },
+          { name: 'evaluations/summary.json', data: Buffer.from('{}') },
+          { name: 'evidence/audit-bundle.zip', data: inner },
+          ...(verificationTxt ? [{ name: 'verification.txt', data: verificationTxt }] : []),
+        ]);
+      const runPkg = (zip: Buffer, extra: string[] = ['--json']) => {
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          return run([bundlePath, ...flags, ...extra]);
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      };
+
+      it('valid package: exit 0, inner bundle verified, side artifacts listed as unverified', () => {
+        const { zip: inner } = buildBundleWithTamper({});
+        const r = runPkg(pkg(inner, receipt(inner)));
+        expect(r.status).toBe(0);
+        const report = JSON.parse(r.stdout);
+        expect(report.status).toBe('valid');
+        expect(report.package).toEqual({
+          status: 'valid',
+          sha256Matches: true,
+          byteCountMatches: true,
+          sideArtifacts: ['executive-summary.pdf', 'evaluations/summary.json'],
+        });
+        const human = runPkg(pkg(inner, receipt(inner)), []);
+        expect(human.status).toBe(0);
+        expect(human.stdout).toMatch(/^package: +VALID/m);
+        expect(human.stdout).toContain('unsigned side artifacts (not verified): executive-summary.pdf, evaluations/summary.json');
+      });
+
+      it('tampered inner bytes: exit 1 with the hash mismatch named, even though the inner bundle verifies', async () => {
+        const { zip: inner } = buildBundleWithTamper({});
+        const swapped = writeZip(
+          readZip(inner).map((e) =>
+            e.name === 'README.md' ? { name: e.name, data: Buffer.from('# tampered\n') } : e,
+          ),
+        );
+        expect((await verifyBundle(swapped, { noRekor: true })).status).toBe('valid');
+        const r = runPkg(pkg(swapped, receipt(inner)));
+        expect(r.status).toBe(1);
+        const report = JSON.parse(r.stdout);
+        expect(report.status).toBe('invalid');
+        expect(report.package.status).toBe('invalid');
+        expect(report.package.sha256Matches).toBe(false);
+        expect(report.package.reason).toContain('SHA-256');
+      });
+
+      it('receipt present but unparseable: invalid (exit 1), never skipped', () => {
+        const { zip: inner } = buildBundleWithTamper({});
+        const r = runPkg(pkg(inner, Buffer.from('Evidence archive bytes: 12\n')));
+        expect(r.status).toBe(1);
+        expect(JSON.parse(r.stdout).package.status).toBe('invalid');
+      });
+
+      it('verification.txt missing: package integrity incomplete, exit 3', () => {
+        const { zip: inner } = buildBundleWithTamper({});
+        const r = runPkg(pkg(inner, null));
+        expect(r.status).toBe(3);
+        const report = JSON.parse(r.stdout);
+        expect(report.status).toBe('incomplete');
+        expect(report.package).toMatchObject({ status: 'incomplete', sha256Matches: null, byteCountMatches: null });
+      });
+
+      it('a plain bundle still verifies unchanged (no `package` key)', () => {
+        const { zip } = buildBundleWithTamper({});
+        const r = runPkg(zip);
+        expect(r.status).toBe(0);
+        expect(JSON.parse(r.stdout)).not.toHaveProperty('package');
+      });
+    });
   });
 
   // ──────────────────────────────────────────────────────────────────────

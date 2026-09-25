@@ -8,6 +8,8 @@
  */
 
 export { verifyBundle } from './verify.js';
+export { verifyAuditPackage, isAuditPackage } from './package.js';
+export type { PackageIntegrity, PackageVerifyReport } from './package.js';
 export type {
   VerifyReport,
   ComponentResult,
