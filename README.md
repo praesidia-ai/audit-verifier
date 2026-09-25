@@ -353,6 +353,33 @@ no `INCOMPLETE` line: a bundle with no evidence at all has only
 `PASS`/`NOT_PRESENT` lines. `--summary` drops the component detail;
 `--quiet` is unchanged (one word).
 
+### Evidence privacy mode (AV-0013, manifest v6)
+
+A v6 manifest signs `evidencePrivacy: { modes: [{ mode, effectiveFrom }], schemaVersion }`,
+the org's evidence privacy mode over `[from, to)` (`FULL | REDACTED | METADATA_ONLY |
+ZERO_RETENTION`). `report.evidencePrivacy` (and the text report's `evidence privacy:` block)
+states, per mode window, what this bundle proves and what it cannot:
+
+| Mode | Proven | Not provable from this bundle |
+|---|---|---|
+| `FULL` (declared) | chain integrity, signatures, ordering, commitment binding, content equality, target-ack body | — |
+| `REDACTED`, `METADATA_ONLY`, `ZERO_RETENTION` | chain integrity, signatures, ordering, commitment binding | content equality, target-ack body |
+| `FULL (undeclared)` — manifest v1–v5 | chain integrity, signatures, ordering, commitment binding | content equality, target-ack body |
+
+- A declared mode never changes a status. A component left `incomplete` by
+  `payload: null` events that all fall in a declared reduced-mode window (by the event's
+  `receivedAt`) keeps `incomplete` and gets `reason: "evidence_privacy_mode:<MODE>"`.
+- Every `payload: null` event is listed in `evidencePrivacy.payloadAbsences`. One outside
+  any declared reduced window is annotated `undeclared_payload_absence`. That is not a
+  failure by itself: subject erasure is a legitimate cause.
+- The declaration counts (`declared: true`) only when the manifest signature verified.
+- Fail closed: an unknown mode, an unknown `schemaVersion` (upgrade the verifier), a
+  timeline not starting at `manifest.from`, out of order, or reaching `manifest.to`, or
+  any extra key, is a bundle-format error (exit 2). The field on a v1–v5 manifest, or its
+  absence on v6, fails `manifest`.
+- A pre-v6 bundle declares no mode, so the verifier does not claim its payloads are the
+  unreduced originals.
+
 ## What it verifies
 
 For a bundle produced by `BundleExporterService` (AGV-035) the verifier
@@ -686,7 +713,7 @@ stored root hash/signature and other available fields to that expected root,
 and validate retention. A HEAD-only existence/lock check is insufficient.
 
 `manifest.version` is checked against an explicit ceiling
-(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 5) — a bundle declaring a newer
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 6) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's

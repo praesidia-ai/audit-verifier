@@ -1,6 +1,13 @@
 import { deriveProofs, type ProofStatus, type ProofType } from './proofs.js';
 import { verifyHttpReceipt, httpTargetKeyFingerprint, httpRequestCommitment, type HttpRequestEnvelope } from './http-receipt.js';
 import { jcsCommitment, type JsonValue } from './jcs-canonical.js';
+import {
+  assertEvidencePrivacyStructure,
+  evidencePrivacyReason,
+  evidencePrivacyReport,
+  type EvidencePrivacyDeclaration,
+  type EvidencePrivacyReport,
+} from './evidence-privacy.js';
 /**
  * Praesidia compliance bundle verifier — pure-function orchestrator.
  *
@@ -197,6 +204,13 @@ interface BundleManifest {
      */
     enforcementMode: 'observe' | 'enforce';
   };
+  /**
+   * AV-0013 / be BE-1615 — the org's evidence privacy mode timeline over
+   * `[from, to)`. Signed; present on every `version: 6` manifest, absent on
+   * every earlier one (enforced in `verifyManifest`). Format:
+   * `assertEvidencePrivacyStructure`.
+   */
+  evidencePrivacy?: EvidencePrivacyDeclaration;
 }
 
 /**
@@ -997,6 +1011,14 @@ export interface VerifyReport {
   policyReference: ComponentResult;
   /** AV-0009 — present only when `decisionReceipt` is `valid`. */
   decisionDisclosures?: DecisionDisclosureSummary;
+  /**
+   * AV-0013 — the declared evidence privacy mode timeline (manifest v6, and
+   * only once the manifest signature verified; otherwise one `FULL`
+   * window with `declared: false`), what each mode lets this bundle prove,
+   * and an annotation for every `payload: null` action event. Annotation
+   * only: a declared mode never changes any component status.
+   */
+  evidencePrivacy: EvidencePrivacyReport;
   bundle: {
     orgId: string;
     from: string;
@@ -1208,8 +1230,12 @@ export interface ExpectedAnchorRoot {
  * v4 fields plus these 3, 15 total) and a new, REQUIRED-even-when-empty
  * bundle entry `action-events.ndjson.gz` carrying the signed
  * `protected_action_events` rows. Same fail-closed-both-directions rule.
+ *
+ * v6 (AV-0013 / be BE-1615) — adds `evidencePrivacy` (the 15 v5 fields plus
+ * this one, 16 total): the org's evidence privacy mode timeline. No new
+ * bundle entry. Same fail-closed-both-directions rule.
  */
-const MAX_SUPPORTED_MANIFEST_VERSION = 5;
+const MAX_SUPPORTED_MANIFEST_VERSION = 6;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -1579,6 +1605,20 @@ export async function verifyBundle(
       : [];
   assertActionEventsStructure(actionEvents, manifest.orgId);
   const actionEventsSupported = manifest.version >= 5;
+  // AV-0013 — trust the declared mode only once the manifest signature did.
+  const evidencePrivacy = evidencePrivacyReport(
+    manifest.version >= 6 && manifestResult.status === 'valid' ? manifest.evidencePrivacy : undefined,
+    manifest.from,
+    manifest.to,
+    actionEvents,
+  );
+  const privacyAnnotated = (r: ComponentResult, eventType: string): ComponentResult => {
+    const reason =
+      r.status === 'incomplete' && r.reason === undefined
+        ? evidencePrivacyReason(evidencePrivacy, eventType)
+        : undefined;
+    return reason ? { ...r, reason } : r;
+  };
 
   const actionEventChainResult = actionEventsSupported
     ? withEvidenceStatus(
@@ -1601,15 +1641,21 @@ export async function verifyBundle(
   const targetAckRaw = actionEventsSupported
     ? verifyTargetAck(actionEvents, options.targetPublicKeys)
     : null;
-  const targetAckResult = actionEventsSupported
-    ? withEvidenceStatus(targetAckRaw!.result, targetAckRaw!.status)
-    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const targetAckResult = privacyAnnotated(
+    actionEventsSupported
+      ? withEvidenceStatus(targetAckRaw!.result, targetAckRaw!.status)
+      : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported'),
+    'TARGET_ACKNOWLEDGED',
+  );
   const callerResultRaw = actionEventsSupported
     ? verifyCallerResult(actionEvents)
     : null;
-  const callerResultResult = actionEventsSupported
-    ? withEvidenceStatus(callerResultRaw!.result, callerResultRaw!.status)
-    : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
+  const callerResultResult = privacyAnnotated(
+    actionEventsSupported
+      ? withEvidenceStatus(callerResultRaw!.result, callerResultRaw!.status)
+      : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported'),
+    'CALLER_RESULT_OBSERVED',
+  );
   const closureLegalityRaw = actionEventsSupported
     ? verifyClosureLegality(actionEvents)
     : null;
@@ -1735,6 +1781,7 @@ export async function verifyBundle(
     ...(decisionReceiptResult.status === 'valid' && disclosures.summary
       ? { decisionDisclosures: disclosures.summary }
       : {}),
+    evidencePrivacy,
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
@@ -1801,6 +1848,9 @@ function manifestSignableBytes(manifest: BundleManifest): Buffer {
     signable.actionEventCount = manifest.actionEventCount;
     signable.captureScopeDigest = manifest.captureScopeDigest;
     signable.evidenceGradeSummary = manifest.evidenceGradeSummary;
+  }
+  if (manifest.version >= 6) {
+    signable.evidencePrivacy = manifest.evidencePrivacy;
   }
   return canonicalJson(signable);
 }
@@ -1958,6 +2008,24 @@ function verifyManifest(
         reason: `evidence_grade_summary_missing_on_v5_manifest: manifest declares version ${manifest.version} but is missing evidenceGradeSummary — every genuine v5 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
       };
     }
+  }
+  // AV-0013 / manifest-v6 — same both-directions rule for `evidencePrivacy`.
+  const hasEvidencePrivacy = 'evidencePrivacy' in manifest;
+  if (manifest.version <= 5 && hasEvidencePrivacy) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `evidence_privacy_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries evidencePrivacy — no genuine producer below v6 ever emits this field; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
+  if (manifest.version >= 6 && !hasEvidencePrivacy) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `evidence_privacy_missing_on_v6_manifest: manifest declares version ${manifest.version} but is missing evidencePrivacy — every genuine v6 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
+    };
   }
 
   const bytes = manifestSignableBytes(manifest);
@@ -5473,6 +5541,10 @@ function assertManifestStructure(manifest: BundleManifest): void {
     ) {
       throw new Error('manifest.json has an invalid structure');
     }
+  }
+  // AV-0013 — format only; presence-vs-version is checked in `verifyManifest`.
+  if ('evidencePrivacy' in manifest) {
+    assertEvidencePrivacyStructure(manifest.evidencePrivacy, manifest.from, manifest.to);
   }
 }
 

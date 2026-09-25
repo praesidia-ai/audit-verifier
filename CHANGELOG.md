@@ -33,6 +33,14 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **Manifest v6: the declared evidence privacy mode** (AV-0013, be BE-1615).
+  `MAX_SUPPORTED_MANIFEST_VERSION` 5 → 6. The signed `evidencePrivacy` timeline joins the
+  manifest preimage (16 fields). New `report.evidencePrivacy`: per mode window, what the
+  bundle proves and what it cannot, plus an annotation for every `payload: null` action
+  event. No status changes: a declared reduced mode keeps `incomplete` as `incomplete` and
+  only adds `reason: "evidence_privacy_mode:<MODE>"`. v1–v5 bundles verify exactly as
+  before and read as `FULL (undeclared)`. A malformed or unknown-schema declaration is a
+  bundle-format error.
 - **Superseding Merkle roots** (AV-0016). New optional root fields `supersedesRootId`
   and `supersessionSignature`, the exported constant `ROOT_SUPERSESSION_VERSION`, and
   `ComponentResult.supersessions` on `rootCoverage` (all additive). A partial root

@@ -49,6 +49,7 @@ import {
   readZip,
 } from '../zip.js';
 import { verifyRekorReceipt } from '../rekor.js';
+import { formatEvidencePrivacyLines } from '../evidence-privacy.js';
 import { aibomTrustFromBundle, verifyAibomAttestation } from '../aibom.js';
 
 // Most fixtures intentionally model pre-attestation legacy bundles. Their
@@ -6194,6 +6195,11 @@ describe('verifyBundle', () => {
       extraPublicKeys?: Record<string, unknown>;
       /** Post-signing mutation hook — applied to the wire event array right before serialization. */
       postSignEvents?: (events: Array<Record<string, unknown>>) => void;
+      /** AV-0013 — v6 `evidencePrivacy` (given the manifest's `from`); default one FULL window on v6. Forced in on any version when set. */
+      evidencePrivacy?: (from: string) => unknown;
+      omitEvidencePrivacy?: boolean;
+      /** Post-signing mutation of the manifest object (tamper tests). */
+      postSignManifest?: (manifest: Record<string, unknown>) => void;
     }): { zip: Buffer; orgId: string } {
       const seed = Buffer.alloc(32, 7); // identical seed to buildFixtureBundle()
       const { privateKey, publicKey } = keypairFromSeed(seed);
@@ -6257,13 +6263,20 @@ describe('verifyBundle', () => {
         manifestSans.captureScopeDigest = captureScopeDigest;
         manifestSans.evidenceGradeSummary = evidenceGradeSummary;
       }
+      if (opts.evidencePrivacy || (version >= 6 && !opts.omitEvidencePrivacy)) {
+        const from = originalManifest.from as string;
+        manifestSans.evidencePrivacy = opts.evidencePrivacy
+          ? opts.evidencePrivacy(from)
+          : { modes: [{ mode: 'FULL', effectiveFrom: from }], schemaVersion: 1 };
+      }
       const manifestBytes = canonicalJson(manifestSans);
       const manifestSignature = signEd25519(manifestBytes, privateKey);
-      const manifest = {
+      const manifest: Record<string, unknown> = {
         ...manifestSans,
         signature: manifestSignature,
         signatureKeyVersion: 1,
       };
+      opts.postSignManifest?.(manifest);
 
       const publicKeys: Record<string, unknown> = {
         '1': { publicKey: publicKeyB64, status: 'ACTIVE', revokedAt: null },
@@ -7270,6 +7283,171 @@ describe('verifyBundle', () => {
         await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(
           /invalid\/incomplete event/,
         );
+      });
+    });
+
+    describe('AV-0013 — manifest v6 evidence privacy mode', () => {
+      const BASE = ['chain_integrity', 'signatures', 'ordering', 'commitment_binding'];
+      const CONTENT = ['content_equality', 'target_ack_body'];
+      const REDUCED_AT = isoSecond(T0, -5 * 60); // 00:05:00, before every successfulActionEvents() event
+      const metadataOnly = (from: string) => ({
+        modes: [
+          { mode: 'FULL', effectiveFrom: from },
+          { mode: 'METADATA_ONLY', effectiveFrom: REDUCED_AT },
+        ],
+        schemaVersion: 1,
+      });
+      const withNullCallerResult = (id: string) =>
+        successfulActionEvents(id).map((e) =>
+          e.eventType === 'CALLER_RESULT_OBSERVED'
+            ? { ...e, payload: null, payloadCommitment: 'c'.repeat(64) }
+            : e,
+        );
+      const gradeC = { A: 0, B: 0, C: 1, D: 0, enforcementMode: 'observe' };
+
+      it('a v6 METADATA_ONLY bundle keeps the incomplete verdict, annotates the reason, and lists what is and is not provable', async () => {
+        const { zip } = buildV5Bundle({
+          versionOverride: 6,
+          events: withNullCallerResult('aaaaaaaa-0000-7000-8000-0000000000p1'),
+          evidenceGradeSummaryOverride: gradeC,
+          evidencePrivacy: metadataOnly,
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.manifest.status).toBe('valid');
+        expect(report.callerResult.status).toBe('incomplete');
+        expect(report.callerResult.reason).toBe('evidence_privacy_mode:METADATA_ONLY');
+        expect(report.status).toBe('incomplete');
+        expect(report.ok).toBe(false);
+        const ep = report.evidencePrivacy;
+        expect(ep.declared).toBe(true);
+        expect(ep.schemaVersion).toBe(1);
+        expect(ep.modes).toEqual([
+          { mode: 'FULL', effectiveFrom: report.bundle.from, effectiveTo: REDUCED_AT, proven: [...BASE, ...CONTENT], notProvable: [] },
+          { mode: 'METADATA_ONLY', effectiveFrom: REDUCED_AT, effectiveTo: report.bundle.to, proven: BASE, notProvable: CONTENT },
+        ]);
+        expect(ep.payloadAbsences).toEqual([
+          {
+            event: 'aaaaaaaa-0000-7000-8000-0000000000p1#5',
+            eventType: 'CALLER_RESULT_OBSERVED',
+            receivedAt: isoSecond(T0, 4),
+            annotation: 'evidence_privacy_mode:METADATA_ONLY',
+          },
+        ]);
+        const text = formatEvidencePrivacyLines(ep).join('\n');
+        expect(text).toMatch(/METADATA_ONLY .*not provable: content_equality, target_ack_body/);
+        expect(text).toMatch(/#5 CALLER_RESULT_OBSERVED: evidence_privacy_mode:METADATA_ONLY/);
+      });
+
+      it('a v6 bundle with full payloads under a declared reduced mode still verifies valid', async () => {
+        const { zip } = buildV5Bundle({
+          versionOverride: 6,
+          events: successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000p2'),
+          evidenceGradeSummaryOverride: gradeC,
+          evidencePrivacy: metadataOnly,
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.status).toBe('valid');
+        expect(report.evidencePrivacy.payloadAbsences).toEqual([]);
+      });
+
+      it('a v5 bundle is unchanged and reads as FULL (undeclared), claiming no content equality', async () => {
+        const { zip } = buildV5Bundle({
+          events: withNullCallerResult('aaaaaaaa-0000-7000-8000-0000000000p3'),
+          evidenceGradeSummaryOverride: gradeC,
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.manifest.status).toBe('valid');
+        expect(report.callerResult.status).toBe('incomplete');
+        expect(report.callerResult.reason).toBeUndefined();
+        expect(report.status).toBe('incomplete');
+        expect(report.evidencePrivacy).toEqual({
+          declared: false,
+          schemaVersion: null,
+          modes: [
+            { mode: 'FULL', effectiveFrom: report.bundle.from, effectiveTo: report.bundle.to, proven: BASE, notProvable: CONTENT },
+          ],
+          payloadAbsences: [
+            {
+              event: 'aaaaaaaa-0000-7000-8000-0000000000p3#5',
+              eventType: 'CALLER_RESULT_OBSERVED',
+              receivedAt: isoSecond(T0, 4),
+              annotation: 'undeclared_payload_absence',
+            },
+          ],
+        });
+        expect(formatEvidencePrivacyLines(report.evidencePrivacy).join('\n')).toMatch(/FULL \(undeclared\)/);
+      });
+
+      it('a null payload outside any declared reduced window is annotated undeclared_payload_absence, not invalid', async () => {
+        const { zip } = buildV5Bundle({
+          versionOverride: 6,
+          events: withNullCallerResult('aaaaaaaa-0000-7000-8000-0000000000p4'),
+          evidenceGradeSummaryOverride: gradeC,
+          evidencePrivacy: (from) => ({
+            modes: [
+              { mode: 'FULL', effectiveFrom: from },
+              { mode: 'METADATA_ONLY', effectiveFrom: isoSecond(T0, 30 * 60) },
+            ],
+            schemaVersion: 1,
+          }),
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.callerResult.status).toBe('incomplete');
+        expect(report.callerResult.reason).toBeUndefined();
+        expect(report.status).toBe('incomplete');
+        expect(report.evidencePrivacy.payloadAbsences.map((a) => a.annotation)).toEqual([
+          'undeclared_payload_absence',
+        ]);
+      });
+
+      it('evidencePrivacy is inside the signed preimage: a post-signing mode edit fails the manifest', async () => {
+        const { zip } = buildV5Bundle({
+          versionOverride: 6,
+          events: successfulActionEvents('aaaaaaaa-0000-7000-8000-0000000000p5'),
+          postSignManifest: (m) => {
+            (m.evidencePrivacy as { modes: Array<{ mode: string }> }).modes[0]!.mode = 'METADATA_ONLY';
+          },
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.manifest.status).toBe('invalid');
+        expect(report.manifest.reason).toBe('manifest signature does not verify');
+        expect(report.status).toBe('invalid');
+        expect(report.evidencePrivacy.declared).toBe(false);
+      });
+
+      it('rejects evidencePrivacy on a v5 manifest and its absence on a v6 manifest', async () => {
+        const onV5 = await verifyBundle(
+          buildV5Bundle({ events: [], evidencePrivacy: metadataOnly }).zip,
+          { noRekor: true },
+        );
+        expect(onV5.manifest.reason).toMatch(/^evidence_privacy_present_on_v5_manifest/);
+        const missing = await verifyBundle(
+          buildV5Bundle({ events: [], versionOverride: 6, omitEvidencePrivacy: true }).zip,
+          { noRekor: true },
+        );
+        expect(missing.manifest.reason).toMatch(/^evidence_privacy_missing_on_v6_manifest/);
+      });
+
+      it.each([
+        ['an unknown mode', (f: string) => ({ modes: [{ mode: 'PARTIAL', effectiveFrom: f }], schemaVersion: 1 })],
+        ['an empty timeline', () => ({ modes: [], schemaVersion: 1 })],
+        ['a first window not starting at manifest.from', () => ({ modes: [{ mode: 'FULL', effectiveFrom: REDUCED_AT }], schemaVersion: 1 })],
+        ['a descending timeline', (f: string) => ({ modes: [{ mode: 'FULL', effectiveFrom: f }, { mode: 'REDACTED', effectiveFrom: isoSecond(T0, 60) }, { mode: 'FULL', effectiveFrom: REDUCED_AT }], schemaVersion: 1 })],
+        ['a change at or after manifest.to', (f: string) => ({ modes: [{ mode: 'FULL', effectiveFrom: f }, { mode: 'REDACTED', effectiveFrom: '2027-01-01T00:00:00.000Z' }], schemaVersion: 1 })],
+        ['an unknown key', (f: string) => ({ modes: [{ mode: 'FULL', effectiveFrom: f }], schemaVersion: 1, note: 'x' })],
+        ['a non-integer schemaVersion', (f: string) => ({ modes: [{ mode: 'FULL', effectiveFrom: f }], schemaVersion: '1' })],
+      ])('rejects %s as a bundle-format error', async (_name, evidencePrivacy) => {
+        const { zip } = buildV5Bundle({ events: [], versionOverride: 6, evidencePrivacy });
+        await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(/manifest\.evidencePrivacy/);
+      });
+
+      it('rejects an evidencePrivacy schemaVersion this build does not know (upgrade the verifier)', async () => {
+        const { zip } = buildV5Bundle({
+          events: [],
+          versionOverride: 6,
+          evidencePrivacy: (f) => ({ modes: [{ mode: 'FULL', effectiveFrom: f }], schemaVersion: 2 }),
+        });
+        await expect(verifyBundle(zip, { noRekor: true })).rejects.toThrow(/evidencePrivacy schemaVersion 2 .*upgrade the verifier/);
       });
     });
 

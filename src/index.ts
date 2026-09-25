@@ -22,6 +22,15 @@ export type {
 } from './verify.js';
 
 export { formatProofLines, PROOF_COMPONENTS } from './proofs.js';
+export { formatEvidencePrivacyLines, EVIDENCE_PRIVACY_MODES, EVIDENCE_PRIVACY_SCHEMA_VERSION } from './evidence-privacy.js';
+export type {
+  EvidencePrivacyMode,
+  EvidencePrivacyProperty,
+  EvidencePrivacyReport,
+  EvidencePrivacyWindow,
+  PayloadAbsence,
+  PayloadAbsenceAnnotation,
+} from './evidence-privacy.js';
 export type { ProofType, ProofStatus } from './proofs.js';
 
 export { findVerifiedDecision, DECISION_DISCLOSURE_VERSION } from './decision-disclosures.js';

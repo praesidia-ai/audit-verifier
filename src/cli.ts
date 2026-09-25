@@ -16,6 +16,8 @@
  *      when the relevant evidence event is legitimately redacted (a
  *      `payload: null` with a present `payloadCommitment` — threat-model
  *      row #10).
+ *      AV-0013: a declared evidence privacy mode (manifest v6) never turns
+ *      that into a pass; it only adds `reason: evidence_privacy_mode:<MODE>`.
  */
 
 import * as fs from 'node:fs/promises';
@@ -28,6 +30,7 @@ import { isAuditPackage, verifyAuditPackage, type PackageIntegrity } from './pac
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 import { findVerifiedDecision, formatDecision } from './decision-disclosures.js';
 import { formatProofLines } from './proofs.js';
+import { formatEvidencePrivacyLines } from './evidence-privacy.js';
 import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
@@ -470,6 +473,8 @@ function printDetail(report: VerifyReport & { package?: PackageIntegrity }, line
   for (const p of report.decisionDisclosures?.policyReferences ?? []) {
     lines.push(`             policy ${p.policyId}@${p.policyVersion ?? 'none'} (reference only; policy text not verified)`);
   }
+  // AV-0013 — declared evidence privacy mode and what it lets the bundle prove.
+  lines.push('', ...formatEvidencePrivacyLines(report.evidencePrivacy));
 }
 
 function printTail(report: VerifyReport, lines: string[], noRekor: boolean, platformKeySupplied: boolean): void {
