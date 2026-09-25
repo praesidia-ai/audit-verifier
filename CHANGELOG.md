@@ -94,6 +94,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   rows, zero roots, no action events) is `incomplete` (exit 3), not `valid`.
   `manifest`, `completeness` and `keyBinding` never report it.
 
+### Fixed
+- **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command
+  every `be` audit package's `verification.txt` and the ui proof page tell the auditor
+  to run, but the CLI only knew `<bundle.zip>`, `verify-set` and `aibom`, so it exited 2
+  (`only one bundle path may be supplied`). A leading `verify` is now an exact alias of
+  single-bundle mode (same checks, report and exit codes), which fixes every package
+  already handed out. No verification check changed. A bundle file literally named
+  `verify` in the working directory must now be passed as `./verify`.
+
 ### Compatibility
 - AV-0008 is a **strictness increase** and a new enum value. JSON / library consumers that
   switch exhaustively on `ComponentStatus` must handle `'not_present'`; a 0-checked

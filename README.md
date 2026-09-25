@@ -25,6 +25,7 @@ npx @praesidia/audit-verifier bundle.zip
 
 ```bash
 praesidia-verify <bundle.zip> [options]
+praesidia-verify verify <bundle.zip> [options]   # alias of the form above
 praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex>
 praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
                # AIBOM attested export — see "AIBOM attestations" below

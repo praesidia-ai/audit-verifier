@@ -54,6 +54,7 @@ const HELP = `praesidia-verify — offline verifier for Praesidia compliance bun
 
 USAGE
   praesidia-verify <bundle.zip> [options]
+  praesidia-verify verify <bundle.zip> [options]   (alias of the form above)
   praesidia-verify verify-set <bundle1.zip> <bundle2.zip> [...] [options]
   praesidia-verify aibom <aibom.attested.json> --tenant-key-fingerprint <sha256hex> [...]
   praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle options]
@@ -850,10 +851,10 @@ async function mainVerifySet(argv: string[]): Promise<number> {
   return verifySetExitCode(setReport.status);
 }
 
-async function main(): Promise<number> {
+async function main(argv: string[]): Promise<number> {
   let args: CliArgs;
   try {
-    args = parseArgs(process.argv.slice(2));
+    args = parseArgs(argv);
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n\n${HELP}`);
     return 2;
@@ -917,13 +918,16 @@ async function main(): Promise<number> {
  * SCAN2-004 — `verify-set` is a subcommand, dispatched on a literal first
  * argument, exactly like `npm <command>` / `git <command>`. Any other
  * first argument (including none) is unaffected and reaches the ORIGINAL
- * single-bundle `main()` unchanged.
+ * single-bundle `main()` unchanged. AV-0006 — a leading `verify` is an
+ * exact alias of single-bundle mode: it is the form be's `verification.txt`
+ * and the ui proof page print, so every package already handed out works.
  */
 function runCli(): Promise<number> {
-  if (process.argv[2] === 'aibom') return mainAibom(process.argv.slice(3));
-  return process.argv[2] === 'verify-set'
-    ? mainVerifySet(process.argv.slice(3))
-    : main();
+  const [cmd, ...rest] = process.argv.slice(2);
+  if (cmd === 'aibom') return mainAibom(rest);
+  if (cmd === 'verify-set') return mainVerifySet(rest);
+  if (cmd === 'verify') return main(rest);
+  return main(process.argv.slice(2));
 }
 
 /**

@@ -23,7 +23,7 @@ import * as zlib from 'node:zlib';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -5904,6 +5904,39 @@ describe('verifyBundle', () => {
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
+    });
+
+    // AV-0006 — `verify` is the form be's verification.txt and the ui proof
+    // page print. It must be an exact alias of single-bundle mode: same exit
+    // code and byte-identical report, for a passing AND a failing bundle.
+    describe('AV-0006 — `verify <bundle>` alias of single-bundle mode', () => {
+      const run = (args: string[]) =>
+        spawnSync(process.execPath, [cliPathOrThrow(), ...args], { encoding: 'utf8' });
+      const flags = ['--no-rekor', '--allow-legacy-unattested', '--json'];
+
+      it.each([
+        ['pristine', {}, 0],
+        ['tampered', { postSignRowByte: (rows: FixtureRow[]) => { rows[2]!.action = 'agent.deleted'; } }, 1],
+      ] as const)('%s bundle: same exit code and report with or without `verify`', (_n, tamper, code) => {
+        const { zip } = buildBundleWithTamper(tamper);
+        const { tmpDir, bundlePath } = writeTempBundle(zip);
+        try {
+          const bare = run([bundlePath, ...flags]);
+          const alias = run(['verify', bundlePath, ...flags]);
+          expect(bare.status).toBe(code);
+          expect(alias.status).toBe(code);
+          expect(alias.stdout).toBe(bare.stdout);
+          expect(JSON.parse(alias.stdout).status).toBe(code === 0 ? 'valid' : 'invalid');
+        } finally {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      });
+
+      it('`verify` with no bundle path exits 2 and prints usage', () => {
+        const r = run(['verify']);
+        expect(r.status).toBe(2);
+        expect(r.stdout).toContain('praesidia-verify verify <bundle.zip>');
+      });
     });
   });
 
