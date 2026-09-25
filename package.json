@@ -19,6 +19,7 @@
   "files": [
     "dist",
     "README.md",
+    "samples",
     "LICENSE",
     "docs/trust-anchor-verification.md",
     "docs/design/platform-key-hierarchy.md",

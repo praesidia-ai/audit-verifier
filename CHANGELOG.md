@@ -33,6 +33,10 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- `samples/` (AV-0011) — valid, corrupted and wrong-key audit packages plus the
+  sample platform PUBLIC key, signed with TEST keys only (SAMPLE — NOT A PRAESIDIA
+  KEY), generated deterministically by `scripts/make-sample-bundles.mjs`; README
+  "Try it in 60 seconds". No verifier code change.
 - `praesidia-verify aibom <file> --tenant-key-fingerprint <sha256hex>` and
   `verifyAibomAttestation()` (AV-0001) — offline verification of `be`'s attested
   AIBOM export (`praesidia-aibom-attestation/v1`) with `be`'s verdict set, plus three

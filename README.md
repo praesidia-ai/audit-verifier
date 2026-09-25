@@ -21,6 +21,61 @@ npm install -g @praesidia/audit-verifier
 npx @praesidia/audit-verifier bundle.zip
 ```
 
+## Try it in 60 seconds
+
+The package ships three sample audit packages in `samples/`, signed with
+**TEST keys only** (SAMPLE — NOT A PRAESIDIA KEY; see
+[`samples/README.md`](samples/README.md)). They carry no Rekor anchor, hence
+`--no-rekor`; `--platform-key` is required because the CLI never trusts the
+sample key on its own.
+
+```bash
+S=node_modules/@praesidia/audit-verifier/samples   # or ./samples in a checkout
+npx praesidia-verify $S/audit-package.valid.zip     --platform-key $S/sample-platform-key.pem --no-rekor --summary
+npx praesidia-verify $S/audit-package.corrupted.zip --platform-key $S/sample-platform-key.pem --no-rekor --summary
+npx praesidia-verify $S/audit-package.wrong-key.zip --platform-key $S/sample-platform-key.pem --no-rekor --summary
+```
+
+Output of a real run (each also prints the `--no-rekor` NOTE and the
+caller-supplied-key WARNING). Valid, exit 0:
+
+```text
+PASS signature
+PASS hash chain
+PASS decision receipt
+PASS policy reference
+PASS evidence integrity
+NOT_PRESENT target receipt
+
+RESULT: OK
+```
+
+Corrupted (one byte of one signed row flipped), exit 1:
+
+```text
+FAIL signature
+FAIL hash chain
+INCOMPLETE decision receipt
+INCOMPLETE policy reference
+PASS evidence integrity
+NOT_PRESENT target receipt
+
+RESULT: FAIL
+```
+
+Wrong key (platform attestation signed by another key), exit 1:
+
+```text
+FAIL signature
+PASS hash chain
+PASS decision receipt
+PASS policy reference
+PASS evidence integrity
+NOT_PRESENT target receipt
+
+RESULT: FAIL
+```
+
 ## Usage
 
 ```bash
