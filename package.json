@@ -41,7 +41,8 @@
     "typecheck": "tsc --noEmit",
     "typecheck:spec": "tsc --noEmit -p tsconfig.spec.json",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "sbom": "npx --yes @cyclonedx/cyclonedx-npm@6.0.1 --omit dev --output-format JSON --output-file sbom.cdx.json"
   },
   "devDependencies": {
     "@types/node": "20.19.43",

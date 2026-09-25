@@ -72,6 +72,19 @@ jobs:
       - name: Verify publish artifact (prepack repeats the trust-anchor gate)
         run: npm pack --dry-run
 
+      # AV-0014 — CycloneDX SBOM of the production dependency tree (same
+      # tool + flags as be's sbom-release.yml), kept as a workflow artifact.
+      # Not in package.json `files`, so it is not shipped in the tarball.
+      - name: Generate SBOM (CycloneDX)
+        run: npm run sbom
+
+      - name: Upload SBOM as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+
       - name: Publish to npm
         # MIL-0002 F4 — `--provenance` publishes a signed SLSA provenance
         # attestation (build workflow + commit + subject digest) to the npm
