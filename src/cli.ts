@@ -26,6 +26,7 @@ import { verifyBundle, type VerifyReport, type ComponentResult, type VerifyOptio
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { isAuditPackage, verifyAuditPackage, type PackageIntegrity } from './package.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
+import { findVerifiedDecision, formatDecision } from './decision-disclosures.js';
 import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
@@ -115,6 +116,16 @@ OPTIONS
                Praesidia's published trust-anchor document). Mismatch exits 2.
   --allow-legacy-unattested
                Explicitly accept bundles without platform attestation.
+  --disclosures <file>
+               AV-0009 — a bare bundle's evidence/decision-receipts.ndjson
+               (an audit package's own entry is read automatically). Each
+               line must open the signed detailsCommitment of the bundle
+               row it names, or the "decision receipts" component fails.
+  --decision <decisionId>
+               Print that decision's verified fields (decision, policy
+               reference, approvalId, actor, tool, signed timestamp). Exit
+               0 only when it is disclosed and the whole report is valid,
+               else 1. The policy text itself is not in the package.
   --quiet      Print only the final OK/FAIL/INCOMPLETE summary line.
   --json       Print the full VerifyReport as stable machine-readable JSON
                instead of the human-readable report (mutually exclusive
@@ -218,14 +229,33 @@ function parseCommonArgs(
   }
 }
 
-function parseArgs(argv: string[]): CliArgs {
+/** AV-0009 — single-bundle-only flags. */
+interface SingleBundleArgs extends CliArgs {
+  disclosuresPath: string | null;
+  decisionId: string | null;
+}
+
+function parseArgs(argv: string[]): SingleBundleArgs {
   const flags = newCommonFlags();
   const positionals: string[] = [];
-  parseCommonArgs(argv, flags, positionals);
+  const rest: string[] = [];
+  const own = { disclosuresPath: null as string | null, decisionId: null as string | null };
+  for (let i = 0; i < argv.length; i += 1) {
+    const key = argv[i] === '--disclosures' ? 'disclosuresPath' : argv[i] === '--decision' ? 'decisionId' : null;
+    if (key === null) {
+      rest.push(argv[i]!);
+      continue;
+    }
+    const value = argv[i + 1];
+    if (!value || value.startsWith('-')) throw new Error(`${argv[i]} requires a value`);
+    own[key] = value;
+    i += 1;
+  }
+  parseCommonArgs(rest, flags, positionals);
   if (positionals.length > 1) {
     throw new Error('only one bundle path may be supplied');
   }
-  return { ...flags, bundlePath: positionals[0] ?? null };
+  return { ...flags, ...own, bundlePath: positionals[0] ?? null };
 }
 
 interface VerifySetArgs extends CommonFlags {
@@ -407,6 +437,11 @@ function printReport(
   lines.push(fmtComponent('closure legality  ', report.closureLegality));
   lines.push(fmtComponent('evidence grade    ', report.evidenceGrade));
   lines.push(fmtComponent('action completeness', report.actionCompleteness));
+  lines.push(fmtComponent('decision receipts ', report.decisionReceipt));
+  lines.push(fmtComponent('policy reference  ', report.policyReference));
+  for (const p of report.decisionDisclosures?.policyReferences ?? []) {
+    lines.push(`             policy ${p.policyId}@${p.policyVersion ?? 'none'} (reference only; policy text not verified)`);
+  }
   lines.push('');
   lines.push(`RESULT: ${statusWord(report.status)}`);
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
@@ -867,7 +902,7 @@ async function mainVerifySet(argv: string[]): Promise<number> {
 }
 
 async function main(argv: string[]): Promise<number> {
-  let args: CliArgs;
+  let args: SingleBundleArgs;
   try {
     args = parseArgs(argv);
   } catch (err) {
@@ -892,6 +927,13 @@ async function main(argv: string[]): Promise<number> {
   let options: VerifyOptions;
   try {
     options = await bundleVerifyOptions(args);
+    if (args.disclosuresPath !== null) {
+      options.decisionDisclosures = await readRegularFileBounded(
+        path.resolve(args.disclosuresPath),
+        MAX_ZIP_ARCHIVE_BYTES,
+        'disclosures',
+      );
+    }
   } catch (err) {
     process.stderr.write(`error: ${(err as Error).message}\n`);
     return 2;
@@ -907,6 +949,20 @@ async function main(argv: string[]): Promise<number> {
       `error: bundle format error: ${(err as Error).message}\n`,
     );
     return 2;
+  }
+  // AV-0009 — `--decision <id>`: that one decision's verified fields; exit 1
+  // unless it is disclosed AND the whole report verified.
+  if (args.decisionId !== null) {
+    const found = findVerifiedDecision(report, args.decisionId);
+    const receipts = `decision receipts ${statusWord(report.decisionReceipt.status)}${report.decisionReceipt.reason ? `: ${report.decisionReceipt.reason}` : ''}`;
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ status: report.status, decision: found }, null, 2)}\n`);
+    } else if (found) {
+      process.stdout.write(`${[`decision ${args.decisionId}: VERIFIED (report ${statusWord(report.status)})`, ...formatDecision(found)].join('\n')}\n`);
+    } else {
+      process.stdout.write(`decision ${args.decisionId}: NOT VERIFIED (report ${statusWord(report.status)}; ${receipts})\n`);
+    }
+    return found ? 0 : 1;
   }
   if (args.json) {
     // PA-0009 — stable machine-readable JSON mode. Prints the full

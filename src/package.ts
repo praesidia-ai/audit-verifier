@@ -12,6 +12,7 @@
 import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyOptions, type VerifyReport } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES, readZip, type ZipEntry } from './zip.js';
+import { DECISION_DISCLOSURES_ENTRY } from './decision-disclosures.js';
 
 export const PACKAGE_BUNDLE_ENTRY = 'evidence/audit-bundle.zip';
 const RECEIPT_ENTRY = 'verification.txt';
@@ -105,10 +106,17 @@ export async function verifyAuditPackage(
   }
   const inner = byName.get(PACKAGE_BUNDLE_ENTRY)!.data;
   const integrity = checkReceipt(inner, byName.get(RECEIPT_ENTRY));
-  const sideArtifacts = [...byName.keys()].filter((n) => n !== PACKAGE_BUNDLE_ENTRY && n !== RECEIPT_ENTRY);
+  // AV-0009 — the decision disclosures are checked line by line against the
+  // bundle's signed rows (`decisionReceipt`), so they are not a side artifact.
+  const disclosures = byName.get(DECISION_DISCLOSURES_ENTRY)?.data;
+  if (disclosures && options.decisionDisclosures) {
+    throw new Error(`the package carries ${DECISION_DISCLOSURES_ENTRY}; do not also pass --disclosures`);
+  }
+  const consumed = new Set([PACKAGE_BUNDLE_ENTRY, RECEIPT_ENTRY, DECISION_DISCLOSURES_ENTRY]);
+  const sideArtifacts = [...byName.keys()].filter((n) => !consumed.has(n));
   let report: VerifyReport;
   try {
-    report = await verifyBundle(inner, options);
+    report = await verifyBundle(inner, disclosures ? { ...options, decisionDisclosures: disclosures } : options);
   } catch (err) {
     const msg = `${PACKAGE_BUNDLE_ENTRY}: ${(err as Error).message}`;
     throw new Error(integrity.status === 'invalid' ? `${integrity.reason}; ${msg}` : msg);

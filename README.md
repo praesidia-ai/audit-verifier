@@ -69,7 +69,32 @@ package itself: the verifier checks the receipt against the inner bundle's bytes
 (mismatch or unparseable receipt → `invalid`, exit 1; receipt missing →
 `incomplete`, exit 3), then verifies the inner bundle exactly as a direct bundle.
 Only the inner bundle's signatures authenticate anything; every other entry is
-listed under `package.sideArtifacts` as **not verified**.
+listed under `package.sideArtifacts` as **not verified** — except
+`evidence/decision-receipts.ndjson`, which is checked line by line (below).
+
+## Decision receipts and policy references (AV-0009)
+
+Post-cutover decision rows are signed over a `detailsCommitment`, not their
+contents. The package's unsigned `evidence/decision-receipts.ndjson` (be BE-1585)
+opens them: `decisionReceipt` requires each line's
+`base64(sha256(salt || canonicalJson({details})))` to equal the signed
+`detailsCommitment` of the `POLICY_DECISION`/`POLICY_VIOLATION` row it names
+(mismatch, a row not in the bundle, an unknown version or an unparseable line →
+`invalid`; withheld rows are counted, not failed; no file → `not_present`).
+`policyReference` then checks each verified Decision Record's `policyId` /
+`policyVersion` / `decision` (and the `approvalId` of an allow that consumed a
+step-up approval) and reports the distinct policy references. It verifies the
+reference only — the policy text is not in the package.
+
+```bash
+praesidia-verify audit-package.zip                          # read automatically
+praesidia-verify bundle.zip --disclosures decision-receipts.ndjson
+praesidia-verify audit-package.zip --decision <decisionId>  # exit 0 verified, 1 not
+```
+
+Report fields: `decisionReceipt`, `policyReference`, and `decisionDisclosures`
+(`withheld`, `undisclosed`, `policyReferences[]`, `decisions[]`; present only when
+`decisionReceipt` is `valid`). Contract: `docs/decision-disclosures.md`.
 
 ## Cross-bundle continuity (`verify-set`)
 

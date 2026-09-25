@@ -103,6 +103,18 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   unsigned side artifact, never verified. Library: `verifyAuditPackage()`,
   `isAuditPackage()`. Additive: a direct bundle verifies byte-for-byte as before (the
   `verify-set` and `aibom --audit-bundle` inputs still take the inner bundle only).
+- **Decision receipts and policy references (AV-0009).** New components
+  `decisionReceipt` and `policyReference` over be BE-1585's unsigned
+  `evidence/decision-receipts.ndjson`: each line must open the signed
+  `detailsCommitment` of the bundle's `POLICY_DECISION`/`POLICY_VIOLATION` row it
+  names (`invalid` on mismatch, a foreign row, an unknown version or an unparseable
+  line; withheld rows counted; no file → `not_present`). Read from audit packages
+  automatically (no longer listed as a side artifact), or `--disclosures <ndjson>`
+  for a bare bundle; `--decision <id>` prints one verified decision (exit 1 unless
+  disclosed and the report is `valid`). Library: `VerifyOptions.decisionDisclosures`,
+  `VerifyReport.decisionReceipt` / `.policyReference` / `.decisionDisclosures?`,
+  `findVerifiedDecision()`. Additive: every existing bundle and pre-BE-1585 package verifies
+  with the same verdict (both components `not_present`).
 
 ### Fixed
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command

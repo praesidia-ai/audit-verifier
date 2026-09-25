@@ -21,6 +21,9 @@ export type {
   AttestedTenantKey,
 } from './verify.js';
 
+export { findVerifiedDecision, DECISION_DISCLOSURE_VERSION } from './decision-disclosures.js';
+export type { VerifiedDecision, DecisionDisclosureSummary } from './decision-disclosures.js';
+
 export { verifyHttpReceipt, httpRequestCommitment, httpTargetKeyFingerprint } from './http-receipt.js';
 export type { SignedHttpReceipt, HttpReceiptStatement, HttpRequestEnvelope, HttpReceiptExpected } from './http-receipt.js';
 

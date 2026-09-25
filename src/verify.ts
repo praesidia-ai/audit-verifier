@@ -77,6 +77,10 @@ import {
   GENESIS_PREV_ROW_HASH,
 } from './crypto.js';
 import {
+  verifyDecisionDisclosures,
+  type DecisionDisclosureSummary,
+} from './decision-disclosures.js';
+import {
   MAX_ZIP_ARCHIVE_BYTES,
   MAX_ZIP_ENTRY_UNCOMPRESSED_BYTES,
   MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
@@ -889,6 +893,27 @@ export interface VerifyReport {
    * `unsupported` on `manifest.version < 5`.
    */
   actionCompleteness: ComponentResult;
+  /**
+   * AV-0009 — `evidence/decision-receipts.ndjson` (be BE-1585, supplied via
+   * `VerifyOptions.decisionDisclosures` or read from an audit package): each
+   * line's `base64(sha256(salt || canonicalJson({details})))` must equal the
+   * SIGNED `detailsCommitment` of the bundle's POLICY_DECISION /
+   * POLICY_VIOLATION row it names. A mismatch, a row not in the bundle, an
+   * unknown version or an unparseable line is `invalid`; withheld rows are
+   * counted in `reason`, not failed; no file is `not_present`. `incomplete`
+   * when every opening matched but row signatures did not verify.
+   */
+  decisionReceipt: ComponentResult;
+  /**
+   * AV-0009 — every verified Decision Record v1 carries a well-formed
+   * `policyId` / `policyVersion` / `decision` consistent with its signed row
+   * action, and an ALLOW that consumed a step-up approval names its
+   * `approvalId`. Verifies the REFERENCE only: the policy text is not in the
+   * package.
+   */
+  policyReference: ComponentResult;
+  /** AV-0009 — present only when `decisionReceipt` is `valid`. */
+  decisionDisclosures?: DecisionDisclosureSummary;
   bundle: {
     orgId: string;
     from: string;
@@ -1018,6 +1043,12 @@ export interface VerifyOptions {
    * to widen them are rejected as bundle-format errors.
    */
   resourceLimits?: Partial<VerifyResourceLimits>;
+  /**
+   * AV-0009 — raw bytes of an UNSIGNED `evidence/decision-receipts.ndjson`
+   * for this bundle (CLI `--disclosures`). `verifyAuditPackage` reads the
+   * package's own entry and rejects this option alongside it.
+   */
+  decisionDisclosures?: Buffer;
 }
 
 export interface VerifyResourceLimits {
@@ -1544,6 +1575,17 @@ export async function verifyBundle(
     verifyRootCoverage(manifest, rows, roots, proofs, verifiedSeals),
   );
 
+  // 12) AV-0009 — decision disclosures, bound to the signed rows above.
+  const disclosures = verifyDecisionDisclosures(options.decisionDisclosures ?? null, rows, {
+    maxLines: resourceLimits.maxRows + 1,
+    maxLineBytes: resourceLimits.maxNdjsonLineBytes,
+  });
+  const rowsTrusted = rowSigResult.status === 'valid';
+  const disclosureStatus = (r: RawComponentResult): ComponentStatus | undefined =>
+    r.ok && r.checked > 0 && !rowsTrusted ? 'incomplete' : undefined;
+  const decisionReceiptResult = withEvidenceStatus(disclosures.receipt, disclosureStatus(disclosures.receipt));
+  const policyReferenceResult = withEvidenceStatus(disclosures.policy, disclosureStatus(disclosures.policy));
+
   // PA-0009 (D15) — real reduction over `status`, not an AND of `ok`. See
   // `reduceStatus` doc comment: `invalid` beats `incomplete` beats `valid`,
   // and `unsupported`/`not_present` components are excluded rather than
@@ -1569,6 +1611,8 @@ export async function verifyBundle(
     closureLegalityResult,
     evidenceGradeResult,
     actionCompletenessResult,
+    decisionReceiptResult,
+    policyReferenceResult,
   ];
   // AV-0008 — the components that carry audit evidence (every
   // optional-evidence component except platformAttestation, which is key
@@ -1602,6 +1646,11 @@ export async function verifyBundle(
     closureLegality: closureLegalityResult,
     evidenceGrade: evidenceGradeResult,
     actionCompleteness: actionCompletenessResult,
+    decisionReceipt: decisionReceiptResult,
+    policyReference: policyReferenceResult,
+    ...(decisionReceiptResult.status === 'valid' && disclosures.summary
+      ? { decisionDisclosures: disclosures.summary }
+      : {}),
     bundle: {
       orgId: manifest.orgId,
       from: manifest.from,
