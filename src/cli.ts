@@ -3,7 +3,7 @@
  * `praesidia-verify` CLI entry point.
  *
  * Usage:
- *   praesidia-verify <bundle.zip> [--no-rekor] [--quiet] [--json] [--help]
+ *   praesidia-verify <bundle.zip> [--no-rekor] [--summary] [--quiet] [--json] [--help]
  *
  * Exit codes:
  *   0  All checks passed (status: valid).
@@ -27,6 +27,7 @@ import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { isAuditPackage, verifyAuditPackage, type PackageIntegrity } from './package.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 import { findVerifiedDecision, formatDecision } from './decision-disclosures.js';
+import { formatProofLines } from './proofs.js';
 import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
@@ -126,6 +127,11 @@ OPTIONS
                reference, approvalId, actor, tool, signed timestamp). Exit
                0 only when it is disclosed and the whole report is valid,
                else 1. The policy text itself is not in the package.
+  --summary    AV-0010 — print only the six per-proof lines (PASS/FAIL/
+               NOT_PRESENT/INCOMPLETE signature, hash chain, decision
+               receipt, policy reference, evidence integrity, target
+               receipt), then RESULT and any caveat. Without it the six
+               lines lead the full component detail.
   --quiet      Print only the final OK/FAIL/INCOMPLETE summary line.
   --json       Print the full VerifyReport as stable machine-readable JSON
                instead of the human-readable report (mutually exclusive
@@ -233,14 +239,20 @@ function parseCommonArgs(
 interface SingleBundleArgs extends CliArgs {
   disclosuresPath: string | null;
   decisionId: string | null;
+  /** AV-0010 — print only the six proof lines + RESULT (and caveats). */
+  summary: boolean;
 }
 
 function parseArgs(argv: string[]): SingleBundleArgs {
   const flags = newCommonFlags();
   const positionals: string[] = [];
   const rest: string[] = [];
-  const own = { disclosuresPath: null as string | null, decisionId: null as string | null };
+  const own = { disclosuresPath: null as string | null, decisionId: null as string | null, summary: false };
   for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === '--summary') {
+      own.summary = true;
+      continue;
+    }
     const key = argv[i] === '--disclosures' ? 'disclosuresPath' : argv[i] === '--decision' ? 'decisionId' : null;
     if (key === null) {
       rest.push(argv[i]!);
@@ -369,14 +381,27 @@ function printReport(
   quiet: boolean,
   noRekor: boolean,
   platformKeySupplied: boolean,
+  summary = false,
 ): void {
   if (quiet) {
     process.stdout.write(`${statusWord(report.status)}\n`);
     return;
   }
   const lines: string[] = [];
-  lines.push('Praesidia compliance bundle verification');
-  lines.push('────────────────────────────────────────');
+  // AV-0010 — the six per-proof lines lead; the component detail follows
+  // unless --summary. RESULT and every caveat below are always printed.
+  if (!summary) {
+    lines.push('Praesidia compliance bundle verification');
+    lines.push('────────────────────────────────────────');
+  }
+  lines.push(...formatProofLines(report.proofs));
+  if (!summary) printDetail(report, lines);
+  printTail(report, lines, noRekor, platformKeySupplied);
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+function printDetail(report: VerifyReport & { package?: PackageIntegrity }, lines: string[]): void {
+  lines.push('');
   // AV-0007 — audit package: receipt binding + unsigned side artifacts.
   if (report.package) {
     const p = report.package;
@@ -442,6 +467,9 @@ function printReport(
   for (const p of report.decisionDisclosures?.policyReferences ?? []) {
     lines.push(`             policy ${p.policyId}@${p.policyVersion ?? 'none'} (reference only; policy text not verified)`);
   }
+}
+
+function printTail(report: VerifyReport, lines: string[], noRekor: boolean, platformKeySupplied: boolean): void {
   lines.push('');
   lines.push(`RESULT: ${statusWord(report.status)}`);
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
@@ -494,7 +522,6 @@ function printReport(
         'Praesidia vouches for the signing keys used.',
     );
   }
-  process.stdout.write(lines.join('\n') + '\n');
 }
 
 function fmtComponent(label: string, c: ComponentResult): string {
@@ -972,7 +999,7 @@ async function main(argv: string[]): Promise<number> {
     // parser. `--quiet` is ignored when `--json` is also passed.
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    printReport(report, args.quiet, args.noRekor, args.platformKeyPath !== null);
+    printReport(report, args.quiet, args.noRekor, args.platformKeyPath !== null, args.summary);
   }
   // PA-0009 (D15) — exit code is a function of `report.status`, not `ok`:
   // 0 valid, 1 invalid, 3 incomplete. `unsupported` never appears at the

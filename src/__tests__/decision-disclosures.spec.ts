@@ -15,6 +15,7 @@ import { verifyAuditPackage } from '../package.js';
 import { findVerifiedDecision, formatDecision } from '../decision-disclosures.js';
 import { canonicalJson, signEd25519, sha256, merkleBuild, merkleProof, GENESIS_PREV_ROW_HASH } from '../crypto.js';
 import { writeZip, gzipDeterministic } from '../zip.js';
+import { formatProofLines, PROOF_COMPONENTS } from '../proofs.js';
 
 const V = 'praesidia.decision-disclosure.v1';
 const ORG = '00000000-0000-0000-0000-000000000009';
@@ -48,7 +49,7 @@ interface DecisionRowSpec {
 }
 
 /** A signed v1 bundle: one plain row, then commitment-signed decision rows. */
-function buildBundle(decisionRows: DecisionRowSpec[]): Buffer {
+function buildBundle(decisionRows: DecisionRowSpec[], tamper?: (rows: Record<string, unknown>[]) => void): Buffer {
   const seed = Buffer.alloc(32, 9);
   const pkcs8 = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]);
   const jwk = crypto.createPublicKey(crypto.createPrivateKey({ key: pkcs8, format: 'der', type: 'pkcs8' }))
@@ -104,6 +105,7 @@ function buildBundle(decisionRows: DecisionRowSpec[]): Buffer {
     keyVersions: [{ keyVersion: 1, publicKey: publicKeyB64 }], generatedAt: iso(3606), signatureAlgorithm: 'Ed25519' as const,
   };
   const manifest = { ...manifestSans, signature: signEd25519(canonicalJson(manifestSans), privateKey), signatureKeyVersion: 1 };
+  tamper?.(rows);
   const ndjsonGz = (xs: unknown[]) => gzipDeterministic(Buffer.from(xs.map((x) => JSON.stringify(x) + '\n').join(''), 'utf8'));
   return writeZip([
     { name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest), 'utf8') },
@@ -268,5 +270,89 @@ describe('AV-0009 decision disclosures', () => {
         fs.rmSync(tmp, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe('AV-0010 per-proof summary', () => {
+  const pkg = (inner: Buffer, sha = crypto.createHash('sha256').update(inner).digest('hex')) =>
+    writeZip([
+      { name: 'evidence/audit-bundle.zip', data: inner },
+      { name: 'verification.txt', data: Buffer.from(`Evidence archive SHA-256: ${sha}\nEvidence archive bytes: ${inner.length}\n`) },
+      { name: 'evidence/decision-receipts.ndjson', data: ndjson(genuine) },
+    ]);
+
+  it('valid package → six lines, PASS except NOT_PRESENT target receipt', async () => {
+    const r = await verifyAuditPackage(pkg(bundle), opts());
+    expect(r.status).toBe('valid');
+    expect(formatProofLines(r.proofs)).toEqual([
+      'PASS signature',
+      'PASS hash chain',
+      'PASS decision receipt',
+      'PASS policy reference',
+      'PASS evidence integrity',
+      'NOT_PRESENT target receipt',
+    ]);
+  });
+
+  it('bare bundle, no disclosures: JSON proofs snapshot', async () => {
+    const r = await verifyBundle(bundle, opts());
+    expect(JSON.parse(JSON.stringify(r)).proofs).toMatchInlineSnapshot(`
+      {
+        "decisionReceipt": "not_present",
+        "evidenceIntegrity": "not_present",
+        "hashChain": "pass",
+        "policyReference": "not_present",
+        "signature": "pass",
+        "targetReceipt": "not_present",
+      }
+    `);
+  });
+
+  it('a tampered row → FAIL signature and FAIL hash chain, report invalid', async () => {
+    const b = buildBundle([{ id: 'row-d1', action: 'POLICY_DECISION', detailsCommitment: BE_COMMITMENT }], (rows) => {
+      rows[0]!.summary = 'Deleted agent';
+    });
+    const r = await verifyBundle(b, opts());
+    expect(r.status).toBe('invalid');
+    expect(formatProofLines(r.proofs)).toEqual(expect.arrayContaining(['FAIL signature', 'FAIL hash chain']));
+  });
+
+  it('a package receipt mismatch → FAIL evidence integrity', async () => {
+    const r = await verifyAuditPackage(pkg(bundle, '0'.repeat(64)), opts());
+    expect(r.status).toBe('invalid');
+    expect(r.proofs.evidenceIntegrity).toBe('fail');
+  });
+
+  const cli = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
+  it.runIf(fs.existsSync(cli))('CLI: six lines lead, --summary drops detail, --quiet and RESULT unchanged', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-0010-'));
+    try {
+      const b = path.join(tmp, 'bundle.zip');
+      fs.writeFileSync(b, bundle);
+      const run = (...args: string[]) =>
+        spawnSync(process.execPath, [cli, b, '--no-rekor', '--allow-legacy-unattested', ...args], { encoding: 'utf8' });
+      const six = ['PASS signature', 'PASS hash chain', 'NOT_PRESENT decision receipt', 'NOT_PRESENT policy reference',
+        'NOT_PRESENT evidence integrity', 'NOT_PRESENT target receipt'];
+      const full = run();
+      expect(full.status).toBe(0);
+      expect(full.stdout.split('\n').slice(2, 8)).toEqual(six);
+      expect(full.stdout).toMatch(/\[VALID +\] manifest[\s\S]*\nRESULT: OK\n/);
+      const summary = run('--summary');
+      expect(summary.status).toBe(0);
+      expect(summary.stdout.split('\n').slice(0, 8)).toEqual([...six, '', 'RESULT: OK']);
+      expect(summary.stdout).not.toMatch(/\[VALID/);
+      expect(run('--quiet').stdout).toBe('OK\n');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('every report component maps to exactly one proof', async () => {
+    const r = await verifyBundle(bundle, opts());
+    const components = Object.entries(r)
+      .filter(([, v]) => v && typeof v === 'object' && 'status' in v && 'checked' in v)
+      .map(([k]) => k)
+      .sort();
+    expect(Object.values(PROOF_COMPONENTS).flat().sort()).toEqual(components);
   });
 });

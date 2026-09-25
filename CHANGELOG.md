@@ -115,6 +115,16 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `VerifyReport.decisionReceipt` / `.policyReference` / `.decisionDisclosures?`,
   `findVerifiedDecision()`. Additive: every existing bundle and pre-BE-1585 package verifies
   with the same verdict (both components `not_present`).
+- **Per-proof summary (AV-0010).** `VerifyReport.proofs` reduces the components into
+  six auditor-facing proofs (`signature`, `hashChain`, `decisionReceipt`,
+  `policyReference`, `evidenceIntegrity`, `targetReceipt`), each `pass` / `fail` /
+  `not_present` / `incomplete`; every component maps to exactly one proof
+  (docs/ARCHITECTURE.md), so `status: 'invalid'` iff some proof is `fail`. The human
+  report now opens with six `PASS|FAIL|NOT_PRESENT|INCOMPLETE <proof>` lines ahead of
+  the unchanged component detail; `--summary` prints only those lines, `RESULT:` and
+  the caveats. Library: `formatProofLines()`, `PROOF_COMPONENTS`, `ProofType`,
+  `ProofStatus`. No check, verdict, exit code, `RESULT:` line or `--quiet` output
+  changed.
 
 ### Fixed
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command
@@ -126,6 +136,10 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `verify` in the working directory must now be passed as `./verify`.
 
 ### Compatibility
+- AV-0010 changes no verification strictness. `VerifyReport.proofs` is a new required
+  field: code that *builds* a `VerifyReport` must add it; readers are unaffected. The
+  default human report gains six leading lines, so a parser keyed on line numbers (not
+  on `RESULT:` or component labels) must adjust. `--quiet` still prints one word.
 - AV-0008 is a **strictness increase** and a new enum value. JSON / library consumers that
   switch exhaustively on `ComponentStatus` must handle `'not_present'`; a 0-checked
   component's derived `ok` is now `false`. Top-level verdicts are unchanged for every bundle

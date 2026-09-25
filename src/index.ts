@@ -21,6 +21,9 @@ export type {
   AttestedTenantKey,
 } from './verify.js';
 
+export { formatProofLines, PROOF_COMPONENTS } from './proofs.js';
+export type { ProofType, ProofStatus } from './proofs.js';
+
 export { findVerifiedDecision, DECISION_DISCLOSURE_VERSION } from './decision-disclosures.js';
 export type { VerifiedDecision, DecisionDisclosureSummary } from './decision-disclosures.js';
 

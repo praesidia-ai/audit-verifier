@@ -29,6 +29,8 @@ src/http-receipt.ts       # HTTP_RECEIPT_VERSION (:4), httpTargetKeyFingerprint 
                           # independently-pinned HTTP target receipts (README.md:877)
 src/aibom.ts              # verifyAibomAttestation — be's attested AIBOM envelope
                           # (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001)
+src/proofs.ts             # AV-0010 — PROOF_COMPONENTS / deriveProofs / formatProofLines:
+                          # components → six proof types (table below)
 src/index.ts              # package's public export surface
 ```
 
@@ -52,6 +54,22 @@ Component statuses (`ComponentStatus`, `verify.ts`; README "Verdict shape"):
 | `incomplete` | evidence present but insufficient (e.g. redacted) | `incomplete` |
 | `unsupported` | component does not apply to this manifest version | ignored |
 | `not_present` | applies, but 0 items to check (AV-0008, `withEvidenceStatus`) | ignored, unless no evidence component is `valid` → `incomplete` |
+
+### Proof summary (AV-0010, `src/proofs.ts`)
+
+`VerifyReport.proofs` / the six leading CLI lines. Every component is in
+exactly one row (pinned by a test), so `invalid` iff some proof is `fail`.
+Reduction per row: any `invalid` → `fail`; else any `incomplete` →
+`incomplete`; else any `valid` → `pass`; else `not_present`.
+
+| proof | components |
+|---|---|
+| `signature` | `manifest`, `rowSignatures`, `rootSignatures`, `platformAttestation` (platform-key fingerprint pin), `keyBinding` |
+| `hashChain` | `chain`, `inclusionProofs`, `rekor`, `completeness`, `rootCoverage`, `integrityCheckpoints` |
+| `decisionReceipt` | `decisionReceipt` |
+| `policyReference` | `policyReference` |
+| `evidenceIntegrity` | audit package `verification.txt` receipt (packages only), `actionEventChain`, `permitBinding`, `requestBinding`, `dispatchIntegrity`, `callerResult`, `closureLegality`, `evidenceGrade`, `actionCompleteness` |
+| `targetReceipt` | `targetAck` (HTTP target receipts + target-ack grade consistency) |
 
 ## Byte-for-byte compatibility with `be`
 

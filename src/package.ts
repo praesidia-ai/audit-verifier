@@ -13,6 +13,7 @@ import * as crypto from 'node:crypto';
 import { verifyBundle, type VerifyOptions, type VerifyReport } from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES, readZip, type ZipEntry } from './zip.js';
 import { DECISION_DISCLOSURES_ENTRY } from './decision-disclosures.js';
+import { deriveProofs } from './proofs.js';
 
 export const PACKAGE_BUNDLE_ENTRY = 'evidence/audit-bundle.zip';
 const RECEIPT_ENTRY = 'verification.txt';
@@ -123,5 +124,11 @@ export async function verifyAuditPackage(
   }
   const statuses = [report.status, integrity.status];
   const status = statuses.includes('invalid') ? 'invalid' : statuses.includes('incomplete') ? 'incomplete' : 'valid';
-  return { ...report, ok: status === 'valid', status, package: { ...integrity, sideArtifacts } };
+  return {
+    ...report,
+    ok: status === 'valid',
+    status,
+    proofs: deriveProofs(report, integrity.status),
+    package: { ...integrity, sideArtifacts },
+  };
 }

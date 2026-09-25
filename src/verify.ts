@@ -1,3 +1,4 @@
+import { deriveProofs, type ProofStatus, type ProofType } from './proofs.js';
 import { verifyHttpReceipt, httpTargetKeyFingerprint, httpRequestCommitment, type HttpRequestEnvelope } from './http-receipt.js';
 import { jcsCommitment, type JsonValue } from './jcs-canonical.js';
 /**
@@ -641,6 +642,13 @@ export interface VerifyReport {
    * (D15, AV-0008) — those statuses only ever appear per-component.
    */
   status: Exclude<ComponentStatus, 'unsupported' | 'not_present'>;
+  /**
+   * AV-0010 — the six auditor-facing proofs, each reduced from named
+   * components (`proofs.ts` `PROOF_COMPONENTS`, docs/ARCHITECTURE.md). Every
+   * component maps to exactly one proof: `status: 'invalid'` iff some proof
+   * is `fail`.
+   */
+  proofs: Record<ProofType, ProofStatus>;
   manifest: ComponentResult;
   rowSignatures: ComponentResult;
   chain: ComponentResult;
@@ -1623,7 +1631,7 @@ export async function verifyBundle(
   const status = reduceStatus(allResults, evidenceResults);
   const ok = status === 'valid';
 
-  return {
+  const report: Omit<VerifyReport, 'proofs'> = {
     ok,
     status,
     manifest: manifestResult,
@@ -1674,6 +1682,7 @@ export async function verifyBundle(
         : {}),
     },
   };
+  return { ...report, proofs: deriveProofs(report) };
 }
 
 // ════════════════════════════════════════════════════════════════════════

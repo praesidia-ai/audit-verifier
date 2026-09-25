@@ -43,6 +43,8 @@ Options:
                exits 2.
   --allow-legacy-unattested
                Explicitly accept a pre-attestation legacy bundle.
+  --summary    Print only the six per-proof lines (see "Proof summary"),
+               then RESULT and any caveat.
   --quiet      Print only the final status word (OK/FAIL/INCOMPLETE).
   --json       Print the full VerifyReport as stable machine-readable JSON
                (mutually exclusive with --quiet; --json wins if both given).
@@ -272,6 +274,29 @@ component is `valid` (a zero-row, zero-root bundle) the top level is
 `incomplete` (exit 3), not `valid`. `manifest`, `completeness` and
 `keyBinding` are mandatory and never report `not_present`. Neither
 `unsupported` nor `not_present` appears at the top level.
+
+### Proof summary (AV-0010)
+
+`report.proofs` groups the components into six proofs an auditor can read, and
+the human report opens with them:
+
+```
+PASS signature
+PASS hash chain
+PASS decision receipt
+PASS policy reference
+PASS evidence integrity
+NOT_PRESENT target receipt
+```
+
+Each proof is `FAIL` if any of its components is `invalid`, else `INCOMPLETE`
+if any is `incomplete`, else `PASS` if any is `valid`, else `NOT_PRESENT`
+(every component `not_present`/`unsupported`). Every component belongs to
+exactly one proof (table in `docs/ARCHITECTURE.md`), so `RESULT: FAIL` (exit 1)
+always comes with at least one `FAIL` line. `RESULT: INCOMPLETE` can come with
+no `INCOMPLETE` line: a bundle with no evidence at all has only
+`PASS`/`NOT_PRESENT` lines. `--summary` drops the component detail;
+`--quiet` is unchanged (one word).
 
 ## What it verifies
 
