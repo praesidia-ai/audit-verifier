@@ -405,8 +405,9 @@ checks every cryptographic invariant the bundle commits to:
    by **root coverage** (see 10).
 4. **Merkle root signatures** — every root in `roots.ndjson.gz` is
    re-canonicalized and verified.
-5. **Inclusion proofs** — exactly one valid proof is required for every
-   exported row. Every proof is walked against the corresponding root via
+5. **Inclusion proofs** — exactly one valid proof into a current root is
+   required for every exported row (plus one per superseded root that
+   committed it, see 10). Every proof is walked against the corresponding root via
    RFC 6962-style verification (leaf prefix `0x00`, internal prefix `0x01`),
    with index and path depth checked against the signed root row count.
    Diagnostic status markers are failures, not substitutes for proofs.
@@ -527,6 +528,27 @@ checks every cryptographic invariant the bundle commits to:
     failure surface, never a widening; a period with MORE rows than its
     own signed root committed to is a different anomaly a purge record can
     never explain and always keeps failing regardless of any seal.
+
+    **Superseding roots (AV-0016).** A root that committed to fewer rows
+    than its hour holds is never rewritten. `be` appends a new root that
+    carries `supersedesRootId` (the old root's `id`) and
+    `supersessionSignature`: a signature, under the new root's own key,
+    over the canonical JSON of `{version: "praesidia.root-supersession.v1",
+    supersedes: <old rootHash>, rootHash, periodStart, periodEnd, rowCount}`.
+    Both roots must ship in the bundle. The link is accepted only when the
+    signature verifies, the old root is in the bundle with the same period
+    and a strictly lower `rowCount`, and no other root supersedes it
+    (chains are linear and acyclic). Each row proves once into its current
+    root, and once more into each superseded root that committed it. The
+    new root must prove every row of the old one. The superseded root
+    keeps its own signature, inclusion-proof, proof-count and anchor
+    checks. Only the rows-in-period count moves to its successor.
+    `rootCoverage.supersessions` names both roots of every link, so the
+    old root's Rekor receipt is never dropped silently. Any broken link
+    fails `rootSignatures` or `rootCoverage`. Bundles without these fields
+    verify exactly as before. Residual: a bundle that ships only the new
+    root, with no link, still looks like an ordinary root. Offline, the
+    verifier cannot know that an older root exists. `be` must export both.
 11. **Integrity checkpoints** (`version: 4`+ only) — `be`'s
     `AuditIntegrityCheckpointService` periodically (hourly) signs and
     persists `{organizationId, chainHeadHash, cumulativeRowCount, asOf}`

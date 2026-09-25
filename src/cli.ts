@@ -444,6 +444,9 @@ function printDetail(report: VerifyReport & { package?: PackageIntegrity }, line
   for (const line of report.rootCoverage.sealExemptions ?? []) {
     lines.push(`             ${line}`);
   }
+  for (const line of report.rootCoverage.supersessions ?? []) {
+    lines.push(`             ${line}`);
+  }
   lines.push(fmtComponent('integrity chkpts  ', report.integrityCheckpoints));
   for (const line of report.integrityCheckpoints.sealExemptions ?? []) {
     lines.push(`             ${line}`);

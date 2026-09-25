@@ -7,7 +7,7 @@
  * library rather than reaching into this package.
  */
 
-export { verifyBundle } from './verify.js';
+export { verifyBundle, ROOT_SUPERSESSION_VERSION } from './verify.js';
 export { verifyAuditPackage, isAuditPackage } from './package.js';
 export type { PackageIntegrity, PackageVerifyReport } from './package.js';
 export type {

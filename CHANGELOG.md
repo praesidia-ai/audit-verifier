@@ -33,6 +33,14 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **Superseding Merkle roots** (AV-0016). New optional root fields `supersedesRootId`
+  and `supersessionSignature`, the exported constant `ROOT_SUPERSESSION_VERSION`, and
+  `ComponentResult.supersessions` on `rootCoverage` (all additive). A partial root
+  plus a signed superseding root for the same hour now verifies, and both roots are
+  reported. An unsigned, re-pointed, non-increasing, period-mismatched, branching or
+  row-dropping link fails. Bundles without the fields verify exactly as before.
+  Older verifiers fail such bundles closed. The wire contract is in README "Root
+  coverage" and `.claude/backlog/AV-0016.md`.
 - `docs/COMPATIBILITY.md` (AV-0012) — which verifier version reads which bundle
   manifest, audit package, decision disclosure, HTTP receipt and AIBOM formats, and
   its minimum Node version. Each current-row cell cites the code that decides it.

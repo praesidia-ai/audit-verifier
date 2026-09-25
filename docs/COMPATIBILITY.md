@@ -4,15 +4,15 @@ Which `@praesidia/audit-verifier` version reads which Praesidia artefact format.
 Use the newest verifier: every row reads all the formats of the rows below it.
 A verifier fails closed on a format it does not know. It never skips one.
 
-| Verifier | Bundle manifest `version` | Audit package (AV-0007) | Decision disclosure v1 (AV-0009) | `praesidia.http-receipt.v1` | AIBOM attestation v1 | Min Node |
-|---|---|---|---|---|---|---|
-| 0.11.0 (Unreleased) | 1–5 | yes | yes | yes | yes | >=22.12.0 |
-| 0.10.0 | 1–5 | — | — | — | — | >=22.12.0 |
-| 0.9.0 – 0.9.2 | 1–5 | — | — | — | — | >=22.12.0 |
-| 0.6.0 – 0.8.0 | 1–4 | — | — | — | — | >=22.12.0 |
-| 0.5.0 | 1–3 | — | — | — | — | >=22.12.0 |
-| 0.4.0 | 1–2 | — | — | — | — | >=22.12.0 |
-| ≤ 0.3.0 (unsupported) | ≥ 1, no ceiling | — | — | — | — | >=18.0.0 |
+| Verifier | Bundle manifest `version` | Audit package (AV-0007) | Decision disclosure v1 (AV-0009) | `praesidia.http-receipt.v1` | AIBOM attestation v1 | Superseding root (AV-0016) | Min Node |
+|---|---|---|---|---|---|---|---|
+| 0.11.0 (Unreleased) | 1–5 | yes | yes | yes | yes | yes | >=22.12.0 |
+| 0.10.0 | 1–5 | — | — | — | — | — | >=22.12.0 |
+| 0.9.0 – 0.9.2 | 1–5 | — | — | — | — | — | >=22.12.0 |
+| 0.6.0 – 0.8.0 | 1–4 | — | — | — | — | — | >=22.12.0 |
+| 0.5.0 | 1–3 | — | — | — | — | — | >=22.12.0 |
+| 0.4.0 | 1–2 | — | — | — | — | — | >=22.12.0 |
+| ≤ 0.3.0 (unsupported) | ≥ 1, no ceiling | — | — | — | — | — | >=18.0.0 |
 
 `—` means that version has no code for the format. Do not use it to verify that artefact.
 No version tag exists in this repository yet, so every row is a source-tree version.
@@ -23,8 +23,8 @@ No version tag exists in this repository yet, so every row is a source-tree vers
 against the quoted code, and checks the current row against `package.json` and
 `src/verify.ts`. If a line number drifts, the test goes red.
 
-- **Bundle manifest 1–5.** The ceiling is `src/verify.ts:1137` `const MAX_SUPPORTED_MANIFEST_VERSION = 5;`.
-  The version gate at `src/verify.ts:5215` `manifest.version < 1 ||` and `src/verify.ts:5216` `manifest.version > MAX_SUPPORTED_MANIFEST_VERSION`
+- **Bundle manifest 1–5.** The ceiling is `src/verify.ts:1212` `const MAX_SUPPORTED_MANIFEST_VERSION = 5;`.
+  The version gate at `src/verify.ts:5357` `manifest.version < 1 ||` and `src/verify.ts:5358` `manifest.version > MAX_SUPPORTED_MANIFEST_VERSION`
   rejects version 0 and anything newer than 5. A newer version throws a
   bundle-format error ("upgrade the verifier"), so the bundle does not verify.
 - **Audit package.** The format has no version field. A zip counts as an audit package when it has
@@ -36,9 +36,17 @@ against the quoted code, and checks the current row against `package.json` and
   The disclosed Decision Record must have `src/decision-disclosures.ts:221` `d.details.schemaVersion === 1`.
 - **`praesidia.http-receipt.v1`.** The version string is `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION = 'praesidia.http-receipt.v1'`.
   Any other version is rejected: `src/http-receipt.ts:49` `s.version !== HTTP_RECEIPT_VERSION`.
-  These receipts are read from manifest v5 action events: `src/verify.ts:3324` `return verifyHttpReceipt(payload.receipt`.
+  These receipts are read from manifest v5 action events: `src/verify.ts:3437` `return verifyHttpReceipt(payload.receipt`.
 - **AIBOM attestation v1.** The format string is `src/aibom.ts:34` `export const AIBOM_ATTESTATION_FORMAT = 'praesidia-aibom-attestation/v1';`.
   Any other format gives `unsupported_format`: `src/aibom.ts:125` `env.attestationFormat !== AIBOM_ATTESTATION_FORMAT`.
+- **Superseding root (AV-0016).** Optional root fields `supersedesRootId` and
+  `supersessionSignature`. The signed envelope is versioned by
+  `src/verify.ts:443` `export const ROOT_SUPERSESSION_VERSION = 'praesidia.root-supersession.v1';`.
+  A link must name a root in the bundle with the same period and a lower row count
+  (`src/verify.ts:486` `: old.rowCount >= root.rowCount`), otherwise `rootCoverage` fails.
+  Roots without the fields take the old path unchanged (`src/verify.ts:479` `if (root.supersedesRootId === undefined) continue;`).
+  Older verifiers have no code for the fields. They fail such a bundle closed, on the partial
+  root's row count and on the second proof per row. They never pass it.
 - **Min Node.** From `package.json:33` `"node": ">=22.12.0"`.
 
 ## Where the code decided each older row

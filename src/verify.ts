@@ -425,6 +425,73 @@ interface BundleRoot {
    * Optional for back-compat with pre-AUDIT-02 bundles.
    */
   signatureAlgorithm?: BundleSignatureAlgorithm;
+  /**
+   * AV-0016 — this root supersedes the root with this `id`, which must ship in
+   * the same bundle with the same period and a LOWER `rowCount`. Both fields
+   * are present together or not at all. See {@link resolveSupersessions}.
+   */
+  supersedesRootId?: string;
+  /**
+   * AV-0016 — signature, under this root's own `keyVersion`/algorithm, over
+   * {@link supersessionSignable}. Binds the link to the superseded root's hash
+   * so a link cannot be added, removed or re-pointed without the org key.
+   */
+  supersessionSignature?: string;
+}
+
+/** AV-0016 — `version` field of the signed supersession envelope. */
+export const ROOT_SUPERSESSION_VERSION = 'praesidia.root-supersession.v1';
+
+/**
+ * AV-0016 — the bytes `supersessionSignature` signs. A separate envelope, so
+ * the root signature (`{rootHash, periodStart, periodEnd, rowCount}`) stays
+ * byte-compatible with every existing bundle.
+ */
+function supersessionSignable(root: BundleRoot, supersededRootHash: string): Buffer {
+  return canonicalJson({
+    version: ROOT_SUPERSESSION_VERSION,
+    supersedes: supersededRootHash,
+    rootHash: root.rootHash,
+    periodStart: root.periodStart,
+    periodEnd: root.periodEnd,
+    rowCount: root.rowCount,
+  });
+}
+
+/**
+ * AV-0016 — valid supersession links (superseded root id → superseding root)
+ * plus one error per invalid link. A link is valid when its target is another
+ * root in this bundle with the same period, a strictly lower `rowCount` (so
+ * chains are acyclic) and no other successor (so chains are linear). An
+ * invalid link supersedes nothing: both roots then face every normal check.
+ * The link's signature is checked in `verifyRootSignatures`.
+ */
+interface Supersessions {
+  successorOf: Map<string, BundleRoot>;
+  errors: Array<{ rootId: string; reason: string }>;
+}
+
+function resolveSupersessions(roots: BundleRoot[]): Supersessions {
+  const byId = new Map(roots.map((r) => [r.id, r]));
+  const successorOf = new Map<string, BundleRoot>();
+  const errors: Supersessions['errors'] = [];
+  for (const root of roots) {
+    if (root.supersedesRootId === undefined) continue;
+    const old = byId.get(root.supersedesRootId);
+    const why =
+      !old || old === root
+        ? `supersedes root ${root.supersedesRootId}, which is not in this bundle`
+        : old.periodStart !== root.periodStart || old.periodEnd !== root.periodEnd
+          ? `supersedes root ${old.id} with a different period`
+          : old.rowCount >= root.rowCount
+            ? `has rowCount ${root.rowCount}, not greater than superseded root ${old.id}'s rowCount ${old.rowCount}`
+            : successorOf.has(old.id)
+              ? `supersedes root ${old.id}, which is already superseded by root ${successorOf.get(old.id)!.id}`
+              : null;
+    if (why) errors.push({ rootId: root.id, reason: `root ${root.id} ${why}` });
+    else successorOf.set(old!.id, root);
+  }
+  return { successorOf, errors };
 }
 
 /**
@@ -562,6 +629,14 @@ export interface ComponentResult {
    * would have passed anyway — this is a downgrade record, not a summary.
    */
   sealExemptions?: string[];
+  /**
+   * AV-0016 — present only on `rootCoverage` when the bundle ships superseded
+   * roots: one line per valid link naming BOTH roots (id, hash, rowCount,
+   * anchor-receipt count). The superseded root keeps its own signature,
+   * inclusion-proof and anchor checks; it is exempt only from the
+   * rows-in-period count, which its successor carries.
+   */
+  supersessions?: string[];
 }
 
 /**
@@ -1426,6 +1501,7 @@ export async function verifyBundle(
     resourceLimits.maxRoots,
   );
   assertRootsStructure(roots, manifest.orgId);
+  const supersessions = resolveSupersessions(roots);
   let anchorReceiptCount = 0;
   for (const root of roots) {
     anchorReceiptCount +=
@@ -1450,7 +1526,7 @@ export async function verifyBundle(
     resourceLimits.maxProofs,
   );
   assertProofsStructure(proofs);
-  const proofResult = withEvidenceStatus(verifyInclusionProofs(rows, roots, proofs));
+  const proofResult = withEvidenceStatus(verifyInclusionProofs(rows, roots, proofs, supersessions));
 
   // 6b) FIX01 F5(b) — parse + verify integrity checkpoints (v4+ only; an
   // empty array for every earlier version).
@@ -1580,7 +1656,7 @@ export async function verifyBundle(
   // closing the trailing-suffix-deletion gap `completeness` cannot see
   // (see the `rootCoverage` field doc comment above).
   const rootCoverageResult = withEvidenceStatus(
-    verifyRootCoverage(manifest, rows, roots, proofs, verifiedSeals),
+    verifyRootCoverage(manifest, rows, roots, proofs, verifiedSeals, supersessions),
   );
 
   // 12) AV-0009 — decision disclosures, bound to the signed rows above.
@@ -2205,6 +2281,7 @@ function verifyRootCoverage(
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
   verifiedSeals: BundleSealedPurge[],
+  supersessions: Supersessions,
 ): RawComponentResult {
   const fromMs = Date.parse(manifest.from);
   const toMs = Date.parse(manifest.to);
@@ -2265,6 +2342,38 @@ function verifyRootCoverage(
   let firstFailure: string | undefined;
   let reason: string | undefined;
   const sealExemptions: string[] = [];
+  const supersessionLines: string[] = [];
+
+  // AV-0016 — every invalid link fails; every valid link must keep the
+  // superseded root's rows: each row proven into it is proven into its
+  // successor too (with the per-root proof count below, a row subset).
+  checked += supersessions.errors.length + supersessions.successorOf.size;
+  for (const e of supersessions.errors) {
+    failed += 1;
+    if (!firstFailure) {
+      firstFailure = e.rootId;
+      reason = e.reason;
+    }
+  }
+  const proofKeys = new Set(proofs.map((p) => `${p.rowId}\0${String(p.rootHash)}`));
+  for (const old of roots) {
+    const next = supersessions.successorOf.get(old.id);
+    if (!next) continue;
+    const dropped = proofs.find(
+      (p) => p.rootHash === old.rootHash && !proofKeys.has(`${p.rowId}\0${next.rootHash}`),
+    );
+    if (dropped) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = next.id;
+        reason = `root ${next.id} supersedes root ${old.id} but does not prove its row ${dropped.rowId} — a superseding root must keep every row of the root it supersedes`;
+      }
+      continue;
+    }
+    supersessionLines.push(
+      `superseded: root ${old.id} (rootHash ${old.rootHash}, rowCount ${old.rowCount}, ${collectAnchorEntries(old).length} anchor receipt(s), checked under rekor) superseded by root ${next.id} (rootHash ${next.rootHash}, rowCount ${next.rowCount}) for period ${old.periodStart}..${old.periodEnd}`,
+    );
+  }
 
   for (const root of roots) {
     const periodStartMs = Date.parse(root.periodStart);
@@ -2279,7 +2388,10 @@ function verifyRootCoverage(
     checked += 1;
     const rowsInPeriod =
       lowerBound(rowTimes, periodEndMs) - lowerBound(rowTimes, periodStartMs);
-    if (rowsInPeriod !== root.rowCount) {
+    // AV-0016 — a superseded root committed to fewer rows than its hour
+    // holds; its successor carries the rows-in-period check. Its proof count
+    // below is still enforced.
+    if (rowsInPeriod !== root.rowCount && !supersessions.successorOf.has(root.id)) {
       // FIX01 (audit-verifier2) / `BE-0003` — only a SHRINKAGE
       // (rowsInPeriod < root.rowCount) is a candidate for the sealed-purge
       // exemption. A period that has MORE rows than its own signed root
@@ -2330,6 +2442,7 @@ function verifyRootCoverage(
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
     ...(sealExemptions.length > 0 ? { sealExemptions } : {}),
+    ...(supersessionLines.length > 0 ? { supersessions: supersessionLines } : {}),
   };
 }
 
@@ -4233,6 +4346,7 @@ function verifyRootSignatures(
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
 ): RawComponentResult {
+  let checked = roots.length;
   let failed = 0;
   let firstFailure: string | undefined;
   let reason: string | undefined;
@@ -4281,10 +4395,26 @@ function verifyRootSignatures(
         reason = 'root signature does not verify';
       }
     }
+    // AV-0016 — the supersession link is signed under the SAME key as this
+    // root's own signature (the revoked check above covers both).
+    if (root.supersedesRootId === undefined && root.supersessionSignature === undefined) continue;
+    checked += 1;
+    const superseded = roots.find((r) => r.id === root.supersedesRootId && r !== root);
+    if (
+      !superseded ||
+      root.supersessionSignature === undefined ||
+      !verifySignature(rootAlgorithm, supersessionSignable(root, superseded.rootHash), root.supersessionSignature, entry.publicKey)
+    ) {
+      failed += 1;
+      if (!firstFailure) {
+        firstFailure = root.id;
+        reason = 'root supersession signature missing or does not verify against the superseded root';
+      }
+    }
   }
   return {
     ok: failed === 0,
-    checked: roots.length,
+    checked,
     failed,
     ...(firstFailure !== undefined ? { firstFailure } : {}),
     ...(reason !== undefined ? { reason } : {}),
@@ -4295,7 +4425,13 @@ function verifyInclusionProofs(
   rows: BundleRow[],
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
+  supersessions: Supersessions,
 ): RawComponentResult {
+  // AV-0016 — a row proves once into a current root and at most once more
+  // into each superseded root it was committed to.
+  const supersededHashes = new Set(
+    roots.filter((r) => supersessions.successorOf.has(r.id)).map((r) => r.rootHash),
+  );
   const rowsById = new Map<string, BundleRow>();
   for (const r of rows) rowsById.set(r.id, r);
   const rootsByHash = new Map<string, BundleRoot>();
@@ -4307,9 +4443,14 @@ function verifyInclusionProofs(
   let reason: string | undefined;
   const seenRowIds = new Set<string>();
 
+  const seenKeys = new Set<string>();
+
   for (const entry of proofs) {
     checked += 1;
-    if (seenRowIds.has(entry.rowId)) {
+    const toSuperseded =
+      typeof entry.rootHash === 'string' && supersededHashes.has(entry.rootHash);
+    const key = toSuperseded ? `${entry.rowId}\0${entry.rootHash}` : entry.rowId;
+    if (seenKeys.has(key)) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = entry.rowId;
@@ -4317,7 +4458,8 @@ function verifyInclusionProofs(
       }
       continue;
     }
-    seenRowIds.add(entry.rowId);
+    seenKeys.add(key);
+    if (!toSuperseded) seenRowIds.add(entry.rowId);
 
     // Status markers are diagnostics, not proofs, and are not signed. Treating
     // them as success let an attacker replace every proof with a marker.
@@ -5573,7 +5715,10 @@ function assertRootsStructure(roots: BundleRoot[], orgId: string): void {
           ))) ||
       (root.signatureAlgorithm !== undefined &&
         root.signatureAlgorithm !== 'Ed25519' &&
-        root.signatureAlgorithm !== 'ECDSA_P256_SHA256')
+        root.signatureAlgorithm !== 'ECDSA_P256_SHA256') ||
+      (root.supersedesRootId !== undefined &&
+        (typeof root.supersedesRootId !== 'string' || root.supersedesRootId.length === 0)) ||
+      (root.supersessionSignature !== undefined && typeof root.supersessionSignature !== 'string')
     ) {
       throw new Error(
         `roots.ndjson.gz has an invalid/duplicate root: ${String(root?.id)}`,
