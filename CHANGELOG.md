@@ -33,6 +33,10 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- `docs/COMPATIBILITY.md` (AV-0012) — which verifier version reads which bundle
+  manifest, audit package, decision disclosure, HTTP receipt and AIBOM formats, and
+  its minimum Node version. Each current-row cell cites the code that decides it.
+  `src/__tests__/compatibility.spec.ts` fails on drift. No verifier code change.
 - `samples/` (AV-0011) — valid, corrupted and wrong-key audit packages plus the
   sample platform PUBLIC key, signed with TEST keys only (SAMPLE — NOT A PRAESIDIA
   KEY), generated deterministically by `scripts/make-sample-bundles.mjs`; README
