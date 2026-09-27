@@ -353,11 +353,20 @@ NOT_PRESENT target receipt
 Each proof is `FAIL` if any of its components is `invalid`, else `INCOMPLETE`
 if any is `incomplete`, else `PASS` if any is `valid`, else `NOT_PRESENT`
 (every component `not_present`/`unsupported`). Every component belongs to
-exactly one proof (table in `docs/ARCHITECTURE.md`), so `RESULT: FAIL` (exit 1)
+exactly one proof (table below; exported as `PROOF_COMPONENTS`), so `RESULT: FAIL` (exit 1)
 always comes with at least one `FAIL` line. `RESULT: INCOMPLETE` can come with
 no `INCOMPLETE` line: a bundle with no evidence at all has only
 `PASS`/`NOT_PRESENT` lines. `--summary` drops the component detail;
 `--quiet` is unchanged (one word).
+
+| proof | components |
+|---|---|
+| `signature` | `manifest`, `rowSignatures`, `rootSignatures`, `platformAttestation`, `keyBinding` |
+| `hashChain` | `chain`, `inclusionProofs`, `rekor`, `completeness`, `rootCoverage`, `integrityCheckpoints` |
+| `decisionReceipt` | `decisionReceipt` |
+| `policyReference` | `policyReference` |
+| `evidenceIntegrity` | audit package `verification.txt` receipt (packages only), `actionEventChain`, `permitBinding`, `requestBinding`, `dispatchIntegrity`, `callerResult`, `closureLegality`, `evidenceGrade`, `actionCompleteness` |
+| `targetReceipt` | `targetAck` |
 
 ### Evidence privacy mode (AV-0013, manifest v6)
 

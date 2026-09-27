@@ -117,4 +117,4 @@ self-asserted fingerprint from being changed together and silently treated as ap
 
 See also `docs/design/platform-key-hierarchy.md` and `docs/trust-anchor-verification.md` for the
 full key-ceremony design (the latter is explicitly incomplete pending MIL-0003, the production key
-ceremony — see `docs/README.md`).
+ceremony — see `docs/INDEX.md`).
