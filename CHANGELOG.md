@@ -159,6 +159,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   already handed out. No verification check changed. A bundle file literally named
   `verify` in the working directory must now be passed as `./verify`.
 
+### Packaging
+- **Publish readiness** (INTEG-0054). `publishConfig.provenance: true` makes npm refuse a
+  publish that cannot attach an OIDC provenance statement, so only the tagged CI workflow
+  can release. The build no longer emits `.js.map` / `.d.ts.map` files: they pointed at
+  `../src/*.ts`, which is not in the tarball, and were a third of its unpacked size. The README install section is now the post-publish command. No
+  verification check, export or CLI behaviour changed.
+
 ### Compatibility
 - AV-0010 changes no verification strictness. `VerifyReport.proofs` is a new required
   field: code that *builds* a `VerifyReport` must add it; readers are unaffected. The

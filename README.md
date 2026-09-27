@@ -14,12 +14,18 @@ Node.js 22.12 or newer is required.
 ## Install
 
 ```bash
-# From npm (once published)
 npm install -g @praesidia/audit-verifier
+praesidia-verify bundle.zip
 
-# Or run via npx without installing
+# Or run once without installing
 npx @praesidia/audit-verifier bundle.zip
 ```
+
+Installing needs the network; verifying never does. Releases are published only
+from the tagged CI workflow with npm provenance (`publishConfig.provenance`), so
+a hand-run publish without an OIDC-backed provenance statement is refused. To
+check the tarball you installed, see
+[Trust anchor](#trust-anchor--verifying-the-clis-embedded-pin-out-of-band).
 
 ## Try it in 60 seconds
 

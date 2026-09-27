@@ -63,6 +63,7 @@
     "url": "https://github.com/praesidia-ai/audit-verifier"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }
