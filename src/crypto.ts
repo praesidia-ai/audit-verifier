@@ -364,6 +364,44 @@ export function verifySignature(
   return false;
 }
 
+/**
+ * AV-0018 / ADR-0004 (DECISION-SEC-03) — tenant signature formats.
+ *
+ * Format 1 (legacy): the tenant key signs the payload bytes as-is.
+ * Format 2: it signs `ASCII("praesidia:" + purpose + ":v2\n") || payload`.
+ * A purpose is lower-case `[a-z0-9-]` (never `:` or a newline), so the
+ * prefix is unambiguous. The verifier takes the purpose from the slot it is
+ * checking, never from the artefact: a format-2 signature minted for one
+ * purpose cannot verify in another slot.
+ */
+export const SIGNATURE_PURPOSES = [
+  'audit-record',
+  'merkle-root',
+  'merkle-supersession',
+  'integrity-checkpoint',
+  'retention-seal',
+  'bundle-manifest',
+  'approval-decision',
+  'permit',
+  'protected-action-event',
+  'attestation',
+  'trust-passport',
+  'governance-badge',
+  'federation-manifest',
+] as const;
+export type SignaturePurpose = (typeof SIGNATURE_PURPOSES)[number];
+export type SignatureFormat = 1 | 2;
+
+/** AV-0018 — the exact bytes a tenant signature of `format` covers. */
+export function tenantSignedBytes(
+  format: SignatureFormat,
+  purpose: SignaturePurpose,
+  payload: Uint8Array,
+): Buffer {
+  if (format === 1) return Buffer.from(payload);
+  return Buffer.concat([Buffer.from(`praesidia:${purpose}:v2\n`, 'ascii'), payload]);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Merkle (RFC 6962, SHA-256, duplicate-last for odd levels)
 // ════════════════════════════════════════════════════════════════════════

@@ -410,6 +410,33 @@ states, per mode window, what this bundle proves and what it cannot:
 - A pre-v6 bundle declares no mode, so the verifier does not claim its payloads are the
   unreduced originals.
 
+### Tenant signature format 2 (AV-0018, manifest v7)
+
+Every tenant-key signature carries `signatureFormat` next to its algorithm (absent = 1):
+
+- **Format 1** (legacy): the key signs the payload bytes as they are.
+- **Format 2**: the key signs `ASCII("praesidia:" + purpose + ":v2\n") || payload`.
+  The verifier takes `purpose` from the slot it is checking, never from the bundle:
+
+| Slot | Purpose | Format field | Signed timestamp used for the cutover |
+|---|---|---|---|
+| manifest | `bundle-manifest` | `manifest.signatureFormat` | `generatedAt` |
+| row | `audit-record` | `signatureFormat` | `createdAt` |
+| Merkle root | `merkle-root` | `signatureFormat` | `periodEnd` |
+| root supersession link | `merkle-supersession` | `supersessionSignatureFormat` | the root's `periodEnd` |
+| integrity checkpoint | `integrity-checkpoint` | `signatureFormat` | `asOf` |
+| protected-action event | `protected-action-event` | `signatureFormat` | `receivedAt` |
+| sealed purge (retention seal) | `retention-seal` | `signatureFormat` | `periodEnd` |
+
+A format-2 signature minted for one purpose does not verify in any other slot.
+
+A v7 manifest signs two more fields: `signatureFormat` (1 or 2, the format of the manifest's own
+signature) and `signatureFormatCutoverAt` (ISO 8601 instant of the org's first format-2
+signature, or `null`). A format-1 signature on an artefact whose signed timestamp is at or
+after the cutover fails with `signature_format_downgrade`. A `signatureFormat` other than 1 or 2
+fails with `signature_format_unsupported`. Either v7 field on a v1–v6 manifest, or a missing one
+on v7, fails `manifest`. v1–v6 bundles carry no cutover and verify exactly as before.
+
 ## What it verifies
 
 For a bundle produced by `BundleExporterService` (AGV-035) the verifier
@@ -745,7 +772,7 @@ stored root hash/signature and other available fields to that expected root,
 and validate retention. A HEAD-only existence/lock check is insufficient.
 
 `manifest.version` is checked against an explicit ceiling
-(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 6) — a bundle declaring a newer
+(`MAX_SUPPORTED_MANIFEST_VERSION`, currently 7) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error
 (exit code 2) rather than silently verified under the wrong (older) rules.
 Never bump the ceiling without landing real support for the new version's

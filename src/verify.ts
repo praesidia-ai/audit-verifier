@@ -79,7 +79,9 @@ import {
   decodeBase64Strict,
   sha256,
   verifySignature,
+  tenantSignedBytes,
   type BundleSignatureAlgorithm,
+  type SignaturePurpose,
   merkleVerify,
   type MerkleProof,
   GENESIS_PREV_ROW_HASH,
@@ -215,6 +217,15 @@ interface BundleManifest {
    * `assertEvidencePrivacyStructure`.
    */
   evidencePrivacy?: EvidencePrivacyDeclaration;
+  /**
+   * AV-0018 / ADR-0004 — v7 only, both signed. `signatureFormat` is the
+   * format of `signature` below (1 = untagged, 2 = purpose-tagged).
+   * `signatureFormatCutoverAt` is the instant of the org's first format-2
+   * signature (null = none yet): every artefact of this bundle whose own
+   * signed timestamp is at or after it must carry a format-2 signature.
+   */
+  signatureFormat?: number;
+  signatureFormatCutoverAt?: string | null;
 }
 
 /**
@@ -278,6 +289,8 @@ interface BundleActionEvent {
   // describe or derive from the signature rather than being covered by it.
   signature: string;
   signatureAlgorithm: BundleSignatureAlgorithm;
+  /** AV-0018 — 1 (untagged) or 2 (purpose-tagged); absent = 1. See {@link signatureFormatRejection}. */
+  signatureFormat?: number;
   keyVersion: number;
   // Part of the signed preimage (see {@link signableActionEvent}) —
   // `be` already ships these (bundle-exporter.service.ts
@@ -327,6 +340,8 @@ interface BundleIntegrityCheckpoint {
   asOf: string;
   signature: string;
   signatureAlgorithm: BundleSignatureAlgorithm;
+  /** AV-0018 — 1 (untagged) or 2 (purpose-tagged); absent = 1. See {@link signatureFormatRejection}. */
+  signatureFormat?: number;
   keyVersion: number;
   /** Unused by verification; present for wire completeness. */
   createdAt?: string;
@@ -397,6 +412,8 @@ interface BundleRow {
    * row-by-row under the correct primitive.
    */
   signatureAlgorithm?: BundleSignatureAlgorithm;
+  /** AV-0018 — 1 (untagged) or 2 (purpose-tagged); absent = 1. See {@link signatureFormatRejection}. */
+  signatureFormat?: number;
   /**
    * DRIFT-0004 — producer-only sort aid (`AuditLog.chainSeq`, monotonic
    * per-org chain-sequence number). NOT part of the signed preimage and
@@ -443,6 +460,8 @@ interface BundleRoot {
    * Optional for back-compat with pre-AUDIT-02 bundles.
    */
   signatureAlgorithm?: BundleSignatureAlgorithm;
+  /** AV-0018 — 1 (untagged) or 2 (purpose-tagged); absent = 1. See {@link signatureFormatRejection}. */
+  signatureFormat?: number;
   /**
    * AV-0016 — this root supersedes the root with this `id`, which must ship in
    * the same bundle with the same period and a LOWER `rowCount`. Both fields
@@ -455,6 +474,8 @@ interface BundleRoot {
    * so a link cannot be added, removed or re-pointed without the org key.
    */
   supersessionSignature?: string;
+  /** AV-0018 — format of `supersessionSignature`; absent = 1. */
+  supersessionSignatureFormat?: number;
 }
 
 /** AV-0016 — `version` field of the signed supersession envelope. */
@@ -553,6 +574,8 @@ interface BundleSealedPurge {
   signature: string | null;
   signingKeyVersion: number | null;
   signatureAlgorithm: BundleSignatureAlgorithm | null;
+  /** AV-0018 — 1 (untagged) or 2 (purpose-tagged); absent = 1. See {@link signatureFormatRejection}. */
+  signatureFormat?: number;
   /** Wall-clock instant the purge committed. ISO 8601. */
   deletedAt: string;
   /** users.id of the operator who executed the purge. */
@@ -1198,6 +1221,8 @@ export interface ExpectedAnchorRoot {
   signature: string;
   keyVersion: number;
   signatureAlgorithm?: BundleSignatureAlgorithm;
+  /** AV-0018 — the root signature's format when the bundle declares one (absent = 1; 2 = `merkle-root` tag). */
+  signatureFormat?: number;
   periodStart: string;
   periodEnd: string;
   rowCount: number;
@@ -1246,8 +1271,12 @@ export interface ExpectedAnchorRoot {
  * v6 (AV-0013 / be BE-1615) — adds `evidencePrivacy` (the 15 v5 fields plus
  * this one, 16 total): the org's evidence privacy mode timeline. No new
  * bundle entry. Same fail-closed-both-directions rule.
+ *
+ * v7 (AV-0018 / ADR-0004 / be BE-1957) — adds `signatureFormat` (of the
+ * manifest's own signature) and `signatureFormatCutoverAt` (the org's first
+ * format-2 signature, or null), 18 signed fields. Same fail-closed rule.
  */
-const MAX_SUPPORTED_MANIFEST_VERSION = 6;
+const MAX_SUPPORTED_MANIFEST_VERSION = 7;
 
 const EXPECTED_ENTRIES = [
   'manifest.json',
@@ -1478,6 +1507,8 @@ export async function verifyBundle(
 
   // 3) Verify manifest signature.
   const manifestResult = withStatus(verifyManifest(manifest, publicKeys));
+  // AV-0018 — the signed v7 format-2 cutover; null on v1..v6 and when unset.
+  const cutoverMs = signatureCutoverMs(manifest);
 
   const gzipOutputBudget: GzipOutputBudget = {
     remainingBytes: resourceLimits.maxTotalGzipOutputBytes,
@@ -1517,7 +1548,7 @@ export async function verifyBundle(
   // the same algorithm as the manifest (be-core's producer never
   // mixes algorithms within one bundle).
   const rowSigResult = withEvidenceStatus(
-    verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm),
+    verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm, cutoverMs),
   );
   // SCAN2-004 — `chainRaw` carries the head/tail endpoint fields
   // `ChainVerification` adds on top of `RawComponentResult`; narrow
@@ -1555,7 +1586,7 @@ export async function verifyBundle(
     }
   }
   const rootSigResult = withEvidenceStatus(
-    verifyRootSignatures(roots, publicKeys, manifest.signatureAlgorithm),
+    verifyRootSignatures(roots, publicKeys, manifest.signatureAlgorithm, cutoverMs),
   );
 
   // 6) Parse + verify inclusion proofs.
@@ -1594,7 +1625,7 @@ export async function verifyBundle(
       )
     : [];
   assertSealedPurgesStructure(sealedPurges, manifest.orgId);
-  const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys);
+  const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys, cutoverMs);
 
   const integrityCheckpointsResult = withEvidenceStatus(
     verifyIntegrityCheckpoints(
@@ -1603,6 +1634,7 @@ export async function verifyBundle(
       checkpoints,
       publicKeys,
       verifiedSeals,
+      cutoverMs,
     ),
   );
 
@@ -1638,6 +1670,7 @@ export async function verifyBundle(
           actionEvents,
           publicKeys,
           manifest.signatureAlgorithm,
+          cutoverMs,
         ),
       )
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
@@ -1845,6 +1878,61 @@ export async function verifyBundle(
  * divergence: a digest over a slightly different preimage would either
  * always fail or, worse, cover fewer fields than the signature does.
  */
+/**
+ * AV-0018 / ADR-0004 — the manifest-v7 format-2 cutover as epoch ms, or null
+ * (no cutover declared, or a pre-v7 bundle, which cannot carry one).
+ */
+function signatureCutoverMs(manifest: BundleManifest): number | null {
+  if (manifest.version < 7 || manifest.signatureFormatCutoverAt == null) return null;
+  return Date.parse(manifest.signatureFormatCutoverAt);
+}
+
+/**
+ * AV-0018 / ADR-0004 — why a declared signature format is unacceptable, or
+ * null. Absent = 1 (pre-format bundles). Anything but 1 or 2 fails closed.
+ * Downgrade guard: a format-1 (untagged) signature on an artefact whose own
+ * SIGNED timestamp is at or after the org's cutover fails.
+ */
+function signatureFormatRejection(
+  format: unknown,
+  signedTimestamp: unknown,
+  cutoverMs: number | null,
+): string | null {
+  const f = format === undefined ? 1 : format;
+  if (f !== 1 && f !== 2) {
+    return `signature_format_unsupported: signatureFormat ${JSON.stringify(f)} is neither 1 nor 2`;
+  }
+  if (f === 1 && cutoverMs !== null) {
+    const t = typeof signedTimestamp === 'string' ? Date.parse(signedTimestamp) : NaN;
+    if (!(t < cutoverMs)) {
+      return `signature_format_downgrade: format-1 (untagged) signature on an artefact signed at ${String(signedTimestamp)}, at or after the org's format-2 cutover ${new Date(cutoverMs).toISOString()}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * AV-0018 — verify a tenant signature in the slot `purpose`, under its
+ * declared format. Returns the rejection reason, `false` for a signature that
+ * does not verify, or `true`. The purpose comes from the caller's slot, never
+ * from the artefact.
+ */
+function verifyTenantSignature(
+  algorithm: BundleSignatureAlgorithm,
+  format: unknown,
+  purpose: SignaturePurpose,
+  payload: Uint8Array,
+  signature: string,
+  publicKey: Uint8Array,
+  signedTimestamp: unknown,
+  cutoverMs: number | null,
+): true | false | string {
+  const rejection = signatureFormatRejection(format, signedTimestamp, cutoverMs);
+  if (rejection !== null) return rejection;
+  const f = format === 2 ? 2 : 1;
+  return verifySignature(algorithm, tenantSignedBytes(f, purpose, payload), signature, publicKey);
+}
+
 function manifestSignableBytes(manifest: BundleManifest): Buffer {
   const signable: Record<string, unknown> = {
     version: manifest.version,
@@ -1871,6 +1959,10 @@ function manifestSignableBytes(manifest: BundleManifest): Buffer {
   }
   if (manifest.version >= 6) {
     signable.evidencePrivacy = manifest.evidencePrivacy;
+  }
+  if (manifest.version >= 7) {
+    signable.signatureFormat = manifest.signatureFormat;
+    signable.signatureFormatCutoverAt = manifest.signatureFormatCutoverAt;
   }
   return canonicalJson(signable);
 }
@@ -2047,24 +2139,48 @@ function verifyManifest(
       reason: `evidence_privacy_missing_on_v6_manifest: manifest declares version ${manifest.version} but is missing evidencePrivacy — every genuine v6 producer emits it; this is version-downgrade skew or tampering, not a signature failure`,
     };
   }
+  // AV-0018 / manifest-v7 — same both-directions rule for the two format fields.
+  const hasFormatFields = 'signatureFormat' in manifest || 'signatureFormatCutoverAt' in manifest;
+  const hasBothFormatFields = 'signatureFormat' in manifest && 'signatureFormatCutoverAt' in manifest;
+  if (manifest.version <= 6 && hasFormatFields) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `signature_format_fields_present_on_v${manifest.version}_manifest: manifest declares version ${manifest.version} but carries signatureFormat/signatureFormatCutoverAt — no genuine producer below v7 ever emits these fields; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
+  if (manifest.version >= 7 && !hasBothFormatFields) {
+    return {
+      ok: false,
+      checked: 1,
+      failed: 1,
+      reason: `signature_format_fields_missing_on_v7_manifest: manifest declares version ${manifest.version} but is missing signatureFormat/signatureFormatCutoverAt — every genuine v7 producer emits both; this is version-downgrade skew or tampering, not a signature failure`,
+    };
+  }
 
   const bytes = manifestSignableBytes(manifest);
   // NX-TAC-02 — Dispatch on the algorithm declared in the manifest.
   // A bundle whose `signatureAlgorithm` is ECDSA_P256_SHA256 is now
   // verifiable (was previously rejected outright).
-  const ok = verifySignature(
+  // AV-0018 — v1..v6 manifests are format 1 (the field cannot be present).
+  const ok = verifyTenantSignature(
     manifest.signatureAlgorithm,
+    manifest.signatureFormat,
+    'bundle-manifest',
     bytes,
     manifest.signature,
     entry.publicKey,
+    manifest.generatedAt,
+    signatureCutoverMs(manifest),
   );
-  return ok
+  return ok === true
     ? { ok: true, checked: 1, failed: 0 }
     : {
         ok: false,
         checked: 1,
         failed: 1,
-        reason: 'manifest signature does not verify',
+        reason: ok === false ? 'manifest signature does not verify' : ok,
       };
 }
 
@@ -2549,6 +2665,7 @@ function verifyIntegrityCheckpoints(
   checkpoints: BundleIntegrityCheckpoint[],
   publicKeys: Map<number, PublicKeyRecord>,
   verifiedSeals: BundleSealedPurge[],
+  cutoverMs: number | null,
 ): RawComponentResult {
   if (manifest.version < 4) {
     return { ok: true, checked: 0, failed: 0 };
@@ -2592,15 +2709,11 @@ function verifyIntegrityCheckpoints(
       cumulativeRowCount: cp.cumulativeRowCount,
       asOf: cp.asOf,
     });
-    if (
-      !verifySignature(
-        cp.signatureAlgorithm,
-        message,
-        cp.signature,
-        entry.publicKey,
-      )
-    ) {
-      fail(cp.id, 'checkpoint signature does not verify');
+    const cpOk = verifyTenantSignature(
+      cp.signatureAlgorithm, cp.signatureFormat, 'integrity-checkpoint', message, cp.signature, entry.publicKey, cp.asOf, cutoverMs,
+    );
+    if (cpOk !== true) {
+      fail(cp.id, cpOk === false ? 'checkpoint signature does not verify' : cpOk);
     }
   }
 
@@ -2983,6 +3096,7 @@ function verifyEventSignatureAndCommitment(
   e: BundleActionEvent,
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
+  cutoverMs: number | null,
 ): { ok: boolean; reason?: string; computedCommitment: string | null } {
   const entry = publicKeys.get(e.keyVersion);
   if (!entry) {
@@ -3006,10 +3120,14 @@ function verifyEventSignatureAndCommitment(
   const canonical = canonicalJson(signableActionEvent(e));
   const message = Buffer.concat([canonical, prevBytes]);
   const algorithm = e.signatureAlgorithm ?? manifestAlgorithm;
-  if (!verifySignature(algorithm, message, e.signature, entry.publicKey)) {
+  // AV-0018 — `receivedAt` (signed) is the event's latest signed timestamp.
+  const eventOk = verifyTenantSignature(
+    algorithm, e.signatureFormat, 'protected-action-event', message, e.signature, entry.publicKey, e.receivedAt, cutoverMs,
+  );
+  if (eventOk !== true) {
     return {
       ok: false,
-      reason: 'event signature does not verify',
+      reason: eventOk === false ? 'event signature does not verify' : eventOk,
       computedCommitment: null,
     };
   }
@@ -3055,6 +3173,7 @@ function verifyActionEventChain(
   events: BundleActionEvent[],
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
+  cutoverMs: number | null,
 ): RawComponentResult {
   let checked = 0;
   let failed = 0;
@@ -3096,6 +3215,7 @@ function verifyActionEventChain(
         e,
         publicKeys,
         manifestAlgorithm,
+        cutoverMs,
       );
       if (!sigResult.ok) {
         fail(id, sigResult.reason ?? 'event signature does not verify');
@@ -4174,6 +4294,7 @@ function verifyRowSignatures(
   rows: BundleRow[],
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
+  cutoverMs: number | null,
 ): RawComponentResult {
   let failed = 0;
   let firstFailure: string | undefined;
@@ -4257,13 +4378,15 @@ function verifyRowSignatures(
       continue;
     }
     const message = Buffer.concat([canonical, prevRowHashBytes]);
-    if (
-      !verifySignature(rowAlgorithm, message, row.signature, entry.publicKey)
-    ) {
+    // AV-0018 — `createdAt` is the row's signed timestamp (in `signableRow`).
+    const rowOk = verifyTenantSignature(
+      rowAlgorithm, row.signatureFormat, 'audit-record', message, row.signature, entry.publicKey, row.createdAt, cutoverMs,
+    );
+    if (rowOk !== true) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = row.id;
-        reason = 'row signature does not verify';
+        reason = rowOk === false ? 'row signature does not verify' : rowOk;
       }
     }
   }
@@ -4433,6 +4556,7 @@ function verifyRootSignatures(
   roots: BundleRoot[],
   publicKeys: Map<number, PublicKeyRecord>,
   manifestAlgorithm: BundleSignatureAlgorithm,
+  cutoverMs: number | null,
 ): RawComponentResult {
   let checked = roots.length;
   let failed = 0;
@@ -4474,13 +4598,16 @@ function verifyRootSignatures(
     // straddles a substrate cutover ships roots of both algorithms;
     // the per-root tag lets each one verify under its own primitive.
     const rootAlgorithm = root.signatureAlgorithm ?? manifestAlgorithm;
-    if (
-      !verifySignature(rootAlgorithm, bytes, root.signature, entry.publicKey)
-    ) {
+    // AV-0018 — `periodEnd` is the root's latest signed timestamp (the
+    // envelope does not cover `signedAt`); a root is signed after it closes.
+    const rootOk = verifyTenantSignature(
+      rootAlgorithm, root.signatureFormat, 'merkle-root', bytes, root.signature, entry.publicKey, root.periodEnd, cutoverMs,
+    );
+    if (rootOk !== true) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
-        reason = 'root signature does not verify';
+        reason = rootOk === false ? 'root signature does not verify' : rootOk;
       }
     }
     // AV-0016 — the supersession link is signed under the SAME key as this
@@ -4488,15 +4615,21 @@ function verifyRootSignatures(
     if (root.supersedesRootId === undefined && root.supersessionSignature === undefined) continue;
     checked += 1;
     const superseded = roots.find((r) => r.id === root.supersedesRootId && r !== root);
-    if (
-      !superseded ||
-      root.supersessionSignature === undefined ||
-      !verifySignature(rootAlgorithm, supersessionSignable(root, superseded.rootHash), root.supersessionSignature, entry.publicKey)
-    ) {
+    const linkOk =
+      !superseded || root.supersessionSignature === undefined
+        ? false
+        : verifyTenantSignature(
+            rootAlgorithm, root.supersessionSignatureFormat, 'merkle-supersession',
+            supersessionSignable(root, superseded.rootHash), root.supersessionSignature, entry.publicKey,
+            root.periodEnd, cutoverMs,
+          );
+    if (linkOk !== true) {
       failed += 1;
       if (!firstFailure) {
         firstFailure = root.id;
-        reason = 'root supersession signature missing or does not verify against the superseded root';
+        reason = linkOk === false
+          ? 'root supersession signature missing or does not verify against the superseded root'
+          : linkOk;
       }
     }
   }
@@ -4885,6 +5018,7 @@ async function verifyAnchorReceipt(
     ...(root.signatureAlgorithm !== undefined
       ? { signatureAlgorithm: root.signatureAlgorithm }
       : {}),
+    ...(root.signatureFormat !== undefined ? { signatureFormat: root.signatureFormat } : {}),
     periodStart: root.periodStart,
     periodEnd: root.periodEnd,
     rowCount: root.rowCount,
@@ -5587,6 +5721,15 @@ function assertManifestStructure(manifest: BundleManifest): void {
   if ('evidencePrivacy' in manifest) {
     assertEvidencePrivacyStructure(manifest.evidencePrivacy, manifest.from, manifest.to);
   }
+  // AV-0018 — format only; presence-vs-version is checked in `verifyManifest`.
+  if (
+    ('signatureFormat' in manifest && manifest.signatureFormat !== 1 && manifest.signatureFormat !== 2) ||
+    ('signatureFormatCutoverAt' in manifest &&
+      manifest.signatureFormatCutoverAt !== null &&
+      !isIsoDate(manifest.signatureFormatCutoverAt))
+  ) {
+    throw new Error('manifest.json has an invalid signatureFormat/signatureFormatCutoverAt');
+  }
 }
 
 function assertIntegrityCheckpointsStructure(
@@ -5708,6 +5851,7 @@ function assertSealedPurgesStructure(
 function verifySealedPurgeAuthenticity(
   purges: BundleSealedPurge[],
   publicKeys: Map<number, PublicKeyRecord>,
+  cutoverMs: number | null,
 ): BundleSealedPurge[] {
   const verified: BundleSealedPurge[] = [];
   for (const p of purges) {
@@ -5731,19 +5875,22 @@ function verifySealedPurgeAuthenticity(
       rekorReceipt: p.rekorReceipt,
     };
     const currentMessage = canonicalJson(envelope);
-    let authentic = verifySignature(
-      p.signatureAlgorithm,
-      currentMessage,
-      p.signature,
-      entry.publicKey,
-    );
+    // AV-0018 — the envelope's latest signed timestamp is `periodEnd`
+    // (`deletedAt` is unsigned, so it cannot be trusted for the cutover).
+    let authentic =
+      verifyTenantSignature(
+        p.signatureAlgorithm, p.signatureFormat, 'retention-seal', currentMessage, p.signature, entry.publicKey,
+        p.periodEnd, cutoverMs,
+      ) === true;
     // Compatibility for seals emitted before the producer aligned its signed
     // representation with the bigint-as-string persistence/wire contract.
     // Those seals signed a JSON number, then stored/exported the same value as
     // a string. The source Merkle root uses a SQL integer, so only a canonical,
     // safely representable decimal is eligible for this exact legacy fallback.
+    // The legacy numeric form predates format 2, so it is format-1 only.
     const legacyRowCount = Number(p.rowCount);
-    if (!authentic && Number.isSafeInteger(legacyRowCount)) {
+    if (!authentic && (p.signatureFormat === undefined || p.signatureFormat === 1) && Number.isSafeInteger(legacyRowCount) &&
+      signatureFormatRejection(1, p.periodEnd, cutoverMs) === null) {
       authentic = verifySignature(
         p.signatureAlgorithm,
         canonicalJson({ ...envelope, rowCount: legacyRowCount }),

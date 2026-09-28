@@ -33,6 +33,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **Tenant signature format 2 and manifest v7** (AV-0018, ADR-0004 / DECISION-SEC-03, be BE-1957).
+  Each signature slot (manifest, row, Merkle root, supersession link, integrity checkpoint,
+  protected-action event, retention seal) verifies `signatureFormat: 2` signatures over
+  `"praesidia:<purpose>:v2\n" || payload` with the slot's fixed purpose, so a signature minted
+  for one purpose fails in every other slot. A v7 manifest signs `signatureFormat` and
+  `signatureFormatCutoverAt`; a format-1 signature dated at or after the cutover fails
+  (`signature_format_downgrade`), and any format other than 1 or 2 fails
+  (`signature_format_unsupported`). A missing `signatureFormat` is 1, so v1–v6 bundles verify
+  unchanged. The manifest ceiling is now 7.
 - **`--trust-anchor <file>` and the `UNANCHORED` verdict** (AV-0017, be BE-1800). The CLI
   accepts a local copy of be's `/.well-known/praesidia-audit-keys.json`; the attestation's
   declared platform key must be listed (else `trust_anchor_key_not_found`) and valid at its
