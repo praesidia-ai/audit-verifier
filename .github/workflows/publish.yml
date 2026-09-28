@@ -69,8 +69,23 @@ jobs:
       - name: Verify operator-approved production trust anchor
         run: npm run check:release-trust-anchor
 
-      - name: Verify publish artifact (prepack repeats the trust-anchor gate)
-        run: npm pack --dry-run
+      # AV-0015 — pack the release tarball (prepack repeats the trust-anchor
+      # gate), flatten it with the samples into release/ and checksum every
+      # file, so `sha256sum -c SHA256SUMS` works in a folder of downloaded
+      # assets. Unsigned: a signed checksum needs a key ceremony (user-owed).
+      - name: Pack release assets (prepack repeats the trust-anchor gate)
+        run: |
+          mkdir release
+          npm pack --pack-destination release
+          cp samples/* release/
+          cd release && sha256sum -- * > SHA256SUMS
+
+      - name: Upload release assets as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release/
+          if-no-files-found: error
 
       # AV-0014 — CycloneDX SBOM of the production dependency tree (same
       # tool + flags as be's sbom-release.yml), kept as a workflow artifact.
@@ -95,3 +110,37 @@ jobs:
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # AV-0015 — the only job with `contents: write`. Runs after npm publish
+  # succeeds, uploads exactly the files SHA256SUMS covers (after re-checking
+  # them), and never overwrites an existing asset (no --clobber).
+  release-assets:
+    name: GitHub release assets (tgz + SHA256SUMS + samples)
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release
+
+      - name: Re-check checksums
+        working-directory: release
+        run: sha256sum -c --strict SHA256SUMS
+
+      - name: Create the release if missing and upload assets
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" \
+              --notes "Verify the download: sha256sum -c SHA256SUMS (see README, Verify the download)."
+          fi
+          # shellcheck disable=SC2046 # asset names are fixed, no whitespace
+          gh release upload "$RELEASE_TAG" SHA256SUMS $(awk '{print $2}' SHA256SUMS)

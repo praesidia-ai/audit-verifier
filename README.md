@@ -27,6 +27,22 @@ a hand-run publish without an OIDC-backed provenance statement is refused. To
 check the tarball you installed, see
 [Trust anchor](#trust-anchor--verifying-the-clis-embedded-pin-out-of-band).
 
+### Verify the download
+
+Each tagged release on GitHub has the npm tarball
+(`praesidia-audit-verifier-<version>.tgz`), the files from `samples/`, and a `SHA256SUMS` file
+that covers all of them as assets. They come from the same CI run that publishes to npm. Download
+the assets you need into one folder, then run:
+
+```bash
+sha256sum -c --ignore-missing SHA256SUMS   # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+npm install -g ./praesidia-audit-verifier-<version>.tgz
+```
+
+`SHA256SUMS` is not signed. It catches a corrupted or truncated download. It does not protect
+against someone who can change the release. To check authenticity, compare the tarball with the npm
+provenance attestation (`npm audit signatures`) and check the embedded trust anchor out-of-band.
+
 ## Try it in 60 seconds
 
 The package ships three sample audit packages in `samples/`, signed with
