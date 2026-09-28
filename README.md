@@ -94,6 +94,12 @@ praesidia-verify aibom <aibom.attested.json> --audit-bundle <bundle.zip> [bundle
 
 Options:
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
+  --trust-anchor <file>
+               A LOCAL copy of Praesidia's trust-anchor document
+               (GET /.well-known/praesidia-audit-keys.json). The bundle's
+               platform attestation must be signed by a key it lists, else
+               FAIL (exit 1). Never fetched by the CLI; exclusive with
+               --platform-key. See "Trust anchor" below.
   --platform-key <file>
                Trust this PEM or SPKI-DER platform public key. Prints a
                WARNING: the result is only as strong as that file's
@@ -106,7 +112,7 @@ Options:
                Explicitly accept a pre-attestation legacy bundle.
   --summary    Print only the six per-proof lines (see "Proof summary"),
                then RESULT and any caveat.
-  --quiet      Print only the final status word (OK/FAIL/INCOMPLETE).
+  --quiet      Print only the final status word (OK/FAIL/INCOMPLETE/UNANCHORED).
   --json       Print the full VerifyReport as stable machine-readable JSON
                (mutually exclusive with --quiet; --json wins if both given).
   --help       Show this help message.
@@ -121,6 +127,10 @@ Exit codes:
       produce this when a piece of evidence was legitimately redacted
       (`payload: null` with a `payloadCommitment` present) rather than
       illegitimately stripped — see "Verdict shape" below.
+  5   status: unanchored — no platform trust anchor at all (no build-time
+      pin, no --trust-anchor, no --platform-key): the signing keys are the
+      bundle's own claim, so origin is unproven. Never a pass; a real
+      failure (exit 1) wins over it.
 ```
 
 ## Audit packages (AV-0007)
@@ -195,9 +205,11 @@ to "just a gap". Exit codes let a script tell the three outcomes apart:
 4   status: discontinuous   — every bundle individually verifies, but the
     set has a named gap, overlap, forged boundary, or non-genesis first
     bundle.
+5   status: bundle_unanchored — no bundle invalid, no discontinuity, but no
+    platform trust anchor was available (see single-bundle exit 5).
 ```
 
-`verify-set` accepts the same `--no-rekor` / `--platform-key` /
+`verify-set` accepts the same `--no-rekor` / `--trust-anchor` / `--platform-key` /
 `--allow-legacy-unattested` / `--json` / `--quiet` options as single-bundle
 mode, applied identically to every bundle in the set. It does not change
 the single-bundle command's behaviour or exit codes in any way.
@@ -315,7 +327,10 @@ the top-level report both carry a `status: 'valid' | 'invalid' | 'incomplete'
 | 'unsupported' | 'not_present'` field (`ok: boolean` is kept for backward compatibility,
 always derived as `status === 'valid'`). The top-level `status` is a real
 reduction, not "any component failed": `invalid` if any component is
-`invalid`; else `incomplete` if any is `incomplete`; else `valid`. A
+`invalid`; else `unanchored` (top level only, AV-0017) when no platform
+trust anchor existed — `platformAttestation` is then `incomplete` with reason
+`platform_key_not_pinned`; else `incomplete` if any is `incomplete`; else
+`valid`. A
 component reporting `unsupported` — this bundle legitimately carries no
 evidence for that check — is reported but never drags the overall verdict
 down. The nine action-evidence components (invariants 13-21 below) report
@@ -506,9 +521,11 @@ checks every cryptographic invariant the bundle commits to:
    see **root coverage** (10).
 8. **Platform key-binding attestation** — `platform-attestation.json` is
    checked against a trusted platform key. The current source distribution
-   does not embed a deployment-specific key, so operators must pass the key
-   with `--platform-key` (or `platformPublicKeyDerB64` through the library).
-   Missing attestation or trust key fails closed. Pre-attestation bundles are
+   does not embed a deployment-specific key, so operators pass a trust anchor
+   with `--trust-anchor` (library: `platformTrustAnchor`) or a single key with
+   `--platform-key` (library: `platformPublicKeyDerB64`). A missing attestation,
+   or an anchor/pin that does not contain the signing key, fails closed (exit 1);
+   no trust anchor at all is `unanchored` (exit 5). Pre-attestation bundles are
    accepted only with explicit `--allow-legacy-unattested`. The attestation
    must cover every bundled key exactly once and binds its fingerprint,
    lifecycle status, and revocation timestamp.
@@ -861,6 +878,28 @@ to eliminate). Do not take the embedded bytes on faith: an npm-registry or CI-su
 compromise of _this package_ is exactly the attack a customer's own second channel should
 catch.
 
+- **`--trust-anchor <file>` (AV-0017) checks the bundle against Praesidia's published
+  trust-anchor document** — `GET https://<api-host>/.well-known/praesidia-audit-keys.json`,
+  `{ "purpose": "audit-bundle-platform-attestation", "keys": [...] }`. The CLI **never fetches
+  it**: download it yourself, over a channel independent of the bundle, and pass the local
+  file (a URL is rejected, exit 2):
+
+  ```bash
+  curl -fsSo praesidia-audit-keys.json https://<api-host>/.well-known/praesidia-audit-keys.json
+  praesidia-verify bundle.zip --trust-anchor praesidia-audit-keys.json
+  ```
+
+  Every listed key is self-checked first (PEM, JWK and `fingerprint` must be the same EC P-256
+  key; `signatureAlgorithm` must be `ECDSA_P256_SHA256`) — any inconsistency is exit 2. The
+  attestation's `platformSigningKeyFingerprint` selects the key; a document that does not list
+  it fails `trust_anchor_key_not_found`, and an attestation `issuedAt` outside the key's
+  `notBefore`/`notAfter` fails `trust_anchor_key_not_valid_at_issuedAt` (both exit 1). Retired
+  keys stay listed so archived bundles keep verifying. Like `--platform-key`, the caller is the
+  trust anchor, so every run prints a `WARNING:` line. Exclusive with `--platform-key`.
+- **No trust anchor at all is `UNANCHORED` (exit 5)**, never OK and never a plain FAIL: with no
+  build-time pin, no `--trust-anchor` and no `--platform-key`, the signing keys are the bundle's
+  own claim. `platformAttestation` reports `incomplete` / `platform_key_not_pinned`; any real
+  verification failure still wins (exit 1).
 - **A caller-supplied `--platform-key` makes the caller the trust anchor.** The CLI cannot
   tell an operator-obtained key from one that arrived in the same email or ZIP as the bundle,
   and with a caller key the attestation's `platformSigningKeyFingerprint` check degenerates to
@@ -898,12 +937,13 @@ catch.
   `docs/design/platform-key-hierarchy.md` — including the concrete, stated limit that an
   already-installed offline CLI cannot learn of a revocation before its next upgrade, which
   no purely offline design can avoid.
-- **Until the production key ceremony lands**, this pin is intentionally empty and the
-  verifier fails closed with `platform_key_not_pinned` on every bundle — see "Platform
-  key-binding attestation" above and `src/platform-pubkey.ts`'s own docblock. That failure
-  is correct; do not work around it with `--platform-key` fetched from anywhere other than
-  the second channel described above, or you have reintroduced the exact trust dependency
-  this tool exists to remove.
+- **Until the production key ceremony lands** (the prod pin value is filled at release,
+  AV-0015), this pin is intentionally empty and every bundle verified without
+  `--trust-anchor`/`--platform-key` is `UNANCHORED` (exit 5, `platform_key_not_pinned`) — see
+  "Platform key-binding attestation" above and `src/platform-pubkey.ts`'s own docblock. That
+  verdict is correct; do not work around it with a trust anchor or key fetched from anywhere
+  other than the second channel described above, or you have reintroduced the exact trust
+  dependency this tool exists to remove.
 - **The bundle-schema contract this verifier parses is itself gated against drift**:
   `scripts/contract-drift.mjs` (CI job `contract-drift`) diffs `be-core`'s bundle producer
   against this package's `BundleActionEvent`/`BundleManifest`/`signableActionEvent`/

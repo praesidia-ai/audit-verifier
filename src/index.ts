@@ -9,6 +9,8 @@
 
 export { verifyBundle, ROOT_SUPERSESSION_VERSION } from './verify.js';
 export { verifyAuditPackage, isAuditPackage } from './package.js';
+export { parsePlatformTrustAnchor, PLATFORM_TRUST_ANCHOR_PURPOSE } from './trust-anchor.js';
+export type { PlatformTrustAnchor, PlatformTrustAnchorKey } from './trust-anchor.js';
 export type { PackageIntegrity, PackageVerifyReport } from './package.js';
 export type {
   VerifyReport,

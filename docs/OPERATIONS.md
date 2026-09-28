@@ -29,6 +29,7 @@ node dist/cli.js <bundle.zip>                       # full verify
 node dist/cli.js <bundle.zip> --json                 # machine-readable VerifyReport
 node dist/cli.js <bundle.zip> --no-rekor             # skip offline Rekor receipt check
 node dist/cli.js <bundle.zip> --platform-key <file>  # trust an alternate pinned key
+node dist/cli.js <bundle.zip> --trust-anchor <file>  # local copy of /.well-known/praesidia-audit-keys.json (AV-0017)
 node dist/cli.js --verify-set <bundle1.zip> <bundle2.zip> ...   # cross-bundle continuity (SCAN2-004)
 node dist/cli.js aibom <file.attested.json> --tenant-key-fingerprint <hex>  # AIBOM export (AV-0001)
 ```

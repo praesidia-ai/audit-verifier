@@ -18,6 +18,9 @@
  *      row #10).
  *      AV-0013: a declared evidence privacy mode (manifest v6) never turns
  *      that into a pass; it only adds `reason: evidence_privacy_mode:<MODE>`.
+ *   5  Unanchored (status: unanchored, AV-0017) — no platform trust anchor
+ *      (build-time pin, --trust-anchor, --platform-key), so the bundle's
+ *      signing keys cannot be tied to Praesidia. Never a pass.
  */
 
 import * as fs from 'node:fs/promises';
@@ -31,6 +34,7 @@ import { GENESIS_PREV_ROW_HASH } from './crypto.js';
 import { findVerifiedDecision, formatDecision } from './decision-disclosures.js';
 import { formatProofLines } from './proofs.js';
 import { formatEvidencePrivacyLines } from './evidence-privacy.js';
+import { parsePlatformTrustAnchor } from './trust-anchor.js';
 import { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_UNAUTHENTICATED_FIELDS, MAX_AIBOM_ENVELOPE_BYTES, type AibomVerifyOptions } from './aibom.js';
 
 interface CliArgs {
@@ -49,12 +53,16 @@ interface CliArgs {
    * document. Mismatch is a hard exit-2 error, never a warning.
    */
   platformKeyFingerprint: string | null;
+  /** AV-0017 — local copy of be's `/.well-known/praesidia-audit-keys.json`. */
+  trustAnchorPath: string | null;
   targetKeysPath: string | null;
   allowLegacyUnattested: boolean;
 }
 
 /** A PEM/SPKI public key is tiny; leave ample room for comments/cert wrappers. */
 const MAX_PLATFORM_KEY_BYTES = 64 * 1024;
+/** At most 64 keys of ~1 KiB each. */
+const MAX_TRUST_ANCHOR_BYTES = 256 * 1024;
 
 const HELP = `praesidia-verify — offline verifier for Praesidia compliance bundles
 
@@ -94,8 +102,8 @@ USAGE
   check, 2 I/O, usage or unsupported-format error.
 
   AV-0002 — \`--audit-bundle\` replaces the pin: the compliance bundle is
-  verified first (with --no-rekor / --platform-key / --platform-key-
-  fingerprint / --target-keys as above) and must be valid AND
+  verified first (with --no-rekor / --trust-anchor / --platform-key /
+  --platform-key-fingerprint / --target-keys as above) and must be valid AND
   platform-attested, else exit 1; its non-REVOKED attested tenant keys
   become the pins, and the AIBOM must name the bundle's org.
 
@@ -110,6 +118,12 @@ OPTIONS
   --no-rekor   Skip the offline Sigstore Rekor receipt verification.
   --target-keys <file>
                JSON map of organizationId:targetId:keyId to trusted Ed25519 PEM.
+  --trust-anchor <file>
+               AV-0017 — a LOCAL copy of Praesidia's trust-anchor document
+               (GET /.well-known/praesidia-audit-keys.json). The attestation
+               must be signed by a key it lists, else FAIL (exit 1). The CLI
+               never fetches it: download it yourself, over a channel
+               independent of the bundle. Exclusive with --platform-key.
   --platform-key <file>
                Trust this PEM or SPKI-DER platform attestation public key.
                The result is only as strong as the provenance of that file;
@@ -135,7 +149,7 @@ OPTIONS
                receipt, policy reference, evidence integrity, target
                receipt), then RESULT and any caveat. Without it the six
                lines lead the full component detail.
-  --quiet      Print only the final OK/FAIL/INCOMPLETE summary line.
+  --quiet      Print only the final OK/FAIL/INCOMPLETE/UNANCHORED summary line.
   --json       Print the full VerifyReport as stable machine-readable JSON
                instead of the human-readable report (mutually exclusive
                with --quiet; --json wins if both are passed).
@@ -147,6 +161,9 @@ EXIT CODES
   1   status: invalid — a real verification failure.
   2   I/O or bundle-format error.
   3   status: incomplete — evidence present is insufficient to decide.
+  5   status: unanchored — no platform trust anchor (no build-time pin, no
+      --trust-anchor, no --platform-key): the signing keys are the bundle's
+      own claim, so origin is unproven. A real failure (exit 1) wins.
 
 EXIT CODES (verify-set)
   0   status: continuous      — every bundle valid, no gap/overlap/mismatch.
@@ -160,6 +177,8 @@ EXIT CODES (verify-set)
   4   status: discontinuous   — every bundle individually verifies, but the
       set has a named gap, overlap, forged boundary, or non-genesis first
       bundle (AUDIT-03).
+  5   status: bundle_unanchored — no bundle invalid, no discontinuity, but
+      no platform trust anchor was available (see exit 5 above).
 
 The bundle is verified entirely offline — the verifier makes NO network
 calls. The Rekor receipt is verified against a PINNED Sigstore public key
@@ -177,6 +196,7 @@ function newCommonFlags(): CommonFlags {
     help: false,
     platformKeyPath: null,
     platformKeyFingerprint: null,
+    trustAnchorPath: null,
     targetKeysPath: null,
     allowLegacyUnattested: false,
   };
@@ -206,6 +226,17 @@ function parseCommonArgs(
       const value = argv[i + 1];
       if (!value || value.startsWith('-')) throw new Error('--target-keys requires a file path');
       flags.targetKeysPath = value;
+      i += 1;
+    } else if (arg === '--trust-anchor') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) throw new Error('--trust-anchor requires a file path');
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+        throw new Error(
+          '--trust-anchor takes a local file: the verifier never fetches over the network. ' +
+            'Download the document first (e.g. curl -fsSo anchor.json <url>) over a channel independent of the bundle.',
+        );
+      }
+      flags.trustAnchorPath = value;
       i += 1;
     } else if (arg === '--platform-key') {
       const value = argv[i + 1];
@@ -372,6 +403,8 @@ function statusWord(status: VerifyReport['status'] | ComponentResult['status']):
       return 'FAIL';
     case 'incomplete':
       return 'INCOMPLETE';
+    case 'unanchored':
+      return 'UNANCHORED';
     case 'unsupported':
       return 'UNSUPPORTED';
     case 'not_present':
@@ -384,6 +417,7 @@ function printReport(
   quiet: boolean,
   noRekor: boolean,
   platformKeySupplied: boolean,
+  trustAnchorSupplied: boolean,
   summary = false,
 ): void {
   if (quiet) {
@@ -399,7 +433,7 @@ function printReport(
   }
   lines.push(...formatProofLines(report.proofs));
   if (!summary) printDetail(report, lines);
-  printTail(report, lines, noRekor, platformKeySupplied);
+  printTail(report, lines, noRekor, platformKeySupplied, trustAnchorSupplied);
   process.stdout.write(lines.join('\n') + '\n');
 }
 
@@ -477,7 +511,18 @@ function printDetail(report: VerifyReport & { package?: PackageIntegrity }, line
   lines.push('', ...formatEvidencePrivacyLines(report.evidencePrivacy));
 }
 
-function printTail(report: VerifyReport, lines: string[], noRekor: boolean, platformKeySupplied: boolean): void {
+const TRUST_ANCHOR_WARNING =
+  'WARNING: trust anchor supplied by caller — result is only as strong as the provenance of ' +
+  'that document. Obtain it from Praesidia\'s /.well-known/praesidia-audit-keys.json over a ' +
+  'channel independent of this bundle.';
+
+function printTail(
+  report: VerifyReport,
+  lines: string[],
+  noRekor: boolean,
+  platformKeySupplied: boolean,
+  trustAnchorSupplied: boolean,
+): void {
   lines.push('');
   lines.push(`RESULT: ${statusWord(report.status)}`);
   // PROD16 F8 — a bare "RESULT: OK" must never be read as "the external
@@ -501,6 +546,9 @@ function printTail(report: VerifyReport, lines: string[], noRekor: boolean, plat
   // it was handed. `--no-rekor` and `--allow-legacy-unattested` both announce
   // themselves; this must too, or `[VALID] platform attest.` reads as an
   // assurance Praesidia never gave.
+  if (trustAnchorSupplied) {
+    lines.push(TRUST_ANCHOR_WARNING);
+  }
   if (platformKeySupplied) {
     lines.push(
       'WARNING: platform key supplied by caller — result is only as strong as ' +
@@ -520,6 +568,13 @@ function printTail(report: VerifyReport, lines: string[], noRekor: boolean, plat
       'NOTE: this bundle\'s platform attestation is not bound to this manifest ' +
         '(no manifestDigest/manifestGeneratedAt) — it attests the org key set, ' +
         'not this specific export; upgrade the exporter.',
+    );
+  }
+  if (report.status === 'unanchored') {
+    lines.push(
+      'UNANCHORED: no platform trust anchor (no build-time pin, --trust-anchor or --platform-key) — ' +
+        'the signing keys are this bundle\'s own claim, so nothing here proves it came from Praesidia. ' +
+        'Re-run with --trust-anchor <local copy of /.well-known/praesidia-audit-keys.json>.',
     );
   }
   if (report.platformAttestation.reason === 'missing_legacy_explicitly_allowed') {
@@ -592,6 +647,9 @@ async function bundleVerifyOptions(flags: CommonFlags): Promise<VerifyOptions> {
   if (!flags.platformKeyPath && flags.platformKeyFingerprint) {
     throw new Error('--platform-key-fingerprint requires --platform-key');
   }
+  if (flags.platformKeyPath && flags.trustAnchorPath) {
+    throw new Error('--trust-anchor and --platform-key are mutually exclusive');
+  }
   const load = async <T>(what: string, read: () => Promise<T>): Promise<T> =>
     read().catch((err: Error) => {
       throw new Error(`cannot load ${what}: ${err.message}`);
@@ -601,6 +659,15 @@ async function bundleVerifyOptions(flags: CommonFlags): Promise<VerifyOptions> {
     allowLegacyUnattested: flags.allowLegacyUnattested,
     ...(flags.platformKeyPath
       ? { platformPublicKeyDerB64: await load('platform key', () => resolvePlatformPublicKeyDerB64(flags.platformKeyPath!, flags.platformKeyFingerprint)) }
+      : {}),
+    ...(flags.trustAnchorPath
+      ? {
+          platformTrustAnchor: await load('trust anchor', async () =>
+            parsePlatformTrustAnchor(
+              (await readRegularFileBounded(path.resolve(flags.trustAnchorPath!), MAX_TRUST_ANCHOR_BYTES, 'trust anchor')).toString('utf8'),
+            ),
+          ),
+        }
       : {}),
     ...(flags.targetKeysPath
       ? { targetPublicKeys: await load('target keys', () => resolveTargetPublicKeys(flags.targetKeysPath!)) }
@@ -669,7 +736,7 @@ interface VerifySetReport {
    * is what lets a script tell "set is continuous" / "set has a gap" /
    * "a bundle is invalid" apart, per the item's Definition of Done.
    */
-  status: 'continuous' | 'discontinuous' | 'bundle_invalid' | 'bundle_incomplete';
+  status: 'continuous' | 'discontinuous' | 'bundle_invalid' | 'bundle_unanchored' | 'bundle_incomplete';
   orgId: string;
   bundles: VerifySetBundleSummary[];
   findings: ContinuityFinding[];
@@ -691,6 +758,7 @@ function buildVerifySetReport(
 
   const bundleInvalid = sorted.some((e) => e.report.status === 'invalid');
   const bundleIncomplete = sorted.some((e) => e.report.status === 'incomplete');
+  const bundleUnanchored = sorted.some((e) => e.report.status === 'unanchored');
 
   // AUDIT-03 — the earliest bundle in a set an auditor is treating as the
   // complete history must be genesis-rooted. An opaque anchor there means
@@ -774,7 +842,9 @@ function buildVerifySetReport(
     ? 'bundle_invalid'
     : findings.length > 0
       ? 'discontinuous'
-      : bundleIncomplete
+      : bundleUnanchored
+        ? 'bundle_unanchored'
+        : bundleIncomplete
         ? 'bundle_incomplete'
         : 'continuous';
 
@@ -804,6 +874,8 @@ function verifySetStatusWord(status: VerifySetReport['status']): string {
       return 'FAIL';
     case 'bundle_incomplete':
       return 'INCOMPLETE';
+    case 'bundle_unanchored':
+      return 'UNANCHORED';
   }
 }
 
@@ -818,6 +890,8 @@ function verifySetExitCode(status: VerifySetReport['status']): number {
       return 3;
     case 'discontinuous':
       return 4;
+    case 'bundle_unanchored':
+      return 5;
   }
 }
 
@@ -826,6 +900,7 @@ function printVerifySetReport(
   quiet: boolean,
   noRekor: boolean,
   platformKeySupplied: boolean,
+  trustAnchorSupplied: boolean,
 ): void {
   if (quiet) {
     process.stdout.write(`${verifySetStatusWord(report.status)}\n`);
@@ -857,6 +932,7 @@ function printVerifySetReport(
     lines.push('NOTE: --no-rekor was passed — the external Rekor witness was NOT checked for any bundle in this set.');
   }
   // SEC-2026-09-12 (MCPSDK-03) — same caveat as single-bundle mode.
+  if (trustAnchorSupplied) lines.push(TRUST_ANCHOR_WARNING);
   if (platformKeySupplied) {
     lines.push(
       'WARNING: platform key supplied by caller — result is only as strong as ' +
@@ -931,6 +1007,7 @@ async function mainVerifySet(argv: string[]): Promise<number> {
       args.quiet,
       args.noRekor,
       args.platformKeyPath !== null,
+      args.trustAnchorPath !== null,
     );
   }
   return verifySetExitCode(setReport.status);
@@ -1007,10 +1084,10 @@ async function main(argv: string[]): Promise<number> {
     // parser. `--quiet` is ignored when `--json` is also passed.
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    printReport(report, args.quiet, args.noRekor, args.platformKeyPath !== null, args.summary);
+    printReport(report, args.quiet, args.noRekor, args.platformKeyPath !== null, args.trustAnchorPath !== null, args.summary);
   }
   // PA-0009 (D15) — exit code is a function of `report.status`, not `ok`:
-  // 0 valid, 1 invalid, 3 incomplete. `unsupported` never appears at the
+  // 0 valid, 1 invalid, 3 incomplete, 5 unanchored (AV-0017). `unsupported` never appears at the
   // top level (see `reduceStatus`), so no exit code is reserved for it.
   switch (report.status) {
     case 'valid':
@@ -1019,6 +1096,8 @@ async function main(argv: string[]): Promise<number> {
       return 1;
     case 'incomplete':
       return 3;
+    case 'unanchored':
+      return 5;
   }
 }
 
@@ -1082,7 +1161,7 @@ async function mainAibom(argv: string[]): Promise<number> {
   }
   if (
     auditBundle === null &&
-    (flags.noRekor || flags.allowLegacyUnattested || flags.platformKeyPath || flags.platformKeyFingerprint || flags.targetKeysPath)
+    (flags.noRekor || flags.allowLegacyUnattested || flags.platformKeyPath || flags.platformKeyFingerprint || flags.trustAnchorPath || flags.targetKeysPath)
   ) {
     return usage('bundle options require --audit-bundle');
   }
@@ -1116,7 +1195,9 @@ async function mainAibom(argv: string[]): Promise<number> {
       `status as attested at ${bundleReport.bundle.attestedTenantKeys![0]!.attestedAt}\n` +
       (flags.platformKeyPath
         ? 'WARNING: platform key supplied by caller — the pin is only as strong as the provenance of that key file.\n'
-        : '');
+        : flags.trustAnchorPath
+          ? `${TRUST_ANCHOR_WARNING}\n`
+          : '');
   }
   const report = verifyAibomAttestation(bytes, trust);
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

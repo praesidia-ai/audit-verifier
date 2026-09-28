@@ -123,7 +123,11 @@ export async function verifyAuditPackage(
     throw new Error(integrity.status === 'invalid' ? `${integrity.reason}; ${msg}` : msg);
   }
   const statuses = [report.status, integrity.status];
-  const status = statuses.includes('invalid') ? 'invalid' : statuses.includes('incomplete') ? 'incomplete' : 'valid';
+  const status = statuses.includes('invalid')
+    ? 'invalid'
+    : report.status === 'unanchored'
+      ? 'unanchored'
+      : statuses.includes('incomplete') ? 'incomplete' : 'valid';
   return {
     ...report,
     ok: status === 'valid',

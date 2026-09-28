@@ -12,8 +12,9 @@ verifier works; it says nothing about Praesidia. No private key is committed.
 | `audit-package.wrong-key.zip` | A well-formed package whose platform attestation was signed by a different key than `sample-platform-key.pem`. |
 | `sample-platform-key.pem` | PUBLIC half of the sample platform attestation test key (P-256, SPKI sha256 `fb4b6246b3670bbafd1c0b84b3025c0be8f486d008395fba755657e583fc7139`). |
 
-The CLI never trusts this key on its own: without `--platform-key` the valid
-sample fails (`FAIL signature`). The samples carry no Rekor anchor (only
+The CLI never trusts this key on its own: without `--platform-key` (or a
+`--trust-anchor` document listing it) the valid sample is `RESULT: UNANCHORED`,
+exit 5 (`INCOMPLETE signature`), never OK. The samples carry no Rekor anchor (only
 Sigstore can sign one), so they are verified with `--no-rekor`, and the CLI
 says so on every run; without it they fail closed on `rekor receipts`.
 

@@ -31,7 +31,8 @@ of *this package* is exactly the attack a customer's second channel should catch
 
 **USER-OWED, pending the production key ceremony (MIL-0003).** As of this writing
 `PLATFORM_PUBLIC_KEY_DER_B64` / `PLATFORM_PUBLIC_KEY_FINGERPRINT` are intentionally empty (the
-verifier fails closed with `platform_key_not_pinned` on every bundle — correct, not a bug) and
+verifier reports every bundle verified without `--trust-anchor`/`--platform-key` as `UNANCHORED`,
+exit 5, reason `platform_key_not_pinned` — correct, not a bug) and
 there is deliberately **no URL published here yet**: a customer-facing document must never point
 an auditor at a channel that does not exist. Once the ceremony lands, publish the exact
 fingerprint on infrastructure that is:

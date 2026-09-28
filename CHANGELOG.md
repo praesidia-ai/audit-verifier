@@ -33,6 +33,19 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **`--trust-anchor <file>` and the `UNANCHORED` verdict** (AV-0017, be BE-1800). The CLI
+  accepts a local copy of be's `/.well-known/praesidia-audit-keys.json`; the attestation's
+  declared platform key must be listed (else `trust_anchor_key_not_found`) and valid at its
+  `issuedAt` (else `trust_anchor_key_not_valid_at_issuedAt`), both exit 1. A malformed or
+  self-inconsistent document, a URL (the CLI never fetches), or combining it with
+  `--platform-key` is exit 2. Library: `parsePlatformTrustAnchor` + `VerifyOptions.platformTrustAnchor`.
+  **Verdict change:** a bundle verified with no trust anchor at all (no build-time pin, no
+  `--trust-anchor`, no `--platform-key`) was `invalid`/exit 1; it is now top-level
+  `status: 'unanchored'` (`ok: false`), exit 5, with `platformAttestation` `incomplete` /
+  `platform_key_not_pinned`; `verify-set` gains `bundle_unanchored` (exit 5). Never a pass;
+  `invalid` still wins. Library callers that treated only `status === 'invalid'` as failure must
+  check `ok` (always false here). A malformed attestation with no anchor is now reported as
+  `malformed` (invalid) instead of `platform_key_not_pinned`.
 - **Manifest v6: the declared evidence privacy mode** (AV-0013, be BE-1615).
   `MAX_SUPPORTED_MANIFEST_VERSION` 5 → 6. The signed `evidencePrivacy` timeline joins the
   manifest preimage (16 fields). New `report.evidencePrivacy`: per mode window, what the

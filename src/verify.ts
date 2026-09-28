@@ -103,6 +103,10 @@ import {
   PLATFORM_PUBLIC_KEY_FINGERPRINT,
   isPlatformPubkeyPinned,
 } from './platform-pubkey.js';
+import type { PlatformTrustAnchor } from './trust-anchor.js';
+
+/** AV-0017 — `platformAttestation.reason` when no trust anchor exists at all; drives top-level `unanchored`. */
+const PLATFORM_KEY_NOT_PINNED = 'platform_key_not_pinned';
 
 // ────────────────────────────────────────────────────────────────────────
 // Bundle wire types — what `BundleExporterService` (AGV-035) writes.
@@ -730,7 +734,7 @@ export interface VerifyReport {
    * `reduceStatus`. Never `unsupported` or `not_present` at the top level
    * (D15, AV-0008) — those statuses only ever appear per-component.
    */
-  status: Exclude<ComponentStatus, 'unsupported' | 'not_present'>;
+  status: Exclude<ComponentStatus, 'unsupported' | 'not_present'> | 'unanchored';
   /**
    * AV-0010 — the six auditor-facing proofs, each reduced from named
    * components (`proofs.ts` `PROOF_COMPONENTS`, docs/ARCHITECTURE.md). Every
@@ -1137,6 +1141,14 @@ export interface VerifyOptions {
    * fails closed when neither source contains a key.
    */
   platformPublicKeyDerB64?: string;
+  /**
+   * AV-0017 — a caller-supplied trust anchor (`parsePlatformTrustAnchor`
+   * over be's `/.well-known/praesidia-audit-keys.json`). The attestation's
+   * declared `platformSigningKeyFingerprint` selects the key; a document
+   * that does not list it fails `trust_anchor_key_not_found`. Mutually
+   * exclusive with `platformPublicKeyDerB64` (both → thrown error).
+   */
+  platformTrustAnchor?: PlatformTrustAnchor;
   /**
    * Explicitly accept a pre-attestation legacy bundle. Defaults to false so a
    * self-signed bundle cannot pass without an external platform trust anchor.
@@ -1681,7 +1693,12 @@ export async function verifyBundle(
     manifest,
     options,
   );
-  const platformResult = withEvidenceStatus(platformRaw);
+  // AV-0017 — no trust anchor at all cannot decide origin: `incomplete`
+  // here, `unanchored` at the top level (below), never `valid`.
+  const platformResult = withEvidenceStatus(
+    platformRaw,
+    platformRaw.reason === PLATFORM_KEY_NOT_PINNED ? 'incomplete' : undefined,
+  );
 
   // 9) BUG-AUDIT-01 — Completeness: the SIGNED row/root counts must
   // match what is actually present, or a trailing-truncation attack
@@ -1750,7 +1767,10 @@ export async function verifyBundle(
   const evidenceResults = allResults.filter(
     (r) => r !== manifestResult && r !== platformResult && r !== completenessResult && r !== keyBindingResult,
   );
-  const status = reduceStatus(allResults, evidenceResults);
+  // AV-0017 — invalid beats unanchored beats incomplete beats valid.
+  const reduced = reduceStatus(allResults, evidenceResults);
+  const status: VerifyReport['status'] =
+    reduced === 'incomplete' && platformResult.reason === PLATFORM_KEY_NOT_PINNED ? 'unanchored' : reduced;
   const ok = status === 'valid';
 
   const report: Omit<VerifyReport, 'proofs'> = {
@@ -5001,10 +5021,11 @@ interface PlatformAttestationEnvelope {
  *
  * The check chain (each step short-circuits to the next reason on
  * failure):
- *   1. Resolve the platform pubkey: caller-supplied
- *      `options.platformPublicKeyDerB64` wins; otherwise fall back
- *      to the bundled pin. If both are empty, return
- *      `platform_key_not_pinned` (fail closed).
+ *   1. Resolve the platform pubkey ({@link resolvePlatformKey}, run
+ *      after step 3): `options.platformPublicKeyDerB64`, else the
+ *      `options.platformTrustAnchor` key the attestation names, else the
+ *      bundled pin. None → `platform_key_not_pinned` (never valid: the
+ *      top-level status is `unanchored`, AV-0017).
  *   2. If the entry is missing entirely, fail unless the caller explicitly
  *      enables `allowLegacyUnattested`.
  *   3. Parse the envelope. Reject malformed JSON / shape with
@@ -5027,6 +5048,53 @@ interface PlatformAttestationEnvelope {
  *   7. Every `keyVersions[i].fingerprint` MUST match the sha256 of
  *      the corresponding entry in `public-keys.json`.
  */
+/**
+ * AUDIT-2026-05-30 / AV-0017 — the platform key the attestation must verify
+ * under: caller key > caller trust anchor > build-time pin. None of them →
+ * `platform_key_not_pinned` (top-level `unanchored`). The returned fingerprint
+ * is what step 6 compares the declared one against — recomputed for caller
+ * material so a hand-built anchor cannot assert a fingerprint.
+ */
+function resolvePlatformKey(
+  body: PlatformAttestationBody,
+  options: VerifyOptions,
+): { der: Buffer; fingerprint: string } | { reason: string } {
+  const override = options.platformPublicKeyDerB64;
+  const anchor = options.platformTrustAnchor;
+  if (override && anchor) {
+    throw new Error('platformPublicKeyDerB64 and platformTrustAnchor are mutually exclusive');
+  }
+  const sha256Hex = (der: Buffer): string => crypto.createHash('sha256').update(der).digest('hex');
+  if (anchor) {
+    const key = anchor.keys.find((k) => k.fingerprint === body.platformSigningKeyFingerprint);
+    if (!key) {
+      return {
+        reason: `trust_anchor_key_not_found: attestation is signed by platform key ${body.platformSigningKeyFingerprint}, which the supplied trust anchor does not list`,
+      };
+    }
+    const issuedMs = Date.parse(body.issuedAt);
+    if (
+      (key.notBefore !== null && issuedMs < Date.parse(key.notBefore)) ||
+      (key.notAfter !== null && issuedMs > Date.parse(key.notAfter))
+    ) {
+      return {
+        reason: `trust_anchor_key_not_valid_at_issuedAt: attestation issuedAt ${body.issuedAt} is outside the anchored key's [${key.notBefore}, ${key.notAfter}] window`,
+      };
+    }
+    const der = Buffer.from(key.spkiDerB64, 'base64');
+    return { der, fingerprint: sha256Hex(der) };
+  }
+  const b64 = override ? override : isPlatformPubkeyPinned() ? PLATFORM_PUBLIC_KEY_DER_B64 : '';
+  if (b64.length === 0) return { reason: PLATFORM_KEY_NOT_PINNED };
+  const der = b64.length <= 512 ? decodeBase64Strict(b64) : null;
+  if (der === null) {
+    return { reason: 'platform_key_malformed: expected canonical base64 SPKI DER' };
+  }
+  // Caller override and bundled pin take the same path so a substitution at
+  // either level fails the `platformSigningKeyFingerprint` check (step 6).
+  return { der, fingerprint: override ? sha256Hex(der) : PLATFORM_PUBLIC_KEY_FINGERPRINT };
+}
+
 function verifyPlatformAttestation(
   entry: ZipEntry | null,
   publicKeysRaw: Record<string, unknown>,
@@ -5051,41 +5119,6 @@ function verifyPlatformAttestation(
           reason: 'platform_attestation_missing',
         };
   }
-
-  // Step 1 — resolve the pinned pubkey (caller override > bundled pin).
-  const callerOverride = options.platformPublicKeyDerB64;
-  const pinnedB64 =
-    callerOverride && callerOverride.length > 0
-      ? callerOverride
-      : isPlatformPubkeyPinned()
-        ? PLATFORM_PUBLIC_KEY_DER_B64
-        : '';
-  if (pinnedB64.length === 0) {
-    return {
-      ok: false,
-      checked: 1,
-      failed: 1,
-      reason: 'platform_key_not_pinned',
-    };
-  }
-  const pinnedDer =
-    pinnedB64.length <= 512 ? decodeBase64Strict(pinnedB64) : null;
-  if (pinnedDer === null) {
-    return {
-      ok: false,
-      checked: 1,
-      failed: 1,
-      reason: 'platform_key_malformed: expected canonical base64 SPKI DER',
-    };
-  }
-  // Compute the expected fingerprint over the same bytes the
-  // verifier will use for signature dispatch. Caller override and
-  // bundled pin take the same path so a substitution at either
-  // level fails the `platformSigningKeyFingerprint` check below.
-  const expectedFingerprint =
-    callerOverride && callerOverride.length > 0
-      ? crypto.createHash('sha256').update(pinnedDer).digest('hex')
-      : PLATFORM_PUBLIC_KEY_FINGERPRINT;
 
   // Parse the envelope.
   let envelope: PlatformAttestationEnvelope;
@@ -5131,6 +5164,14 @@ function verifyPlatformAttestation(
       reason: 'malformed: attestation body has wrong shape',
     };
   }
+
+  // Step 1 (AV-0017: after parsing, so a trust anchor can select by the
+  // declared fingerprint) — resolve the platform pubkey.
+  const resolved = resolvePlatformKey(body, options);
+  if ('reason' in resolved) {
+    return { ok: false, checked: 1, failed: 1, reason: resolved.reason };
+  }
+  const { der: pinnedDer, fingerprint: expectedFingerprint } = resolved;
 
   // Step 4 — orgId must match the manifest.
   if (body.orgId !== manifestOrgId) {
