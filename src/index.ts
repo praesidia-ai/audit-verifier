@@ -42,4 +42,5 @@ export { verifyHttpReceipt, httpRequestCommitment, httpTargetKeyFingerprint } fr
 export type { SignedHttpReceipt, HttpReceiptStatement, HttpRequestEnvelope, HttpReceiptExpected } from './http-receipt.js';
 
 export { verifyAibomAttestation, aibomTrustFromBundle, AIBOM_ATTESTATION_FORMAT, AIBOM_SIGNING_DOMAIN } from './aibom.js';
+export type { Rfc3161RootReport } from './rfc3161.js';
 export type { AibomVerdict, AibomVerifyOptions, AibomVerifyReport } from './aibom.js';

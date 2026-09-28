@@ -100,6 +100,7 @@ import {
   type GzipOutputBudget,
 } from './zip.js';
 import { verifyRekorReceipt } from './rekor.js';
+import { verifyRfc3161Receipt, type Rfc3161RootReport, type Rfc3161Verdict } from './rfc3161.js';
 import {
   PLATFORM_PUBLIC_KEY_DER_B64,
   PLATFORM_PUBLIC_KEY_FINGERPRINT,
@@ -771,6 +772,8 @@ export interface VerifyReport {
   rootSignatures: ComponentResult;
   inclusionProofs: ComponentResult;
   rekor: ComponentResult;
+  /** AV-0019 — per-root RFC 3161 rows; a `failed` token also fails `rekor`. */
+  rfc3161: Rfc3161RootReport[];
   /**
    * AUDIT-2026-05-30 — Platform key-binding attestation.
    *
@@ -1127,6 +1130,8 @@ export interface VerifyOptions {
    * `anchorReceiptVerifier` is provided.
    */
   rekorPublicKeyPem?: string;
+  /** AV-0019 — auditor-supplied RFC 3161 TSA anchor PEMs (`--tsa-cert`); never "qualified". */
+  tsaTrustAnchorsPem?: readonly string[];
   /**
    * AUDIT-2026-05-09 — Optional hook for verifying provider-specific
    * anchor receipts in the multi-anchor `anchorReceipts` array. The
@@ -1815,6 +1820,7 @@ export async function verifyBundle(
     rootSignatures: rootSigResult,
     inclusionProofs: proofResult,
     rekor: rekorResult,
+    rfc3161: summarizeRfc3161(roots, options),
     platformAttestation: platformResult,
     completeness: completenessResult,
     keyBinding: keyBindingResult,
@@ -4999,6 +5005,7 @@ function anchorWindowUpperBound(
  *
  *   - `'rekor'` → cryptographic offline verification bound to this root.
  *   - `'s3'`    → fail closed unless the caller supplies a verifier.
+ *   - `'rfc3161'` → offline TimeStampToken check (AV-0019, `rfc3161.ts`).
  *   - other     → `{ ok: false, reason: 'unknown_provider' }`.
  */
 async function verifyAnchorReceipt(
@@ -5045,11 +5052,33 @@ async function verifyAnchorReceipt(
       anchoredAt: anchorWindowUpperBound(root, entry),
     });
   }
+  if (entry.provider === 'rfc3161') {
+    const v = verifyRfc3161(root, entry, options);
+    return v.status === 'verified' ? { ok: true } : { ok: false, reason: v.reason };
+  }
   if (entry.provider === 's3') {
     const shape = verifyS3ReceiptShape(entry.receipt);
     return shape.ok ? { ok: false, reason: 'unverifiable_offline' } : shape;
   }
   return { ok: false, reason: 'unknown_provider' };
+}
+
+/** AV-0019 — offline RFC 3161 check of one entry, bound to its root and time window. */
+function verifyRfc3161(root: BundleRoot, entry: AnchorReceiptEntry, options: VerifyOptions): Rfc3161Verdict {
+  return verifyRfc3161Receipt(
+    entry.receipt,
+    { rootHashB64: root.rootHash, signedAt: root.signedAt, anchoredAt: anchorWindowUpperBound(root, entry) },
+    options.tsaTrustAnchorsPem,
+  );
+}
+
+/** AV-0019 — the report's per-root RFC 3161 rows (offline, independent of any caller hook). */
+function summarizeRfc3161(roots: BundleRoot[], options: VerifyOptions): Rfc3161RootReport[] {
+  return roots.flatMap((root): Rfc3161RootReport[] => {
+    const entries = collectAnchorEntries(root).filter((e) => e.provider === 'rfc3161');
+    if (entries.length === 0) return [{ rootId: root.id, status: 'absent' as const }];
+    return entries.map((entry) => ({ rootId: root.id, ...verifyRfc3161(root, entry, options) }));
+  });
 }
 
 /**

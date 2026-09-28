@@ -771,6 +771,21 @@ its second argument and must GET the immutable object version, compare the
 stored root hash/signature and other available fields to that expected root,
 and validate retention. A HEAD-only existence/lock check is insufficient.
 
+RFC 3161 timestamp receipts (`provider: 'rfc3161'`, AV-0019) are verified
+offline: the DER `TimeStampToken` must parse strictly, its SHA-256
+`messageImprint` must equal the root's `rootHash`, the CMS signature (with an
+ESS signing-certificate binding and a critical `timeStamping`-only EKU on the
+TSA certificate) must verify, every certificate on the path must be valid at
+`genTime`, `genTime` must fall in the root's signedAt/anchoredAt window (24h
+skew, as for Rekor), and the chain must end in a trust anchor that is either
+pinned in this build for a contracted QTSP or supplied with
+`--tsa-cert <pem>` (library: `tsaTrustAnchorsPem`). Anchors are never fetched;
+no anchor, a parse error or any mismatch FAILS the anchor component. Only a
+pinned-QTSP chain is reported as "qualified timestamp"; otherwise "RFC 3161
+timestamp". `report.rfc3161` lists `verified` (with `genTime`, TSA subject) /
+`failed(reason)` / `absent` per root. Revocation (CRL/OCSP) and archive
+timestamps (ETSI EN 319 102-1) are not checked — the bundle carries no such data.
+
 `manifest.version` is checked against an explicit ceiling
 (`MAX_SUPPORTED_MANIFEST_VERSION`, currently 7) — a bundle declaring a newer
 version than this build implements is rejected as a bundle-format error

@@ -1726,6 +1726,36 @@ describe('verifyBundle', () => {
       expect(report.rekor.failed).toBe(0);
     });
 
+    it('AV-0019 — verifies an rfc3161 token on the root offline, fails closed without a TSA anchor', async () => {
+      const fx = path.resolve(process.cwd(), 'test-fixtures/rfc3161');
+      const token = fs.readFileSync(path.join(fx, 'token-bundle-root.b64'), 'utf8').trim();
+      const tsaRoot = fs.readFileSync(path.join(fx, 'root-ca.pem'), 'utf8');
+      const { verifyRfc3161Receipt } = await import('../rfc3161.js');
+      const probe = verifyRfc3161Receipt(token, { rootHashB64: buildFixtureBundle().roots[0]!.rootHash }, [tsaRoot]);
+      if (probe.status !== 'verified') throw new Error(`fixture token must verify: ${JSON.stringify(probe)}`);
+      const zip = rebuildWithReceipts([{ provider: 'rfc3161', receipt: token, anchoredAt: probe.genTime }]);
+
+      const good = await verifyBundle(zip, { tsaTrustAnchorsPem: [tsaRoot] });
+      expect(good.ok).toBe(true);
+      expect(good.rekor).toMatchObject({ ok: true, checked: 1, failed: 0 });
+      expect(good.rfc3161).toEqual([{ rootId: buildFixtureBundle().roots[0]!.id, ...probe }]);
+
+      const noAnchor = await verifyBundle(zip);
+      expect(noAnchor.ok).toBe(false);
+      expect(noAnchor.rekor.reason).toMatch(/^rfc3161: no_tsa_trust_anchor/);
+      expect(noAnchor.rfc3161[0]!.status).toBe('failed');
+
+      const wrong = await verifyBundle(zip, { tsaTrustAnchorsPem: [fs.readFileSync(path.join(fx, 'other-ca.pem'), 'utf8')] });
+      expect(wrong.ok).toBe(false);
+      expect(wrong.rekor.reason).toMatch(/^rfc3161: tsa_chain_untrusted/);
+
+      const s3Only = await verifyBundle(
+        rebuildWithReceipts([{ provider: 's3', receipt: 's3:b:k:v', anchoredAt: '2026-05-01T01:00:05.000Z' }]),
+        { anchorReceiptVerifier: async () => ({ ok: true }) },
+      );
+      expect(s3Only.rfc3161).toEqual([{ rootId: buildFixtureBundle().roots[0]!.id, status: 'absent' }]);
+    });
+
     it('synthesizes a rekor entry from the legacy anchorReceipt scalar when anchorReceipts is empty', async () => {
       // Empty multi-anchor array but legacy slot populated. The
       // verifier must still verify the legacy receipt (the migration

@@ -33,6 +33,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **Offline RFC 3161 timestamp verification on Merkle roots** (AV-0019). An
+  `anchorReceipts` entry with `provider: 'rfc3161'` (base64 DER TimeStampToken,
+  produced by be BE-1960) is now verified offline instead of failing as
+  `unknown_provider`: strict DER, SHA-256 imprint = `rootHash`, CMS signature,
+  ESS signer binding, critical timeStamping EKU, chain to a pinned QTSP or a
+  `--tsa-cert` anchor valid at `genTime`, and `genTime` inside the root's time
+  window. New `VerifyReport.rfc3161` per-root rows and `VerifyOptions.tsaTrustAnchorsPem`.
+  No QTSP is pinned yet, so a token verifies only with `--tsa-cert`; without one
+  it fails closed (`no_tsa_trust_anchor`).
 - **Tenant signature format 2 and manifest v7** (AV-0018, ADR-0004 / DECISION-SEC-03, be BE-1957).
   Each signature slot (manifest, row, Merkle root, supersession link, integrity checkpoint,
   protected-action event, retention seal) verifies `signatureFormat: 2` signatures over

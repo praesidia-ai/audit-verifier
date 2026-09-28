@@ -23,8 +23,8 @@ No version tag exists in this repository yet, so every row is a source-tree vers
 against the quoted code, and checks the current row against `package.json` and
 `src/verify.ts`. If a line number drifts, the test goes red.
 
-- **Bundle manifest 1–7.** The ceiling is `src/verify.ts:1279` `const MAX_SUPPORTED_MANIFEST_VERSION = 7;`.
-  The version gate at `src/verify.ts:5600` `manifest.version < 1 ||` and `src/verify.ts:5601` `manifest.version > MAX_SUPPORTED_MANIFEST_VERSION`
+- **Bundle manifest 1–7.** The ceiling is `src/verify.ts:1284` `const MAX_SUPPORTED_MANIFEST_VERSION = 7;`.
+  The version gate at `src/verify.ts:5629` `manifest.version < 1 ||` and `src/verify.ts:5630` `manifest.version > MAX_SUPPORTED_MANIFEST_VERSION`
   rejects version 0 and anything newer than 7. A newer version throws a
   bundle-format error ("upgrade the verifier"), so the bundle does not verify.
 - **Audit package.** The format has no version field. A zip counts as an audit package when it has
@@ -36,15 +36,15 @@ against the quoted code, and checks the current row against `package.json` and
   The disclosed Decision Record must have `src/decision-disclosures.ts:221` `d.details.schemaVersion === 1`.
 - **`praesidia.http-receipt.v1`.** The version string is `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION = 'praesidia.http-receipt.v1'`.
   Any other version is rejected: `src/http-receipt.ts:49` `s.version !== HTTP_RECEIPT_VERSION`.
-  These receipts are read from manifest v5 action events: `src/verify.ts:3645` `return verifyHttpReceipt(payload.receipt`.
+  These receipts are read from manifest v5 action events: `src/verify.ts:3651` `return verifyHttpReceipt(payload.receipt`.
 - **AIBOM attestation v1.** The format string is `src/aibom.ts:34` `export const AIBOM_ATTESTATION_FORMAT = 'praesidia-aibom-attestation/v1';`.
   Any other format gives `unsupported_format`: `src/aibom.ts:125` `env.attestationFormat !== AIBOM_ATTESTATION_FORMAT`.
 - **Superseding root (AV-0016).** Optional root fields `supersedesRootId` and
   `supersessionSignature`. The signed envelope is versioned by
-  `src/verify.ts:482` `export const ROOT_SUPERSESSION_VERSION = 'praesidia.root-supersession.v1';`.
+  `src/verify.ts:483` `export const ROOT_SUPERSESSION_VERSION = 'praesidia.root-supersession.v1';`.
   A link must name a root in the bundle with the same period and a lower row count
-  (`src/verify.ts:525` `: old.rowCount >= root.rowCount`), otherwise `rootCoverage` fails.
-  Roots without the fields take the old path unchanged (`src/verify.ts:518` `if (root.supersedesRootId === undefined) continue;`).
+  (`src/verify.ts:526` `: old.rowCount >= root.rowCount`), otherwise `rootCoverage` fails.
+  Roots without the fields take the old path unchanged (`src/verify.ts:519` `if (root.supersedesRootId === undefined) continue;`).
   Older verifiers have no code for the fields. They fail such a bundle closed, on the partial
   root's row count and on the second proof per row. They never pass it.
 - **Evidence privacy (manifest v6, AV-0013).** The mode table version is
@@ -53,8 +53,8 @@ against the quoted code, and checks the current row against `package.json` and
 - **Tenant signature format 2 (manifest v7, AV-0018, ADR-0004).** Format 2 signs
   `src/crypto.ts:402` `praesidia:${purpose}:v2\n` followed by the payload
   (the purpose is fixed by the slot being verified). Any `signatureFormat` other than 1 or 2 fails
-  (`src/verify.ts:1902` `if (f !== 1 && f !== 2) {`); a format-1 signature dated at or after the signed
-  v7 `signatureFormatCutoverAt` fails (`src/verify.ts:1905` `if (f === 1 && cutoverMs !== null) {`).
+  (`src/verify.ts:1908` `if (f !== 1 && f !== 2) {`); a format-1 signature dated at or after the signed
+  v7 `signatureFormatCutoverAt` fails (`src/verify.ts:1911` `if (f === 1 && cutoverMs !== null) {`).
   An absent `signatureFormat` is 1, so v1–v6 bundles verify unchanged. Verifiers before 0.11.0
   reject every v7 manifest, and none of them can verify a format-2 signature.
 - **Min Node.** From `package.json:33` `"node": ">=22.12.0"`.

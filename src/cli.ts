@@ -55,6 +55,8 @@ interface CliArgs {
   platformKeyFingerprint: string | null;
   /** AV-0017 — local copy of be's `/.well-known/praesidia-audit-keys.json`. */
   trustAnchorPath: string | null;
+  /** AV-0019 — local PEM files of RFC 3161 TSA trust anchors (repeatable). */
+  tsaCertPaths: string[];
   targetKeysPath: string | null;
   allowLegacyUnattested: boolean;
 }
@@ -124,6 +126,11 @@ OPTIONS
                must be signed by a key it lists, else FAIL (exit 1). The CLI
                never fetches it: download it yourself, over a channel
                independent of the bundle. Exclusive with --platform-key.
+  --tsa-cert <file>
+               AV-0019 — PEM trust anchor(s) for RFC 3161 timestamp tokens
+               on Merkle roots (repeatable; local file only, never fetched).
+               A token that does not chain to a pinned QTSP or a --tsa-cert
+               anchor FAILS. Only a pinned QTSP chain is called "qualified".
   --platform-key <file>
                Trust this PEM or SPKI-DER platform attestation public key.
                The result is only as strong as the provenance of that file;
@@ -197,6 +204,7 @@ function newCommonFlags(): CommonFlags {
     platformKeyPath: null,
     platformKeyFingerprint: null,
     trustAnchorPath: null,
+    tsaCertPaths: [],
     targetKeysPath: null,
     allowLegacyUnattested: false,
   };
@@ -237,6 +245,14 @@ function parseCommonArgs(
         );
       }
       flags.trustAnchorPath = value;
+      i += 1;
+    } else if (arg === '--tsa-cert') {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('-')) throw new Error('--tsa-cert requires a PEM file path');
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+        throw new Error('--tsa-cert takes a local file: the verifier never fetches over the network.');
+      }
+      flags.tsaCertPaths.push(value);
       i += 1;
     } else if (arg === '--platform-key') {
       const value = argv[i + 1];
@@ -474,6 +490,13 @@ function printDetail(report: VerifyReport & { package?: PackageIntegrity }, line
   lines.push(fmtComponent('root signatures   ', report.rootSignatures));
   lines.push(fmtComponent('inclusion proofs  ', report.inclusionProofs));
   lines.push(fmtComponent('rekor receipts    ', report.rekor));
+  // AV-0019 — RFC 3161 detail; a failed token already failed `rekor` above.
+  for (const t of report.rfc3161) {
+    if (t.status === 'verified') lines.push(`             rfc3161 root ${t.rootId}: verified ${t.label} genTime ${t.genTime} TSA ${t.tsaSubject.replace(/\n/g, ', ')}`);
+    else if (t.status === 'failed') lines.push(`             rfc3161 root ${t.rootId}: failed(${t.reason})`);
+  }
+  const absent = report.rfc3161.filter((t) => t.status === 'absent').length;
+  if (absent > 0 && absent < report.rfc3161.length) lines.push(`             rfc3161: absent on ${absent} root(s)`);
   lines.push(fmtComponent('platform attest.  ', report.platformAttestation));
   lines.push(fmtComponent('completeness      ', report.completeness));
   lines.push(fmtComponent('key binding       ', report.keyBinding));
@@ -665,6 +688,17 @@ async function bundleVerifyOptions(flags: CommonFlags): Promise<VerifyOptions> {
           platformTrustAnchor: await load('trust anchor', async () =>
             parsePlatformTrustAnchor(
               (await readRegularFileBounded(path.resolve(flags.trustAnchorPath!), MAX_TRUST_ANCHOR_BYTES, 'trust anchor')).toString('utf8'),
+            ),
+          ),
+        }
+      : {}),
+    ...(flags.tsaCertPaths.length > 0
+      ? {
+          tsaTrustAnchorsPem: await load('TSA certificate', () =>
+            Promise.all(
+              flags.tsaCertPaths.map(async (p) =>
+                (await readRegularFileBounded(path.resolve(p), MAX_TRUST_ANCHOR_BYTES, 'TSA certificate')).toString('utf8'),
+              ),
             ),
           ),
         }
@@ -1161,7 +1195,7 @@ async function mainAibom(argv: string[]): Promise<number> {
   }
   if (
     auditBundle === null &&
-    (flags.noRekor || flags.allowLegacyUnattested || flags.platformKeyPath || flags.platformKeyFingerprint || flags.trustAnchorPath || flags.targetKeysPath)
+    (flags.noRekor || flags.allowLegacyUnattested || flags.platformKeyPath || flags.platformKeyFingerprint || flags.trustAnchorPath || flags.tsaCertPaths.length > 0 || flags.targetKeysPath)
   ) {
     return usage('bundle options require --audit-bundle');
   }
