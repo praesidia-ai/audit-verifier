@@ -196,6 +196,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   can release. The build no longer emits `.js.map` / `.d.ts.map` files: they pointed at
   `../src/*.ts`, which is not in the tarball, and were a third of its unpacked size. The README install section is now the post-publish command. No
   verification check, export or CLI behaviour changed.
+- **Toolchain on latest** (AV-0030): TypeScript 7, Vitest 5, `@types/node` 22 (the
+  `engines` floor, so typecheck rejects APIs newer than Node 22), Docker base
+  `node:26.10.0-alpine3.24`, CI matrix Node 22/24/26. Emitted JavaScript is byte-identical
+  to the TypeScript 5.9 build; `.d.ts` files differ only in quote style.
+- **`gzipDeterministic` output is now identical on every OS** (AV-0030). zlib stamps the
+  build OS in gzip header byte 9 (macOS 19, Linux 3), so `samples/` regenerated on Linux
+  never matched the macOS-built files and the drift test failed there. The byte is now
+  pinned to 3 and the three sample packages were regenerated. The verifier reads that
+  byte nowhere; no verification check changed.
 
 ### Compatibility
 - AV-0010 changes no verification strictness. `VerifyReport.proofs` is a new required

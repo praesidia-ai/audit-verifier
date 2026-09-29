@@ -46,9 +46,9 @@
     "sbom": "npx --yes @cyclonedx/cyclonedx-npm@6.0.1 --omit dev --output-format JSON --output-file sbom.cdx.json"
   },
   "devDependencies": {
-    "@types/node": "20.19.43",
-    "typescript": "5.9.3",
-    "vitest": "^4.1.10"
+    "@types/node": "22.20.4",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.2"
   },
   "keywords": [
     "praesidia",
