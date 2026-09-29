@@ -219,6 +219,10 @@ describe('AUDIT-2026-05-15 ZIP64 read support', () => {
     );
   });
 
+  it('gzipDeterministic pins mtime 0 and OS byte 3 so samples reproduce on every platform', () => {
+    expect(gzipDeterministic(Buffer.from('x')).subarray(4, 10).toString('hex')).toBe('000000000203');
+  });
+
   it('enforces one aggregate budget across independently compressed gzip members', async () => {
     const budget = { remainingBytes: 80 * 1024 };
     const first = gzipDeterministic(Buffer.alloc(48 * 1024, 0x61));

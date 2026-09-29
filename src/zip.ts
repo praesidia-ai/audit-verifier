@@ -771,8 +771,11 @@ function buildZip64Extra(values: {
 
 /** Gzip a buffer (test fixture helper). Deterministic — no extra fields. */
 export function gzipDeterministic(data: Buffer): Buffer {
-  // Use mtime=0 so the gzip header is reproducible.
-  return zlib.gzipSync(data, { level: 9 });
+  // Node writes mtime=0; zlib stamps the build OS in header byte 9 (macOS 19,
+  // Unix 3), so pin it to Unix (as GNU gzip does) for cross-platform bytes.
+  const gz = zlib.gzipSync(data, { level: 9 });
+  gz[9] = 3;
+  return gz;
 }
 
 /**
