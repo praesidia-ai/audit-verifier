@@ -11,7 +11,7 @@ FROM node:26.10.0-alpine3.24@sha256:0b36e8c136b94cd4fcf02188228e76c31ad5872eef3f
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY tsconfig.json tsconfig.spec.json ./
+COPY tsconfig.json tsconfig.spec.json vitest.config.mjs ./
 COPY src ./src
 COPY test-fixtures ./test-fixtures
 COPY samples ./samples

@@ -205,6 +205,10 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   never matched the macOS-built files and the drift test failed there. The byte is now
   pinned to 3 and the three sample packages were regenerated. The verifier reads that
   byte nowhere; no verification check changed.
+- **The test suite now builds `dist/` first** (AV-0031). Six specs run `dist/cli.js` and
+  the samples drift test regenerates from `dist/*.js`, so after a source change without a
+  rebuild they silently tested old code. `vitest.config.mjs` runs `tsc` as a globalSetup,
+  and a compile error fails the run.
 
 ### Compatibility
 - AV-0010 changes no verification strictness. `VerifyReport.proofs` is a new required
