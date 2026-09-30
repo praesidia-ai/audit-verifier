@@ -770,6 +770,7 @@ export interface VerifyReport {
   rowSignatures: ComponentResult;
   chain: ComponentResult;
   rootSignatures: ComponentResult;
+  /** AV-0032 — `incomplete` when only unrooted-tail `not_yet_rooted` stubs lack a proof. */
   inclusionProofs: ComponentResult;
   rekor: ComponentResult;
   /** AV-0019 — per-root RFC 3161 rows; a `failed` token also fails `rekor`. */
@@ -1600,7 +1601,8 @@ export async function verifyBundle(
     resourceLimits.maxProofs,
   );
   assertProofsStructure(proofs);
-  const proofResult = withEvidenceStatus(verifyInclusionProofs(rows, roots, proofs, supersessions));
+  const proofRaw = verifyInclusionProofs(rows, roots, proofs, supersessions);
+  const proofResult = withEvidenceStatus(proofRaw.result, proofRaw.status);
 
   // 6b) FIX01 F5(b) — parse + verify integrity checkpoints (v4+ only; an
   // empty array for every earlier version).
@@ -4653,7 +4655,7 @@ function verifyInclusionProofs(
   roots: BundleRoot[],
   proofs: BundleProofEntry[],
   supersessions: Supersessions,
-): RawComponentResult {
+): { result: RawComponentResult; status?: ComponentStatus } {
   // AV-0016 — a row proves once into a current root and at most once more
   // into each superseded root it was committed to.
   const supersededHashes = new Set(
@@ -4671,6 +4673,18 @@ function verifyInclusionProofs(
   const seenRowIds = new Set<string>();
 
   const seenKeys = new Set<string>();
+
+  // AV-0032 — `not_yet_rooted` stubs (includeUnrooted=true exports) are
+  // accepted ONLY for the unrooted tail: rows signed at/after the end of the
+  // latest root in the bundle (the root set is bound by the signed manifest's
+  // `rootCount`). They make the component `incomplete`, never `valid`.
+  // Root periods are ISO-validated by `assertRootsStructure`.
+  let latestRoot: BundleRoot | undefined;
+  for (const r of roots) {
+    if (latestRoot === undefined || Date.parse(r.periodEnd) > Date.parse(latestRoot.periodEnd)) latestRoot = r;
+  }
+  let unrooted = 0;
+  let firstUnrooted: string | undefined;
 
   for (const entry of proofs) {
     checked += 1;
@@ -4690,6 +4704,22 @@ function verifyInclusionProofs(
 
     // Status markers are diagnostics, not proofs, and are not signed. Treating
     // them as success let an attacker replace every proof with a marker.
+    // AV-0032 — the one exception is a well-formed `not_yet_rooted` stub in
+    // the unrooted tail, counted as unproven (`incomplete`), never as a pass.
+    if (entry.status === NOT_YET_ROOTED) {
+      const stubFailure = unrootedStubFailure(entry, rowsById.get(entry.rowId), roots, latestRoot);
+      if (stubFailure === null) {
+        unrooted += 1;
+        firstUnrooted ??= entry.rowId;
+      } else {
+        failed += 1;
+        if (!firstFailure) {
+          firstFailure = entry.rowId;
+          reason = stubFailure;
+        }
+      }
+      continue;
+    }
     if (entry.status && entry.status !== 'ok') {
       failed += 1;
       if (!firstFailure) {
@@ -4795,13 +4825,60 @@ function verifyInclusionProofs(
     }
   }
 
+  if (failed === 0 && unrooted > 0) {
+    const after = latestRoot === undefined
+      ? 'this bundle carries no Merkle root'
+      : `signed after the latest published root in this bundle (${latestRoot.id}, periodEnd ${latestRoot.periodEnd})`;
+    return {
+      result: {
+        ok: true,
+        checked,
+        failed,
+        firstFailure: firstUnrooted!,
+        reason: `${NOT_YET_ROOTED}: ${unrooted} of ${rows.length} row(s) have no inclusion proof yet — ${after}; their signatures and chain are verified, their Merkle inclusion is not. Re-export once those hours are rooted to prove them.`,
+      },
+      status: 'incomplete',
+    };
+  }
   return {
-    ok: failed === 0,
-    checked,
-    failed,
-    ...(firstFailure !== undefined ? { firstFailure } : {}),
-    ...(reason !== undefined ? { reason } : {}),
+    result: {
+      ok: failed === 0,
+      checked,
+      failed,
+      ...(firstFailure !== undefined ? { firstFailure } : {}),
+      ...(reason !== undefined ? { reason } : {}),
+    },
   };
+}
+
+const NOT_YET_ROOTED = 'not_yet_rooted';
+
+/**
+ * AV-0032 — why a `not_yet_rooted` stub is NOT acceptable, or `null` when it
+ * is: exactly `{ rowId, status }` (the exporter's shape), for a row present
+ * in the bundle whose `signedAt` is at/after the latest root's `periodEnd`.
+ * A stub inside a root's period or in a gap before a later root is invalid.
+ */
+function unrootedStubFailure(
+  entry: BundleProofEntry,
+  row: BundleRow | undefined,
+  roots: BundleRoot[],
+  latestRoot: BundleRoot | undefined,
+): string | null {
+  if (Object.keys(entry).some((k) => k !== 'rowId' && k !== 'status')) {
+    return 'malformed not_yet_rooted stub: a stub carries only rowId and status';
+  }
+  if (!row) return 'proof references a row not present in rows.ndjson.gz';
+  const t = typeof row.signedAt === 'string' ? Date.parse(row.signedAt) : NaN;
+  if (Number.isNaN(t)) return 'not_yet_rooted stub for a row with no parseable signedAt';
+  const covering = roots.find((r) => Date.parse(r.periodStart) <= t && t < Date.parse(r.periodEnd));
+  if (covering) {
+    return `not_yet_rooted stub for a row inside the period of published root ${covering.id} (${covering.periodStart}..${covering.periodEnd}) — a rooted row must carry its inclusion proof`;
+  }
+  if (latestRoot !== undefined && !(t >= Date.parse(latestRoot.periodEnd))) {
+    return `not_yet_rooted stub for a row before the end of the latest published root (${latestRoot.id}, periodEnd ${latestRoot.periodEnd}) — only rows after every root in the bundle may be unrooted`;
+  }
+  return null;
 }
 
 /**

@@ -181,6 +181,22 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `ProofStatus`. No check, verdict, exit code, `RESULT:` line or `--quiet` output
   changed.
 
+### Changed
+- **`includeUnrooted=true` bundles verify as `incomplete` (exit 3), not `invalid`**
+  (AV-0032, DECISION-AV-UNROOTED). The be exporter writes a `{ rowId, status:
+  'not_yet_rooted' }` stub for each row in an hour it has not rooted yet, and the
+  verifier failed every stub, so an honest export read as tampering. A stub is now
+  accepted only for the **unrooted tail**, meaning rows signed at or after the latest bundled
+  root's `periodEnd` (the root set is bound by the signed manifest's `rootCount`). It
+  makes `inclusionProofs` `incomplete` with `failed: 0`, `firstFailure` = the first
+  unrooted row, and reason `not_yet_rooted: N of M row(s) have no inclusion proof yet
+  — …`. The top-level verdict is `incomplete` unless another component fails.
+  `verify-set` reports `bundle_incomplete` (exit 3). These cases stay `invalid`: a
+  stub on a row inside a published root's period, a stub in a rooting gap before a
+  later root, a stub with fields beyond `rowId`/`status`, a stub for an absent row,
+  a duplicate, any other status, and any row-signature or chain failure in the tail.
+  No new status, exit code or export.
+
 ### Fixed
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command
   every `be` audit package's `verification.txt` and the ui proof page tell the auditor
@@ -211,6 +227,14 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   and a compile error fails the run.
 
 ### Compatibility
+- AV-0032 is a **scoped strictness relaxation from `invalid` to `incomplete`**, never to
+  `valid`. It applies only to well-formed `not_yet_rooted` stubs in the unrooted tail.
+  Such a bundle moves from exit 1 to exit 3. Every bundle without stubs gets
+  byte-identical results. Every other stub keeps failing, with a more specific reason
+  for `not_yet_rooted` stubs outside the tail. Consumers that treat any non-zero exit
+  as "not verified" are unaffected. Consumers that treat exit 1 as "the bundle was
+  exported with includeUnrooted" must switch to exit 3 / `inclusionProofs.status ===
+  'incomplete'`.
 - AV-0010 changes no verification strictness. `VerifyReport.proofs` is a new required
   field: code that *builds* a `VerifyReport` must add it; readers are unaffected. The
   default human report gains six leading lines, so a parser keyed on line numbers (not

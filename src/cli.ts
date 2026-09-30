@@ -167,7 +167,9 @@ EXIT CODES
       verified.
   1   status: invalid — a real verification failure.
   2   I/O or bundle-format error.
-  3   status: incomplete — evidence present is insufficient to decide.
+  3   status: incomplete — evidence present is insufficient to decide
+      (e.g. an includeUnrooted=true export: rows after the latest Merkle
+      root carry not_yet_rooted stubs, so their inclusion is unproven).
   5   status: unanchored — no platform trust anchor (no build-time pin, no
       --trust-anchor, no --platform-key): the signing keys are the bundle's
       own claim, so origin is unproven. A real failure (exit 1) wins.

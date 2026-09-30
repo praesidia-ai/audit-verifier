@@ -139,7 +139,9 @@ Exit codes:
   2   I/O or bundle-format error (malformed zip, missing file, etc.).
   3   status: incomplete — evidence present is insufficient to decide
       (distinct from a failure). Also returned for a bundle that carries no
-      evidence at all (every evidence component NOT_PRESENT). The `targetAck`/`callerResult` components
+      evidence at all (every evidence component NOT_PRESENT), and for a
+      bundle exported with includeUnrooted=true whose unrooted tail carries
+      `not_yet_rooted` proof stubs (AV-0032, see "Inclusion proofs"). The `targetAck`/`callerResult` components
       produce this when a piece of evidence was legitimately redacted
       (`payload: null` with a `payloadCommitment` present) rather than
       illegitimately stripped — see "Verdict shape" below.
@@ -510,7 +512,21 @@ checks every cryptographic invariant the bundle commits to:
    committed it, see 10). Every proof is walked against the corresponding root via
    RFC 6962-style verification (leaf prefix `0x00`, internal prefix `0x01`),
    with index and path depth checked against the signed root row count.
-   Diagnostic status markers are failures, not substitutes for proofs.
+   Diagnostic status markers are failures, not substitutes for proofs, with
+   one exception (AV-0032): a bundle exported with `includeUnrooted=true`
+   carries a `{ "rowId", "status": "not_yet_rooted" }` stub for each row in
+   an hour the server had not rooted yet. A stub is accepted only for the
+   **unrooted tail**, meaning rows signed at or after the `periodEnd` of the latest root in
+   the bundle (every row when the bundle has no root). It leaves
+   `inclusionProofs` **`incomplete`** (exit 3), never `valid`. The reason
+   counts the rows (`not_yet_rooted: N of M row(s) have no inclusion proof
+   yet …`) and `firstFailure` names the first one. Those rows are still fully
+   checked for signatures and chain links, and only their Merkle inclusion is
+   unproven. Re-export once the hour is rooted to prove them. Any other stub is
+   `invalid`: one on a row inside a published root's period, one in a
+   rooting gap before a later root, a stub carrying fields beyond
+   `rowId`/`status`, a stub for a row not in `rows.ndjson.gz`, a duplicate,
+   and every other status (`error`, `key_unavailable`, `unsigned`).
 6. **Rekor receipt** — when `--no-rekor` is NOT passed, each root's
    Sigstore Rekor receipt is verified **cryptographically and offline**:
    its Signed Entry Timestamp (SET) is checked against the **pinned**
