@@ -201,6 +201,39 @@ function nodeHash(left: Buffer, right: Buffer): Buffer {
 // Ed25519
 // ════════════════════════════════════════════════════════════════════════
 
+const ED25519_P = (1n << 255n) - 19n;
+
+/**
+ * AV-2701 — y coordinates of the 8 small-order Ed25519 points: 0 (order 4),
+ * 1 (identity), p-1 (order 2) and the two order-8 values. With either sign
+ * bit they cover all 8 points (plus the "-0" encodings of y=1 and y=p-1).
+ * Mirrors libsodium's ed25519_ref10.c blocklist.
+ */
+export const ED25519_SMALL_ORDER_Y: ReadonlySet<bigint> = new Set([
+  0n,
+  1n,
+  ED25519_P - 1n,
+  2707385501144840649318225287225658788936804267575313519463743609750303402022n,
+  55188659117513257062467267217118295137698188065244968500265048394206261417927n,
+]);
+
+/**
+ * AV-2701 — `true` iff a 32-byte Ed25519 point encoding (public key or a
+ * signature's R) must be rejected before it reaches OpenSSL: y (sign bit
+ * masked, little-endian) is non-canonical (`y >= p`, RFC 8032 §5.1.3) or is
+ * a small-order point's y. Some OpenSSL builds (node v24.14 / OpenSSL 3.5.5)
+ * accept an all-zero key with an all-zero signature for ~1 in 4 messages, so
+ * the verifier cannot leave this to the runtime. Any other length → `true`.
+ */
+export function isRejectedEd25519Point(b: Uint8Array): boolean {
+  if (b.length !== 32) return true;
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) {
+    y = (y << 8n) | BigInt(i === 31 ? b[i]! & 0x7f : b[i]!);
+  }
+  return y >= ED25519_P || ED25519_SMALL_ORDER_Y.has(y);
+}
+
 /**
  * Verify an Ed25519 signature. Returns `false` (never throws) on any
  * malformed input or mismatched signature.
@@ -225,6 +258,14 @@ export function verifyEd25519(
     // Ed25519 signatures are always 64 bytes; reject malformed inputs
     // before handing them to the OpenSSL bindings.
     if (sig === null) {
+      return false;
+    }
+    // AV-2701 — small-order / non-canonical key or R fails closed here,
+    // whatever the runtime's OpenSSL would decide.
+    if (
+      isRejectedEd25519Point(publicKey) ||
+      isRejectedEd25519Point(sig.subarray(0, 32))
+    ) {
       return false;
     }
     const der = Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(publicKey)]);

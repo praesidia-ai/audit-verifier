@@ -51,7 +51,7 @@ against the quoted code, and checks the current row against `package.json` and
   `src/evidence-privacy.ts:17` `export const EVIDENCE_PRIVACY_SCHEMA_VERSION = 1;`. Any other
   `evidencePrivacy.schemaVersion` is a bundle-format error. Verifiers before 0.11.0 reject every v6 manifest.
 - **Tenant signature format 2 (manifest v7, AV-0018, ADR-0004).** Format 2 signs
-  `src/crypto.ts:402` `praesidia:${purpose}:v2\n` followed by the payload
+  `src/crypto.ts:443` `praesidia:${purpose}:v2\n` followed by the payload
   (the purpose is fixed by the slot being verified). Any `signatureFormat` other than 1 or 2 fails
   (`src/verify.ts:1910` `if (f !== 1 && f !== 2) {`); a format-1 signature dated at or after the signed
   v7 `signatureFormatCutoverAt` fails (`src/verify.ts:1913` `if (f === 1 && cutoverMs !== null) {`).

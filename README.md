@@ -458,7 +458,11 @@ on v7, fails `manifest`. v1–v6 bundles carry no cutover and verify exactly as 
 ## What it verifies
 
 For a bundle produced by `BundleExporterService` (AGV-035) the verifier
-checks every cryptographic invariant the bundle commits to:
+checks every cryptographic invariant the bundle commits to. Every Ed25519
+signature in the list below (and in AIBOM attestations) fails closed, before
+the runtime's OpenSSL is consulted, when its public key or its `R` half is a
+small-order point or a non-canonical encoding (`y >= p`) — some OpenSSL
+builds accept an all-zero key with an all-zero signature (AV-2701):
 
 1. **Manifest signature** — Ed25519 (or ECDSA-P256) signature over the
    canonical-JSON of the manifest fields, signed with the tenant's

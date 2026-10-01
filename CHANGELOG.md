@@ -11,6 +11,17 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 ## [0.11.0] — Unreleased
 
 ### Security
+- **Small-order and non-canonical Ed25519 keys and signatures are rejected
+  by the verifier itself** (AV-2701). On node v24.14.0 / OpenSSL 3.5.5 an
+  all-zero Ed25519 public key with an all-zero signature verifies for roughly
+  1 in 4 messages, so a bundle "signed" by the identity point could verify
+  green. Before calling `crypto.verify`, the public key and the signature's
+  `R` are now rejected when `y` (sign bit masked) is `>= p` (RFC 8032 §5.1.3)
+  or is the `y` of one of the 8 small-order points (libsodium's
+  `ed25519_ref10.c` blocklist). The outcome is the existing bad-signature
+  result; no new reason string. Keys and signatures produced by an honest
+  signer are never small-order or non-canonical, so no existing bundle changes
+  verdict.
 - **Rekor `integratedTime` is now bound to the root's own time window**
   (SEC-2026-09-12 MCPSDK-01). The log's signed integration time was previously
   used only to rebuild the SET payload and was never compared to anything, so a
