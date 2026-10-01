@@ -34,8 +34,8 @@ against the quoted code, and checks the current row against `package.json` and
 - **Decision disclosure v1.** The version string is `src/decision-disclosures.ts:14` `export const DECISION_DISCLOSURE_VERSION = 'praesidia.decision-disclosure.v1';`.
   Any other line version fails: `src/decision-disclosures.ts:170` `line.version !== DECISION_DISCLOSURE_VERSION`.
   The disclosed Decision Record must have `src/decision-disclosures.ts:221` `d.details.schemaVersion === 1`.
-- **`praesidia.http-receipt.v1`.** The version string is `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION = 'praesidia.http-receipt.v1'`.
-  Any other version is rejected: `src/http-receipt.ts:49` `s.version !== HTTP_RECEIPT_VERSION`.
+- **`praesidia.http-receipt.v1`.** The version string is `src/http-receipt.ts:5` `export const HTTP_RECEIPT_VERSION = 'praesidia.http-receipt.v1'`.
+  Any other version is rejected: `src/http-receipt.ts:50` `s.version !== HTTP_RECEIPT_VERSION`.
   These receipts are read from manifest v5 action events: `src/verify.ts:3693` `return verifyHttpReceipt(payload.receipt`.
 - **AIBOM attestation v1.** The format string is `src/aibom.ts:35` `export const AIBOM_ATTESTATION_FORMAT = 'praesidia-aibom-attestation/v1';`.
   Any other format gives `unsupported_format`: `src/aibom.ts:126` `env.attestationFormat !== AIBOM_ATTESTATION_FORMAT`.
@@ -51,7 +51,7 @@ against the quoted code, and checks the current row against `package.json` and
   `src/evidence-privacy.ts:17` `export const EVIDENCE_PRIVACY_SCHEMA_VERSION = 1;`. Any other
   `evidencePrivacy.schemaVersion` is a bundle-format error. Verifiers before 0.11.0 reject every v6 manifest.
 - **Tenant signature format 2 (manifest v7, AV-0018, ADR-0004).** Format 2 signs
-  `src/crypto.ts:445` `praesidia:${purpose}:v2\n` followed by the payload
+  `src/crypto.ts:466` `praesidia:${purpose}:v2\n` followed by the payload
   (the purpose is fixed by the slot being verified). Any `signatureFormat` other than 1 or 2 fails
   (`src/verify.ts:1976` `if (f !== 1 && f !== 2) {`); a format-1 signature dated at or after the signed
   v7 `signatureFormatCutoverAt` fails (`src/verify.ts:1979` `if (f === 1 && cutoverMs !== null) {`).

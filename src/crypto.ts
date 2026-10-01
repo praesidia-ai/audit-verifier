@@ -235,6 +235,27 @@ export function isRejectedEd25519Point(b: Uint8Array): boolean {
 }
 
 /**
+ * AV-2702 — {@link isRejectedEd25519Point} for verify paths that hold a
+ * `KeyObject` (HTTP receipt target key, RFC 3161 TSA certificate key):
+ * `true` iff the key is not a plain Ed25519 SPKI key, the signature is not 64
+ * bytes, or the key or the signature's R is rejected. Never throws.
+ */
+export function isRejectedEd25519KeyOrR(key: crypto.KeyObject, signature: Uint8Array): boolean {
+  try {
+    if (key.asymmetricKeyType !== 'ed25519' || signature.length !== 64) return true;
+    const spki = key.export({ format: 'der', type: 'spki' });
+    return (
+      spki.length !== ED25519_SPKI_PREFIX.length + 32 ||
+      !spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX) ||
+      isRejectedEd25519Point(spki.subarray(ED25519_SPKI_PREFIX.length)) ||
+      isRejectedEd25519Point(signature.subarray(0, 32))
+    );
+  } catch {
+    return true;
+  }
+}
+
+/**
  * Verify an Ed25519 signature. Returns `false` (never throws) on any
  * malformed input or mismatched signature.
  *

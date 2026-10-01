@@ -1,4 +1,5 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
+import { isRejectedEd25519KeyOrR } from './crypto.js';
 import { jcsCanonicalize, jcsCommitment, type JsonValue } from './jcs-canonical.js';
 
 export const HTTP_RECEIPT_VERSION = 'praesidia.http-receipt.v1' as const;
@@ -53,6 +54,8 @@ export function verifyHttpReceipt(receipt: unknown, publicKeyPem: string, expect
     if (!/^[a-f0-9]{64}$/.test(String(s.requestCommitment)) || !/^[a-f0-9]{64}$/.test(String(s.resultCommitment))) return false;
     const key = createPublicKey(publicKeyPem);
     if (key.asymmetricKeyType !== 'ed25519') return false;
-    return verify(null, jcsCanonicalize(s as JsonValue), key, Buffer.from(r.signature, 'base64'));
+    const signature = Buffer.from(r.signature, 'base64');
+    if (isRejectedEd25519KeyOrR(key, signature)) return false; // AV-2702: small-order / non-canonical key or R
+    return verify(null, jcsCanonicalize(s as JsonValue), key, signature);
   } catch { return false; }
 }

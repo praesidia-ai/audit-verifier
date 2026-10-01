@@ -66,6 +66,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   result; no new reason string. Keys and signatures produced by an honest
   signer are never small-order or non-canonical, so no existing bundle changes
   verdict.
+- **The same guard now covers the HTTP target receipt and RFC 3161 Ed25519
+  paths** (AV-2702). `verifyHttpReceipt` and the CMS signature check of an
+  Ed25519 RFC 3161 TSA token called `crypto.verify` directly, so a real key
+  with `R` = identity, or the identity key with a real `R`, verified on
+  OpenSSL 3.5.5. Both now apply the AV-2701 key and `R` checks first; the
+  outcome is each path's existing failure (`false` /
+  `cms_signature_invalid`), no new reason string, no key material in it.
 - **Rekor `integratedTime` is now bound to the root's own time window**
   (SEC-2026-09-12 MCPSDK-01). The log's signed integration time was previously
   used only to rebuild the SET payload and was never compared to anything, so a

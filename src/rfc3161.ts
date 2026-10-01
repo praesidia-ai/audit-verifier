@@ -31,7 +31,7 @@
  */
 
 import * as crypto from 'node:crypto';
-import { decodeBase64Strict } from './crypto.js';
+import { decodeBase64Strict, isRejectedEd25519KeyOrR } from './crypto.js';
 import { REKOR_INTEGRATED_TIME_SKEW_MS } from './rekor.js';
 
 /**
@@ -351,6 +351,10 @@ export function verifyRfc3161Receipt(
     if (key.asymmetricKeyType !== sigAlg.keyType) return fail('signature_key_type_mismatch', { genTime, tsaSubject });
     const signedBytes = Buffer.from(signedAttrs.raw);
     signedBytes[0] = 0x31; // RFC 5652 §5.4: signed over the EXPLICIT SET OF encoding
+    // AV-2702: a small-order / non-canonical Ed25519 key or R fails like a bad signature.
+    if (sigAlg.keyType === 'ed25519' && isRejectedEd25519KeyOrR(key, signature)) {
+      return fail('cms_signature_invalid', { genTime, tsaSubject });
+    }
     const sigOk = crypto.verify(sigAlg.keyType === 'ed25519' ? null : digest, signedBytes, key, signature);
     if (!sigOk) return fail('cms_signature_invalid', { genTime, tsaSubject });
 
