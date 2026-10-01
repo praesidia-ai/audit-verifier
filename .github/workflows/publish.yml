@@ -80,6 +80,16 @@ jobs:
           cp samples/* release/
           cd release && sha256sum -- * > SHA256SUMS
 
+      # AV-2750 (audit F02) — the packed CLI, with no key flag, must verify the
+      # genuine production fixture (synthetic org, never customer data) with its
+      # embedded pin alone and reject a byte-flipped copy. Not in prepack: only
+      # this job has the fixture. An unset fixture blocks the release.
+      - name: Verify the packed CLI against the production fixture (embedded pin only)
+        env:
+          PRAESIDIA_RELEASE_FIXTURE: ${{ vars.PRODUCTION_RELEASE_FIXTURE_PATH }}
+          PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: ${{ vars.PRODUCTION_RELEASE_FIXTURE_NO_REKOR }}
+        run: npm run check:release-fixture
+
       - name: Upload release assets as workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

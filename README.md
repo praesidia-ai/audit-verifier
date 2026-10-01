@@ -1001,6 +1001,10 @@ catch.
   other than P-256. This prevents a key and its self-asserted fingerprint from being changed
   together and silently treated as approved. Setup and ceremony details are in
   `docs/trust-anchor-verification.md`, which is included in the published package.
+- **The packed CLI must verify a genuine production fixture before publish** (AV-2750).
+  `check:release-fixture` runs the `npm pack` tarball's CLI with no key flag: the fixture must
+  exit 0 and a byte-flipped copy must not. At verify time the embedded pin's fingerprint is
+  recomputed from its DER; a mismatch fails closed (`platform_key_pin_mismatch`, exit 1).
 - **`npm publish --provenance`** (MIL-0002 F4) means `npm view @praesidia/audit-verifier
   provenance` shows a SLSA attestation binding the published tarball to the exact GitHub
   Actions run, commit, and source repository that built it — a second, cryptographic check

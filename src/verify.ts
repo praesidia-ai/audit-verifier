@@ -5292,8 +5292,10 @@ interface PlatformAttestationEnvelope {
  * AUDIT-2026-05-30 / AV-0017 — the platform key the attestation must verify
  * under: caller key > caller trust anchor > build-time pin. None of them →
  * `platform_key_not_pinned` (top-level `unanchored`). The returned fingerprint
- * is what step 6 compares the declared one against — recomputed for caller
- * material so a hand-built anchor cannot assert a fingerprint.
+ * is what step 6 compares the declared one against — always recomputed from
+ * the DER, so neither a hand-built anchor nor the build-time pin can assert a
+ * fingerprint. AV-2750: a build-time pin whose DER does not hash to its pinned
+ * fingerprint is a substituted or half-updated pin and fails closed.
  */
 function resolvePlatformKey(
   body: PlatformAttestationBody,
@@ -5332,7 +5334,13 @@ function resolvePlatformKey(
   }
   // Caller override and bundled pin take the same path so a substitution at
   // either level fails the `platformSigningKeyFingerprint` check (step 6).
-  return { der, fingerprint: override ? sha256Hex(der) : PLATFORM_PUBLIC_KEY_FINGERPRINT };
+  const fingerprint = sha256Hex(der);
+  if (!override && fingerprint !== PLATFORM_PUBLIC_KEY_FINGERPRINT) {
+    return {
+      reason: `platform_key_pin_mismatch: embedded platform key DER hashes to ${fingerprint}, not the pinned fingerprint ${PLATFORM_PUBLIC_KEY_FINGERPRINT}`,
+    };
+  }
+  return { der, fingerprint };
 }
 
 function verifyPlatformAttestation(
@@ -5461,10 +5469,7 @@ function verifyPlatformAttestation(
   }
 
   // Step 6 — declared fingerprint must match the pinned pubkey.
-  if (
-    expectedFingerprint.length > 0 &&
-    body.platformSigningKeyFingerprint !== expectedFingerprint
-  ) {
+  if (body.platformSigningKeyFingerprint !== expectedFingerprint) {
     return {
       ok: false,
       checked: 1,

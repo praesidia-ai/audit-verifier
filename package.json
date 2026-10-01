@@ -37,6 +37,7 @@
     "build": "tsc",
     "prepack": "npm run build && npm run typecheck:spec && npm run check:release-trust-anchor",
     "check:release-trust-anchor": "node scripts/assert-release-trust-anchor.mjs",
+    "check:release-fixture": "node scripts/assert-release-fixture.mjs",
     "check:trust-anchor-ci": "node scripts/check-trust-anchor-ci.mjs",
     "test:trust-anchor-policy": "node --test scripts/trust-anchor-policy.selftest.mjs",
     "typecheck": "tsc --noEmit",

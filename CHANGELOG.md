@@ -11,6 +11,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 ## [0.11.0] — Unreleased
 
 ### Security
+- **The embedded platform-key pin is checked, not trusted** (AV-2750, audit F02).
+  With no key flag, the attestation's declared fingerprint was compared against the
+  pinned `PLATFORM_PUBLIC_KEY_FINGERPRINT` constant, never recomputed from the pinned
+  DER. A build whose DER bytes were swapped with the constant left intact therefore
+  accepted a bundle forged under the swapped-in key. The fingerprint is now always
+  `sha256(DER)`, and a pin whose DER does not hash to its constant fails closed:
+  `invalid` (exit 1), reason `platform_key_pin_mismatch: ...`.
 - **Small-order and non-canonical Ed25519 keys and signatures are rejected
   by the verifier itself** (AV-2701). On node v24.14.0 / OpenSSL 3.5.5 an
   all-zero Ed25519 public key with an all-zero signature verifies for roughly
@@ -236,8 +243,16 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   the samples drift test regenerates from `dist/*.js`, so after a source change without a
   rebuild they silently tested old code. `vitest.config.mjs` runs `tsc` as a globalSetup,
   and a compile error fails the run.
+- **`check:release-fixture`** (AV-2750, audit F02): `scripts/assert-release-fixture.mjs`
+  unpacks the `npm pack` tarball and runs its CLI with no key flag. The genuine production
+  fixture (`PRAESIDIA_RELEASE_FIXTURE`) must exit 0 and a byte-flipped copy must exit
+  non-zero. `publish.yml` runs it after `npm pack`; an unset fixture blocks the release.
+  Not in `prepack`. Self-tested on a sample-pinned `npm pack` build.
 
 ### Compatibility
+- AV-2750 tightens verification only for a build whose embedded DER and fingerprint
+  disagree, which `check:trust-anchor-ci` and `prepack` already refuse to build. No bundle
+  changes verdict under a consistent pin, `--platform-key` or `--trust-anchor`.
 - AV-0032 is a **scoped strictness relaxation from `invalid` to `incomplete`**, never to
   `valid`. It applies only to well-formed `not_yet_rooted` stubs in the unrooted tail.
   Such a bundle moves from exit 1 to exit 3. Every bundle without stubs gets

@@ -20,6 +20,13 @@ of *this package* is exactly the attack a customer's second channel should catch
   passes it as `PRAESIDIA_RELEASE_APPROVED_PLATFORM_KEY_FINGERPRINT`. Configure the Environment
   with required reviewers. An absent, malformed, uppercase, stale, or mismatched value blocks both
   `npm pack` and `npm publish`; there is no source-code fallback.
+- After `npm pack`, `publish.yml` runs `npm run check:release-fixture`
+  (`scripts/assert-release-fixture.mjs`). It runs the packed CLI with no key flag: the genuine
+  production fixture named by `PRODUCTION_RELEASE_FIXTURE_PATH` must exit 0 and a byte-flipped
+  copy must exit non-zero, or the release stops before upload and publish. Set
+  `PRODUCTION_RELEASE_FIXTURE_NO_REKOR=1` only if the fixture carries no Rekor anchor.
+- At verify time the CLI recomputes the fingerprint from the embedded DER and fails closed
+  (`platform_key_pin_mismatch`) if it differs from `PLATFORM_PUBLIC_KEY_FINGERPRINT`.
 - `scripts/trust-anchor-policy.selftest.mjs` exercises the placeholder, partial-edit, malformed,
   wrong-curve, wrong-fingerprint, missing-approval, mismatch, and valid P-256 cases in ordinary CI.
 - Confirm what shipped in a specific release with a registry query independent of `npm install`:
