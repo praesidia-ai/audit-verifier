@@ -55,7 +55,9 @@ export const PLATFORM_PUBLIC_KEY_DER_B64: string = '';
 export const PLATFORM_PUBLIC_KEY_FINGERPRINT: string = '';
 
 /**
- * True iff an internally consistent platform trust anchor is embedded.
+ * True iff both pin constants are non-empty (a half pin counts as unpinned).
+ * Consistency is not checked here: `resolvePlatformKey` in verify.ts recomputes
+ * the fingerprint from the DER and fails closed on a mismatch (AV-2750).
  */
 export function isPlatformPubkeyPinned(): boolean {
   return (

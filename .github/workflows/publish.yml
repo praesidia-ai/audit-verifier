@@ -80,13 +80,17 @@ jobs:
           cp samples/* release/
           cd release && sha256sum -- * > SHA256SUMS
 
-      # AV-2750 (audit F02) — the packed CLI, with no key flag, must verify the
-      # genuine production fixture (synthetic org, never customer data) with its
-      # embedded pin alone and reject a byte-flipped copy. Not in prepack: only
-      # this job has the fixture. An unset fixture blocks the release.
+      # AV-2750 / AV-2752 (audit F02) — the packed CLI in release/, with no key
+      # flag, must verify the genuine production fixture with its embedded pin
+      # alone (exit 0) and reject that bundle re-signed under a foreign platform
+      # key (exit 1, `signature: `). The fixture is the committed file
+      # release-fixture/production-audit-package.zip in this repository (on the
+      # runner via checkout; not in the npm tarball): an audit package exported
+      # from a synthetic org, never customer data, committed by the operator after
+      # the key ceremony (AV-2751). Until it is committed this step blocks the
+      # release. Not in prepack.
       - name: Verify the packed CLI against the production fixture (embedded pin only)
         env:
-          PRAESIDIA_RELEASE_FIXTURE: ${{ vars.PRODUCTION_RELEASE_FIXTURE_PATH }}
           PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: ${{ vars.PRODUCTION_RELEASE_FIXTURE_NO_REKOR }}
         run: npm run check:release-fixture
 

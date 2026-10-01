@@ -31,6 +31,7 @@ function pack(dir: string, dest: string): string {
 let pinned: string;
 let unpinned: string;
 let acceptsAnything: string;
+let noSignatureCheck: string;
 
 beforeAll(() => {
   unpinned = pack(root, path.join(tmp, 'unpinned')); // dist/ is built by vitest globalSetup
@@ -49,6 +50,9 @@ beforeAll(() => {
   expect(pinnedJs.match(/PLATFORM_PUBLIC_KEY_(DER_B64|FINGERPRINT) = '[A-Za-z0-9+/=]+'/g)).toHaveLength(2);
   fs.writeFileSync(pubkeyJs, pinnedJs);
   pinned = pack(build, path.join(tmp, 'pinned'));
+  // The same pinned build with its ECDSA check (the platform attestation signature) a no-op.
+  fs.appendFileSync(path.join(build, 'dist/crypto.js'), '\nverifyEcdsaP256 = () => true;\n');
+  noSignatureCheck = pack(build, path.join(tmp, 'no-signature-check'));
 
   const fake = path.join(tmp, 'fake/package');
   fs.mkdirSync(path.join(fake, 'dist'), { recursive: true });
@@ -59,7 +63,7 @@ beforeAll(() => {
 }, 120_000);
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-function check(env: Record<string, string>) {
+function runGate(env: Record<string, string>) {
   const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('PRAESIDIA_RELEASE_')));
   return spawnSync(process.execPath, [path.join(root, 'scripts/assert-release-fixture.mjs')], {
     cwd: root, encoding: 'utf8', env: { ...clean, ...env },
@@ -67,11 +71,11 @@ function check(env: Record<string, string>) {
 }
 
 describe('AV-2750 check:release-fixture (packed CLI, embedded pin only)', () => {
-  it('passes a sample-pinned build: genuine fixture exits 0, byte-flipped copy exits non-zero', () => {
-    const r = check({ PRAESIDIA_RELEASE_TARBALL: pinned, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
+  it('passes a sample-pinned build: genuine fixture exits 0, foreign-signed attestation exits 1', () => {
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: pinned, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
     expect(r.stderr).toBe('');
     expect(r.stdout).toContain('RESULT: OK');
-    expect(r.stdout).toMatch(/release fixture check OK: .* rejects a byte-flipped copy \(exit [1-9]\d*\)\./);
+    expect(r.stdout).toMatch(/release fixture check OK: .* rejects it re-signed under a foreign platform key \(exit 1, signature: /);
     expect(r.status).toBe(0);
   });
 
@@ -89,26 +93,47 @@ describe('AV-2750 check:release-fixture (packed CLI, embedded pin only)', () => 
     expect(wrongKey.status).toBe(1);
   });
 
+  it('blocks a packed build whose platform signature check accepts anything', () => {
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: noSignatureCheck, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/^audit-verifier release blocked: the packed CLI did not reject /);
+  });
+
+  it('the packed tarball ships every script its package.json runs, and what those scripts import', () => {
+    const pkg = path.join(tmp, 'unpinned-unpacked/package');
+    fs.mkdirSync(path.dirname(pkg));
+    sh('tar', ['-xzf', unpinned, '-C', path.dirname(pkg)], tmp);
+    const { scripts } = JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
+    const run = Object.values(scripts).flatMap((cmd) => cmd.match(/scripts\/[\w.-]+\.mjs/g) ?? []);
+    expect(run).toContain('scripts/assert-release-fixture.mjs');
+    for (const file of run) {
+      expect(fs.existsSync(path.join(pkg, file)), file).toBe(true);
+      for (const [, rel] of fs.readFileSync(path.join(pkg, file), 'utf8').matchAll(/from '(\.\.?\/[^']+)'/g)) {
+        expect(fs.existsSync(path.resolve(pkg, path.dirname(file), rel!)), `${file} imports ${rel}`).toBe(true);
+      }
+    }
+  });
+
   it('blocks the current unpinned build: the genuine fixture is only UNANCHORED (exit 5)', () => {
-    const r = check({ PRAESIDIA_RELEASE_TARBALL: unpinned, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: unpinned, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
     expect(r.stderr).toMatch(/^audit-verifier release blocked: the packed CLI did not verify the genuine fixture with its embedded pin \(exit 5\)/);
     expect(r.status).toBe(1);
   });
 
-  it('blocks a CLI that does not reject the byte-flipped copy', () => {
-    const r = check({ PRAESIDIA_RELEASE_TARBALL: acceptsAnything, PRAESIDIA_RELEASE_FIXTURE: VALID });
-    expect(r.stderr).toBe('audit-verifier release blocked: the packed CLI did not reject a byte-flipped fixture (exit 0)\n');
+  it('blocks a CLI that does not reject the foreign-signed copy', () => {
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: acceptsAnything, PRAESIDIA_RELEASE_FIXTURE: VALID });
+    expect(r.stderr).toMatch(/^audit-verifier release blocked: the packed CLI did not reject the fixture re-signed under a foreign platform key with exit 1 and a signature reason \(exit 0, reason null\)\n$/);
     expect(r.status).toBe(1);
   });
 
-  it('blocks when no fixture is configured', () => {
-    const r = check({ PRAESIDIA_RELEASE_TARBALL: pinned });
-    expect(r.stderr).toMatch(/^audit-verifier release blocked: PRAESIDIA_RELEASE_FIXTURE is not set/);
+  it('blocks when the committed fixture is absent', () => {
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: pinned });
+    expect(r.stderr).toMatch(/^audit-verifier release blocked: no release fixture at \S+release-fixture\/production-audit-package\.zip; /);
     expect(r.status).toBe(1);
   });
 
   it('blocks when the tarball is missing', () => {
-    const r = check({ PRAESIDIA_RELEASE_TARBALL: path.join(tmp, 'nope.tgz'), PRAESIDIA_RELEASE_FIXTURE: VALID });
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: path.join(tmp, 'nope.tgz'), PRAESIDIA_RELEASE_FIXTURE: VALID });
     expect(r.stderr).toMatch(/^audit-verifier release blocked: cannot unpack /);
     expect(r.status).toBe(1);
   });

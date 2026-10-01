@@ -57,7 +57,7 @@ against the quoted code, and checks the current row against `package.json` and
   v7 `signatureFormatCutoverAt` fails (`src/verify.ts:1913` `if (f === 1 && cutoverMs !== null) {`).
   An absent `signatureFormat` is 1, so v1–v6 bundles verify unchanged. Verifiers before 0.11.0
   reject every v7 manifest, and none of them can verify a format-2 signature.
-- **Min Node.** From `package.json:34` `"node": ">=22.12.0"`.
+- **Min Node.** From `package.json:35` `"node": ">=22.12.0"`.
 
 ## Where the code decided each older row
 

@@ -25,6 +25,7 @@
     "docs/design/platform-key-hierarchy.md",
     "docs/decision-disclosures.md",
     "docs/COMPATIBILITY.md",
+    "scripts/assert-release-fixture.mjs",
     "scripts/assert-release-trust-anchor.mjs",
     "scripts/check-trust-anchor-ci.mjs",
     "scripts/trust-anchor-policy.mjs",

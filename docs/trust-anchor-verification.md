@@ -21,9 +21,11 @@ of *this package* is exactly the attack a customer's second channel should catch
   with required reviewers. An absent, malformed, uppercase, stale, or mismatched value blocks both
   `npm pack` and `npm publish`; there is no source-code fallback.
 - After `npm pack`, `publish.yml` runs `npm run check:release-fixture`
-  (`scripts/assert-release-fixture.mjs`). It runs the packed CLI with no key flag: the genuine
-  production fixture named by `PRODUCTION_RELEASE_FIXTURE_PATH` must exit 0 and a byte-flipped
-  copy must exit non-zero, or the release stops before upload and publish. Set
+  (`scripts/assert-release-fixture.mjs`, shipped in the package). It runs the packed CLI with no
+  key flag: the genuine production fixture, committed at
+  `release-fixture/production-audit-package.zip` in the source repository, must exit 0, and the
+  same bundle with its platform attestation re-signed under a foreign key must exit 1 with a
+  `signature: ` reason. Otherwise the release stops before upload and publish. Set
   `PRODUCTION_RELEASE_FIXTURE_NO_REKOR=1` only if the fixture carries no Rekor anchor.
 - At verify time the CLI recomputes the fingerprint from the embedded DER and fails closed
   (`platform_key_pin_mismatch`) if it differs from `PLATFORM_PUBLIC_KEY_FINGERPRINT`.

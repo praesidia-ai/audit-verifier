@@ -243,11 +243,14 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   the samples drift test regenerates from `dist/*.js`, so after a source change without a
   rebuild they silently tested old code. `vitest.config.mjs` runs `tsc` as a globalSetup,
   and a compile error fails the run.
-- **`check:release-fixture`** (AV-2750, audit F02): `scripts/assert-release-fixture.mjs`
-  unpacks the `npm pack` tarball and runs its CLI with no key flag. The genuine production
-  fixture (`PRAESIDIA_RELEASE_FIXTURE`) must exit 0 and a byte-flipped copy must exit
-  non-zero. `publish.yml` runs it after `npm pack`; an unset fixture blocks the release.
-  Not in `prepack`. Self-tested on a sample-pinned `npm pack` build.
+- **`check:release-fixture`** (AV-2750, AV-2752, audit F02): `scripts/assert-release-fixture.mjs`
+  (now shipped in `files`) unpacks the `npm pack` tarball and runs its CLI with no key flag.
+  The genuine production fixture (committed at `release-fixture/production-audit-package.zip`)
+  must exit 0, and its bundle with the platform attestation re-signed under a throwaway foreign
+  key must exit 1 with a `signature: ` reason. A raw byte flip was rejected by the zip parser
+  (exit 2) and so passed a build whose signature check did nothing. `publish.yml` runs it after
+  `npm pack`; a missing fixture blocks the release. Not in `prepack`. Self-tested on sample-pinned
+  `npm pack` builds, including one whose ECDSA check is a no-op.
 
 ### Compatibility
 - AV-2750 tightens verification only for a build whose embedded DER and fingerprint
