@@ -55,9 +55,11 @@ describe('docs/COMPATIBILITY.md', () => {
  * must sit on exactly the cited lines and on no other line of the file, so
  * any shift of the cited code turns this red. A line anchor in any other
  * spelling (`cli.ts:12`, `(:12)`) cannot be checked, so it is a failure too.
+ * AV-2761 — `README.md:N` citations are checked the same way, and a bare
+ * anchor into any `.md`, `.json` or JS/TS file fails.
  */
-const CITE = /`((?:src\/[\w./-]+|package\.json)):(\d+)(?:-(\d+))?` `([^`]+)`/g;
-const BARE = /(?:src\/[\w./-]+|[\w-]+\.ts|package\.json):\d+|\(:\d+/g;
+const CITE = /`((?:src\/[\w./-]+|package\.json|README\.md)):(\d+)(?:-(\d+))?` `([^`]+)`/g;
+const BARE = /(?:src\/[\w./-]+|[\w-]+\.(?:[cm]?[jt]s|json|md)):\d+|\(:\d+/g;
 
 describe.each([
   ['docs/COMPATIBILITY.md', 6],
@@ -79,5 +81,39 @@ describe.each([
 
   it('has no line anchor outside a `path:line` `quote` citation', () => {
     expect(text.replace(CITE, '').match(BARE) ?? []).toEqual([]);
+  });
+});
+
+/**
+ * AV-2761 — every subcommand a doc spells is one the CLI dispatches on. The
+ * set is read from the `cmd === '<name>'` branches of `runCli` in
+ * src/cli.ts, never copied here. In an invocation, a first argument that is
+ * a bare word (not a path, `<placeholder>`, `$VAR` or flag) is a subcommand
+ * and must be in that set. A subcommand spelled as a flag (`--verify-set`)
+ * fails anywhere in the text: the CLI has no such flag, so a copied command
+ * exits 2.
+ */
+const runCliBody = /^function runCli\(\)[^{\n]*\{$([\s\S]*?)^\}$/m.exec(read('src/cli.ts'))?.[1] ?? '';
+const SUBCOMMANDS = [...runCliBody.matchAll(/\bcmd === '([^']+)'/g)].map((m) => m[1]!);
+const INVOCATION = /(?:praesidia-verify|cli\.js|npx @praesidia\/audit-verifier(?:@\S+)?)[ \t]+([^\s`]+)/g;
+const mdFiles = (dir: string): string[] =>
+  fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? mdFiles(`${dir}/${e.name}`) : e.name.endsWith('.md') ? [`${dir}/${e.name}`] : [],
+  );
+
+describe('CLI subcommands spelled in README.md and docs/', () => {
+  it('reads the subcommand set from runCli', () => {
+    expect(SUBCOMMANDS.length).toBeGreaterThan(0);
+  });
+
+  it.each(['README.md', ...mdFiles('docs')])('%s spells only real subcommands', (rel) => {
+    const asFlag = new RegExp(`(?<![\\w-])--(?:${SUBCOMMANDS.join('|')})(?![\\w-])`, 'g');
+    const wrong = read(rel).split('\n').flatMap((line, i) => [
+      ...[...line.matchAll(INVOCATION)]
+        .filter(([, arg]) => /^[a-z][\w-]*$/.test(arg!) && !SUBCOMMANDS.includes(arg!))
+        .map(([inv]) => `${rel}:${i + 1} \`${inv}\` is not a subcommand`),
+      ...(line.match(asFlag) ?? []).map((flag) => `${rel}:${i + 1} \`${flag}\` is a subcommand spelled as a flag`),
+    ]);
+    expect(wrong).toEqual([]);
   });
 });

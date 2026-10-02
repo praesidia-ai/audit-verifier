@@ -398,10 +398,18 @@ with `checked: 0`) reports `not_present` (CLI `[NOT_PRESENT]`), never
 roots under `--no-rekor`, `integrityCheckpoints` below `manifest.version: 4`,
 or `platformAttestation` absent under `--allow-legacy-unattested`. Like
 `unsupported` it never drags the verdict down, but if **no** evidence
-component is `valid` (a zero-row, zero-root bundle) the top level is
-`incomplete` (exit 3), not `valid`. `manifest`, `completeness` and
-`keyBinding` are mandatory and never report `not_present`. Neither
-`unsupported` nor `not_present` appears at the top level.
+component is `valid` the top level is `incomplete` (exit 3), not `valid`.
+This applies to manifest v1-v4 only, e.g. a bundle with no rows, no roots
+and no integrity checkpoints. From manifest v5, `actionCompleteness`
+always checks the signed `actionEventCount`, even at zero action events,
+so it is `valid` or `invalid`: a zero-row v5+ bundle is `valid` on its own
+unless another component is `incomplete` or `invalid`. In `verify-set` a
+v1-v4 empty bundle keeps its `incomplete` status in `bundles[]`. It does
+not make the set `bundle_incomplete` when a verified chain check spans it
+and none of its components is `incomplete` (AV-2759, see "Cross-bundle
+continuity"). `manifest`, `completeness` and `keyBinding` are mandatory
+and never report `not_present`. Neither `unsupported` nor `not_present`
+appears at the top level.
 
 ### Proof summary (AV-0010)
 

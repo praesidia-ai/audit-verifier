@@ -5,7 +5,7 @@ trust-anchor ceremony detail live in the root `audit-verifier/README.md`.
 
 ## Requirements
 
-Node.js `>=22.12` (`audit-verifier/README.md:12`). Zero runtime dependencies
+Node.js `>=22.12` (`README.md:12` `Node.js 22.12 or newer is required.`). Zero runtime dependencies
 (`package.json`'s `dependencies: {}`).
 
 ## Local development
@@ -30,12 +30,12 @@ node dist/cli.js <bundle.zip> --json                 # machine-readable VerifyRe
 node dist/cli.js <bundle.zip> --no-rekor             # skip offline Rekor receipt check
 node dist/cli.js <bundle.zip> --platform-key <file>  # trust an alternate pinned key
 node dist/cli.js <bundle.zip> --trust-anchor <file>  # local copy of /.well-known/praesidia-audit-keys.json (AV-0017)
-node dist/cli.js --verify-set <bundle1.zip> <bundle2.zip> ...   # cross-bundle continuity (SCAN2-004)
+node dist/cli.js verify-set <bundle1.zip> <bundle2.zip> ...   # cross-bundle continuity (SCAN2-004)
 node dist/cli.js aibom <file.attested.json> --tenant-key-fingerprint <hex>  # AIBOM export (AV-0001)
 ```
 
-Exit codes and the `--quiet`/`--allow-legacy-unattested` flags are documented in
-`audit-verifier/README.md:24-50`.
+Exit codes and the `--quiet`/`--allow-legacy-unattested` flags are documented in the
+README's "Usage" section (`README.md:101` `## Usage`).
 
 ## Trust-anchor release gate
 
@@ -48,7 +48,7 @@ npm run test:trust-anchor-policy     # node --test scripts/trust-anchor-policy.s
 `prepack` (`package.json:39` `"prepack": "npm run build && npm run typecheck:spec && npm run check:release-trust-anchor"`)
 runs build + `typecheck:spec` + `check:release-trust-anchor` automatically before packaging — a
 release with a missing/mismatched/non-P-256 operator-approved fingerprint cannot be packed
-(`audit-verifier/README.md:547-550`).
+(`README.md:1075` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`).
 
 ## Contract-drift gate
 
@@ -63,16 +63,16 @@ Not yet published — `npm view @praesidia/audit-verifier` → `404` (re-confirm
 `.claude/tickets/CLOSE/TRIAGE-rest.md`'s `MKT-0002` row). `npm publish --provenance` (MIL-0002 F4)
 is configured so that once published, `npm view @praesidia/audit-verifier provenance` will show a
 SLSA attestation binding the tarball to the exact GitHub Actions run/commit that built it
-(`audit-verifier/README.md:555-556`).
+(`README.md:1084` `(MIL-0002 F4) means`).
 
 ## Failure modes — what to check first
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `audit-verifier/README.md:99-115` (verdict shape), `src/verify.ts` |
-| `--verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1058` `async function mainVerifySet(`; `f13793e` pins this behavior |
+| Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `README.md:375` `## Verdict shape`, `src/verify.ts` |
+| `verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1058` `async function mainVerifySet(`; `f13793e` pins this behavior |
 | Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:648` `export function verifyRekorReceipt(` |
-| `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `audit-verifier/README.md:547-550` |
+| `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `README.md:1075` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve` |
 | Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` `export const MAX_ZIP_` |
 
 ## `verify-set` limit: rows deleted from the end of the history
