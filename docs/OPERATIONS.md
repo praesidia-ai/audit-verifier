@@ -59,8 +59,8 @@ at execution time — only this drift check reads its source).
 
 ## Publishing (see `README.md`'s "Trust anchor" section for the full ceremony detail)
 
-Not yet published — `npm view @praesidia/audit-verifier` → `404` (re-confirmed live 2026-09-12,
-`.claude/tickets/CLOSE/TRIAGE-rest.md`'s `MKT-0002` row). `npm publish --provenance` (MIL-0002 F4)
+Not yet published — `npm view @praesidia/audit-verifier` → `404` (re-confirmed live
+2026-09-12). `npm publish --provenance` (MIL-0002 F4)
 is configured so that once published, `npm view @praesidia/audit-verifier provenance` will show a
 SLSA attestation binding the tarball to the exact GitHub Actions run/commit that built it
 (`README.md:1097` `(MIL-0002 F4) means`).

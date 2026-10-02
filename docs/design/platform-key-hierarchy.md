@@ -1,13 +1,13 @@
 # DESIGN — platform key hierarchy (offline root + rotating operational keys)
 
-MIL-0002 item 3. **Design only — not built.** This file is the design of record. It ships in
+**Design only — not built.** This file is the design of record. It ships in
 the npm package so that anyone auditing the verifier can read how platform keys are meant to
 rotate and be revoked.
 
 Building this is a two-repo change (`be` mints/rotates, `audit-verifier` pins/verifies) and
-touches the bundle wire format, so it needs `backend-dev` + `audit-verifier-dev` sign-off before
-implementation, and should land after MIL-0003 (platform key into KMS) rather than before — no
-sense hardening rotation for a key that is still a plaintext env var.
+touches the bundle wire format, so the owners of both the API and the verifier must sign it off
+before implementation, and it should land after the platform key moves into KMS rather than
+before — no sense hardening rotation for a key that is still a plaintext env var.
 
 ## Problem this solves
 
@@ -31,7 +31,7 @@ Offline ROOT keypair (Ed25519 or P-256, air-gapped / HSM-backed, generated once)
    │
    │  cross-signs (root_signature over operational pubkey + validity window + keyId)
    ▼
-Operational platform keypair(s) — 1 ACTIVE + up to N-1 ROTATED/REVOKED, KMS-held (MIL-0003)
+Operational platform keypair(s) — 1 ACTIVE + up to N-1 ROTATED/REVOKED, KMS-held
    │
    │  signs
    ▼
@@ -71,7 +71,7 @@ interface PlatformKeyHierarchy {
 3. Verify the attestation's own signature under that operational key's `publicKeyDerB64` — same
    as today's single-key check.
 4. Apply the SAME signed-before-revocation-window rule the tenant-key path already uses
-   (`verifyKeyBinding`'s existing precedent, PROD15): an attestation signed while the
+   (`verifyKeyBinding`'s existing precedent): an attestation signed while the
    operational key was `ACTIVE` and within `[validFrom, validUntil)` verifies even after later
    rotation; one signed after `revokedAt` (compromise, not routine rotation) fails closed
    unconditionally — mirrors `verifyManifest`'s existing REVOKED-key rule, no new precedent.
@@ -97,7 +97,7 @@ interface PlatformKeyHierarchy {
    `--version`/`RESULT: OK` output once built, so a customer's security reviewer sees "verified
    against key hierarchy dated X" rather than an unqualified pass.
 
-### Wire change (additive, non-breaking — matches MIL-0003's own framing)
+### Wire change (additive, non-breaking)
 
 `platform-attestation.json`'s `PlatformAttestationBody` gains one optional field:
 
@@ -110,12 +110,12 @@ interface PlatformAttestationBody {
 }
 ```
 
-`platformKeyVersion` (MIL-0003, messaged separately) is a DIFFERENT axis — it is the *tenant*
-signing-key version already carried in `keyVersions[]`; `keyId` here is the *platform*
-attestation key selector. They are independent fields and must not be conflated when MIL-0003's
-shape lands; this design assumes `keyId` is added alongside whatever `platformKeyVersion` turns
-out to be, and the two should be reviewed together when MIL-0003 messages the final attestation
-shape.
+`platformKeyVersion` (planned with the move of the platform key into KMS) is a DIFFERENT axis —
+it is the *tenant* signing-key version already carried in `keyVersions[]`; `keyId` here is the
+*platform* attestation key selector. They are independent fields and must not be conflated when
+that shape lands; this design assumes `keyId` is added alongside whatever `platformKeyVersion`
+turns out to be, and the two should be reviewed together once the final attestation shape is
+fixed.
 
 ### Why this design over the alternative (N pinned keys, no root)
 
@@ -132,22 +132,23 @@ above rather than implied).
 ### Non-goals / explicitly out of scope for this design
 
 - Does not change `verifyRowSignatures`/`verifyRootSignatures`/tenant key rotation — those
-  already have a working per-tenant `status`/`revokedAt` model (PROD15); this design only adds
+  already have a working per-tenant `status`/`revokedAt` model; this design only adds
   the missing layer above the single platform key.
 - Does not attempt a threshold/multi-sig root (M-of-N root signers) — a real improvement, but a
   separate hardware/ceremony decision for whoever runs the actual key ceremony, orthogonal to
   the wire format this design fixes.
-- Does not touch RFC 9421 / SCITT interop (parked, `PLAN-milspec-nodrift.md`'s "not attempted"
-  list) — this hierarchy is Praesidia-internal trust plumbing, not a standards-interop surface.
+- Does not touch RFC 9421 / SCITT interop (parked, not attempted) — this hierarchy is
+  Praesidia-internal trust plumbing, not a standards-interop surface.
 - Does not attempt real-time revocation for an already-installed CLI — see the hard limitation
   spelled out in step 5 above. No design can offer this for a tool with zero network calls; a
   design that implies otherwise would be lying to auditors about what "offline" costs.
 
 ## Rollout sequencing
 
-1. MIL-0003 lands (platform key in KMS, `platformKeyVersion` messaged to `audit-verifier-dev`).
-2. This design reviewed jointly by `backend-dev` + `audit-verifier-dev`, `keyId` finalized
-   against whatever MIL-0003 actually shipped.
+1. The platform key moves into KMS, and the final attestation shape (with `platformKeyVersion`)
+   is fixed.
+2. This design reviewed jointly by the API and verifier owners, `keyId` finalized against the
+   attestation shape that actually shipped.
 3. Generate the offline root (human key ceremony — same class of user-only action as pinning
    `PLATFORM_PUBLIC_KEY_DER_B64` itself; not autonomous).
 4. `be` cross-signs the (now-KMS-held) operational key under the root, adds `keyId` to

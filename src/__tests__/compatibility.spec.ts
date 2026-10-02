@@ -101,10 +101,26 @@ const filesUnder = (rel: string): string[] =>
     : [rel];
 const shipped = pkg.files.flatMap(filesUnder);
 
-describe.each(['package.json', ...shipped])('%s (in the npm tarball)', (rel) => {
+/**
+ * AV-2772 — nor a workspace agent-role name (`backend-dev` and the like):
+ * it names no team a customer can reach. Say "the API" or "the verifier".
+ * Both rules also hold for the docs/ files outside the tarball: the
+ * repository is public.
+ */
+const AGENT_ROLE =
+  /\b((audit-verifier|backend|frontend|gateway|infra|mcp|sdk|shared|website|worker)-dev|(content|docs)-writer|(database|devops|iac|qa|security)-engineer|release-manager)\b/;
+const repoOnlyDocs = filesUnder('docs').filter((f) => !shipped.includes(f));
+
+describe.each(['package.json', ...shipped, ...repoOnlyDocs])('%s (in the npm tarball or docs/)', (rel) => {
+  const lines = read(rel).split('\n');
+  const hitsOf = (match: (l: string) => boolean) => lines.flatMap((l, i) => (match(l) ? [`${rel}:${i + 1}`] : []));
+
   it('cites no workspace-internal `.claude/` path', () => {
-    const hits = read(rel).split('\n').flatMap((l, i) => (l.includes('.claude/') ? [`${rel}:${i + 1}`] : []));
-    expect(hits).toEqual([]);
+    expect(hitsOf((l) => l.includes('.claude/'))).toEqual([]);
+  });
+
+  it('names no workspace agent role (AV-2772)', () => {
+    expect(hitsOf((l) => AGENT_ROLE.test(l))).toEqual([]);
   });
 });
 
