@@ -287,6 +287,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   other link (a left row, an unknown link, a row of a later bundle) is still a fork. The
   comments on `verifyChainBoundary` and the genesis check now state be's seal export rule
   (period overlaps the window, or `deletedAt` falls in it) and the dedupe key.
+- **An invalid bundle gives `verify-set` no row links, and the read-twice guard is
+  tested** (AV-2782). `verifyBundleAndBridges` (internal, not exported) returned the
+  asked-for row links of a bundle whose chain, signatures or proofs failed. It now returns
+  none when the bundle's status is `invalid`. `verify-set` already skipped such bundles at
+  the stitch and genesis checks, so no verdict changes. A new test runs the built CLI with
+  a preload that serves different bytes on the second read of a bundle and expects exit 2.
+  With the SHA-256 guard disabled, that test fails.
 - **`verify-set`'s genesis check follows doubly-signed sealed-purge bridges** (AV-2758).
   The earliest bundle with rows had to start at `GENESIS_PREV_ROW_HASH`, so every set
   whose oldest hours were legitimately seal-purged read `chain_head_not_genesis`

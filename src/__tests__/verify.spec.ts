@@ -24,7 +24,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   verifyBundle as verifyBundleStrict,
@@ -4866,6 +4866,12 @@ describe('verifyBundle', () => {
       const gunzipLines = (b: Buffer): Record<string, unknown>[] =>
         zlib.gunzipSync(b).toString('utf8').split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
       const entry = (zip: Buffer, name: string): Buffer => readZip(zip).find((e) => e.name === name)!.data;
+      /** `zip` with the lines of ndjson entry `name` replaced by `f` of them. */
+      const edit = (zip: Buffer, name: string, f: (xs: Record<string, unknown>[]) => Record<string, unknown>[]): Buffer =>
+        writeZip(readZip(zip).map((e) => (e.name === name ? { ...e, data: ndjson(f(gunzipLines(e.data))) } : e)));
+      /** `zip` without row `id` and its proof. */
+      const cut = (zip: Buffer, id: string): Buffer =>
+        edit(edit(zip, 'rows.ndjson.gz', (rs) => rs.filter((r) => r.id !== id)), 'proofs.ndjson.gz', (ps) => ps.filter((p) => p.rowId !== id));
       /** A pre-purge archive: every row still present, no seal yet. */
       const ARCHIVE = { purgedHours: [], seals: () => [] };
 
@@ -4902,10 +4908,86 @@ describe('verifyBundle', () => {
       it('B1 (memory bound): a bundle returns only the asked-for links that are its row links, and none unasked', async () => {
         let link!: (i: number) => string;
         const zip = build({ purgedHours: [], seals: (c) => { link = c.link; return []; }, range: [2, 5] });
-        expect((await verifyBundleAndBridges(zip, { noRekor: true })).rowLinks).toEqual(new Set());
+        // The options verify-set's CLI tests pass: without allowLegacyUnattested this bundle is invalid (AV-2782, B2).
+        const options = { noRekor: true, allowLegacyUnattested: true };
+        expect((await verifyBundleAndBridges(zip, options)).rowLinks).toEqual(new Set());
         // Rows 2-5 are in the bundle: link(0) is not, nor is an arbitrary value.
         const query = new Set([link(0), link(3), link(5), Buffer.alloc(32, 0x99).toString('base64')]);
-        expect((await verifyBundleAndBridges(zip, { noRekor: true }, query)).rowLinks).toEqual(new Set([link(3), link(5)]));
+        expect((await verifyBundleAndBridges(zip, options, query)).rowLinks).toEqual(new Set([link(3), link(5)]));
+      });
+
+      it('B2 (AV-2782): an invalid bundle returns no row links, though its rows hold an asked-for link', async () => {
+        let link!: (i: number) => string;
+        const zip = build({ key2Status: 'ACTIVE', purgedHours: [], seals: (c) => { link = c.link; return []; }, range: [2, 5] });
+        // Each tamper leaves row-3 (whose link is asked for) as it was and fails the check it is named for.
+        const tampered = {
+          // row-4 claims key 2: its signature fails; its leaf and chain link are unchanged.
+          rowSignatures: edit(zip, 'rows.ndjson.gz', (rs) => rs.map((r) => (r.id === 'row-4' ? { ...r, keyVersion: 2 } : r))),
+          // row-4 and its proof cut: row-5 no longer chains.
+          chain: cut(zip, 'row-4'),
+          // row-5's proof dropped.
+          inclusionProofs: edit(zip, 'proofs.ndjson.gz', (ps) => ps.filter((p) => p.rowId !== 'row-5')),
+          // The newest row and its proof cut: chain, signatures and proofs still verify, the signed rowCount does not.
+          completeness: cut(zip, 'row-5'),
+        };
+        const options = { noRekor: true, allowLegacyUnattested: true };
+        const query = new Set([link(3)]);
+        const control = await verifyBundleAndBridges(zip, options, query);
+        expect(control.report.status).not.toBe('invalid');
+        expect(control.rowLinks).toEqual(query);
+        for (const [check, bad] of Object.entries(tampered)) {
+          const { report, rowLinks } = await verifyBundleAndBridges(bad, options, query);
+          const others = (['rowSignatures', 'chain', 'inclusionProofs'] as const).filter((c) => c !== check);
+          expect([report.status, report[check as keyof typeof tampered].status], check).toEqual(['invalid', 'invalid']);
+          expect(others.map((c) => report[c].status), check).not.toContain('invalid');
+          expect(rowLinks, check).toEqual(new Set());
+        }
+      });
+
+      it('R7 (AV-2782): a right archive whose bytes change between verify-set\'s two reads is exit 2', () => {
+        const cliPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
+        expect(fs.existsSync(cliPath), 'npm run build must run before npm test').toBe(true);
+        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-2782-'));
+        try {
+          // A local racer: the 2nd open of SWAP_FROM opens SWAP_TO instead.
+          const preload = path.join(tmp, 'swap.mjs');
+          fs.writeFileSync(preload, [
+            "import fs from 'node:fs';",
+            "import { syncBuiltinESMExports } from 'node:module';",
+            'const open = fs.promises.open;',
+            'let n = 0;',
+            'fs.promises.open = function (p, ...rest) {',
+            '  if (String(p) === process.env.SWAP_FROM && ++n === 2) {',
+            "    process.stderr.write('SWAPPED\\n');",
+            '    p = process.env.SWAP_TO;',
+            '  }',
+            '  return open.call(fs.promises, p, ...rest);',
+            '};',
+            'syncBuiltinESMExports();',
+          ].join('\n'));
+          const right = build({ ...ARCHIVE, range: [2, 5] });
+          const [left, rightPath, same, other] = ['bundle-0', 'bundle-1', 'same', 'other'].map((n) => path.join(tmp, `${n}.zip`));
+          fs.writeFileSync(left!, build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }));
+          fs.writeFileSync(rightPath!, right);
+          fs.writeFileSync(same!, right);
+          fs.writeFileSync(other!, cut(right, 'row-5'));
+          const run = (swapTo: string) => spawnSync(
+            process.execPath,
+            ['--import', pathToFileURL(preload).href, cliPath, 'verify-set', left!, rightPath!, '--no-rekor', '--allow-legacy-unattested', '--json'],
+            { encoding: 'utf8', env: { ...process.env, SWAP_FROM: rightPath, SWAP_TO: swapTo } },
+          );
+          // The M1 set: a bridge leaves the right archive's head anchor, so verify-set reads it twice.
+          const control = run(same!);
+          expect(control.stderr).toContain('SWAPPED');
+          expect(control.status).toBe(0);
+          const swapped = run(other!);
+          expect(swapped.stderr).toContain('SWAPPED');
+          expect(swapped.stderr).toContain(`error: cannot read bundle ${rightPath}: it changed while verify-set was reading it`);
+          expect(swapped.status).toBe(2);
+          expect(swapped.stdout).toBe('');
+        } finally {
+          fs.rmSync(tmp, { recursive: true, force: true });
+        }
       });
 
       it('F1: a bridge out of the right head anchor back to a LEFT row link is still a fork', () => {

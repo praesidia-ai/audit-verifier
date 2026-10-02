@@ -1475,8 +1475,8 @@ export async function verifyBundle(
  * signatures verified (the ones its chain check may follow), for
  * `verify-set`'s boundary check. Not re-exported by `index.ts`; `report` is
  * exactly `verifyBundle`'s. AV-2775: `rowLinks` holds the members of
- * `rowLinkQuery` that are chain links of this bundle's rows, so it never
- * holds more than the query, however many rows the bundle has.
+ * `rowLinkQuery` that are chain links of this bundle's rows, never more than
+ * the query. AV-2782: it is empty when `report.status` is `invalid`.
  */
 export async function verifyBundleAndBridges(
   bundle: Buffer,
@@ -1942,7 +1942,7 @@ export async function verifyBundleAndBridges(
         : {}),
     },
   };
-  return { report: { ...report, proofs: deriveProofs(report) }, chainBridges, rowLinks };
+  return { report: { ...report, proofs: deriveProofs(report) }, chainBridges, rowLinks: status === 'invalid' ? new Set() : rowLinks };
 }
 
 // ════════════════════════════════════════════════════════════════════════
