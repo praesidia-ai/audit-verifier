@@ -19,7 +19,7 @@ npm run typecheck:spec
 npm test                # vitest run
 ```
 
-(`package.json:33-42` — script list confirmed against the current manifest.)
+(The script list starts at `package.json:37` `"scripts": {`.)
 
 ## Running the CLI locally against a bundle
 
@@ -45,9 +45,10 @@ npm run check:trust-anchor-ci        # node scripts/check-trust-anchor-ci.mjs
 npm run test:trust-anchor-policy     # node --test scripts/trust-anchor-policy.selftest.mjs
 ```
 
-`prepack` (`package.json:35`) runs build + `typecheck:spec` + `check:release-trust-anchor`
-automatically before packaging — a release with a missing/mismatched/non-P-256 operator-approved
-fingerprint cannot be packed (`audit-verifier/README.md:547-550`).
+`prepack` (`package.json:39` `"prepack": "npm run build && npm run typecheck:spec && npm run check:release-trust-anchor"`)
+runs build + `typecheck:spec` + `check:release-trust-anchor` automatically before packaging — a
+release with a missing/mismatched/non-P-256 operator-approved fingerprint cannot be packed
+(`audit-verifier/README.md:547-550`).
 
 ## Contract-drift gate
 
@@ -69,10 +70,36 @@ SLSA attestation binding the tarball to the exact GitHub Actions run/commit that
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `audit-verifier/README.md:99-115` (verdict shape), `src/verify.ts` |
-| `--verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:644` `mainVerifySet`; `f13793e` pins this behavior |
-| Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:549` |
+| `--verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1025` `async function mainVerifySet(`; `f13793e` pins this behavior |
+| Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:648` `export function verifyRekorReceipt(` |
 | `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `audit-verifier/README.md:547-550` |
-| Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` |
+| Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` `export const MAX_ZIP_` |
+
+## `verify-set` limit: rows deleted from the end of the history
+
+`verify-set` checks each bundle with rows against the next bundle with rows. The later bundle's
+chain head must link back to the earlier bundle's newest row, through any empty bundles between
+them (AV-2756). The newest bundle with rows has no later bundle to be checked against. So when a
+set ends in one or more empty bundles, rows deleted from the end of the history, inside those
+empty windows, break no chain link that the set can see. Each empty bundle's own checks still
+apply: a Merkle root whose whole period lies in that bundle's window and committed to rows fails
+the bundle (`rootCoverage`). Rows that no such root covers (the un-rooted tail, a boundary period,
+or a period whose root was removed with them) leave nothing that the verifier checks. Offline, such a window cannot be told apart from
+one in which nothing was logged, and `verify-set` reports no finding for it. This limit predates
+AV-2756.
+
+What an operator can do:
+
+- **Treat the end of the set as unconfirmed.** A set that ends in an empty bundle proves nothing
+  about rows after its newest bundle with rows.
+- **Verify again with a later export.** Once the next window holds rows, export it from the
+  set's last `to`, add it to the set and run `verify-set` again. Its chain head must link back,
+  across the empty bundles, to the last row before them. Rows deleted under the empty bundles
+  then show up as a `boundary_chain_mismatch` that names them, unless a verified sealed purge
+  bridges the gap.
+- **Compare against an earlier export of the same window**, if one was archived. A window that
+  held rows in an earlier export (`rowsSeen` in the `--json` report) and is empty in a later one,
+  with no sealed purge for those rows, has lost rows.
 
 ## Verification limits
 

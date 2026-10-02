@@ -48,12 +48,36 @@ describe('docs/COMPATIBILITY.md', () => {
   it('no row claims a manifest version above the enforced ceiling', () => {
     expect(Math.max(...rows.map((r) => manifestMax(r[col('manifest')]!)))).toBe(maxManifest);
   });
+});
 
-  it('every `path:line` `quote` citation still points at the quoted code', () => {
-    const cites = [...doc.matchAll(/`((?:src\/[\w./-]+|package\.json)):(\d+)` `([^`]+)`/g)];
-    expect(cites.length).toBeGreaterThanOrEqual(6);
-    for (const [, file, line, quote] of cites) {
-      expect(read(file!).split('\n')[Number(line) - 1], `${file}:${line}`).toContain(quote);
-    }
+/**
+ * AV-2760 — a citation is `` `src/x.ts:N` `quote` `` (or `:N-M`). The quote
+ * must sit on exactly the cited lines and on no other line of the file, so
+ * any shift of the cited code turns this red. A line anchor in any other
+ * spelling (`cli.ts:12`, `(:12)`) cannot be checked, so it is a failure too.
+ */
+const CITE = /`((?:src\/[\w./-]+|package\.json)):(\d+)(?:-(\d+))?` `([^`]+)`/g;
+const BARE = /(?:src\/[\w./-]+|[\w-]+\.ts|package\.json):\d+|\(:\d+/g;
+
+describe.each([
+  ['docs/COMPATIBILITY.md', 6],
+  ['docs/ARCHITECTURE.md', 4],
+  ['docs/OPERATIONS.md', 2],
+])('%s citations', (rel, floor) => {
+  const text = read(rel);
+
+  it('every `path:line` `quote` citation points at exactly the lines holding the quote', () => {
+    const cites = [...text.matchAll(CITE)];
+    const wrong = cites.flatMap(([cite, file, from, to, quote]) => {
+      const hits = read(file!).split('\n').flatMap((l, i) => (l.includes(quote!) ? [i + 1] : []));
+      const cited = Array.from({ length: Number(to ?? from) - Number(from) + 1 }, (_, k) => Number(from) + k);
+      return hits.join() === cited.join() ? [] : [`${cite} is on line(s) [${hits.join(', ')}]`];
+    });
+    expect(wrong).toEqual([]);
+    expect(cites.length).toBeGreaterThanOrEqual(floor);
+  });
+
+  it('has no line anchor outside a `path:line` `quote` citation', () => {
+    expect(text.replace(CITE, '').match(BARE) ?? []).toEqual([]);
   });
 });

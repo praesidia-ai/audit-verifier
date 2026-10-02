@@ -1,49 +1,53 @@
 # `@praesidia/audit-verifier` — architecture
 
-Module map with `path:line` anchors, verified against the current tree 2026-09-12.
+Module map with `path:line` anchors. Each `src/` anchor is a path, line and quote
+(`` `src/x.ts:N` `quote` ``). `src/__tests__/compatibility.spec.ts` fails when the quote is not on
+exactly that line, or when a `src/` anchor has no quote. `README.md` line anchors are not checked.
 
 ## `src/` layout
 
-```
-src/cli.ts               # entrypoint (832 lines): flag parsing, mainVerifySet (:644),
-                          # main (:725) — dispatches to verifyBundle or the verify-set path
-src/verify.ts             # verifyBundle (:1189, 5548 lines total) — the actual bundle
-                          # verification pipeline: signatures, Merkle proofs, chain
-                          # continuity, cross-bundle verify-set (SCAN2-004)
-src/crypto.ts             # vendored Ed25519/ECDSA-P256 primitives, byte-for-byte
-                          # compatible with be's CryptoUtilsService (AGV-003)
-src/jcs-canonical.ts      # vendored JSON Canonicalization Scheme, compatible with be's
-                          # canonicalJson (AGV-030) — includes the __proto__-key
-                          # canonicalization pinned against be-core (SCAN-AV-02)
-src/zip.ts                # PKZIP reader/writer (849 lines): readZip (:101), writeZip (:589),
-                          # gzipDeterministic (:773); bounded archive/entry size caps
-                          # (MAX_ZIP_ARCHIVE_BYTES etc., :71-73) reject oversized bundles
-                          # before full decompression
-src/rekor.ts              # Sigstore Rekor offline verification (632 lines):
-                          # computeRekorLogIdHex (:66), verifyRekorReceipt (:549) — SET
-                          # signature + signed checkpoint + inclusion proof, no network call
-src/platform-pubkey.ts    # PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT —
-                          # the compiled-in trust anchor (audit-verifier/README.md:530-534)
-src/http-receipt.ts       # HTTP_RECEIPT_VERSION (:4), httpTargetKeyFingerprint (:32),
-                          # httpRequestCommitment (:37), verifyHttpReceipt (:41) — verifies
-                          # independently-pinned HTTP target receipts (README.md:877)
-src/aibom.ts              # verifyAibomAttestation — be's attested AIBOM envelope
-                          # (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001)
-src/proofs.ts             # AV-0010 — PROOF_COMPONENTS / deriveProofs / formatProofLines:
-                          # components → six proof types (table below)
-src/index.ts              # package's public export surface
-```
+- `src/cli.ts` — entrypoint and flag parsing. `runCli` dispatches on the first argument: to
+  `src/cli.ts:1096` `async function main(` for one bundle (no subcommand, or `verify`), to
+  `src/cli.ts:1025` `async function mainVerifySet(` for `verify-set`, or to `mainAibom` for `aibom`.
+- `src/verify.ts` — `src/verify.ts:1465` `export async function verifyBundle(` is the bundle
+  verification pipeline: signatures, Merkle proofs, chain continuity. `verifyChainBoundary` is the
+  cross-bundle boundary rule that `verify-set` uses (SCAN2-004).
+- `src/crypto.ts` — vendored Ed25519/ECDSA-P256 primitives, byte-for-byte compatible with be's
+  CryptoUtilsService (AGV-003).
+- `src/jcs-canonical.ts` — vendored JSON Canonicalization Scheme, compatible with be's
+  canonicalJson (AGV-030), including the `__proto__`-key canonicalization pinned against be-core
+  (SCAN-AV-02).
+- `src/zip.ts` — PKZIP reader/writer: `src/zip.ts:101` `export function readZip(`,
+  `src/zip.ts:589` `export function writeZip(`, `src/zip.ts:773` `export function gzipDeterministic(`.
+  The archive/entry size caps `src/zip.ts:71-73` `export const MAX_ZIP_` reject oversized bundles
+  before full decompression.
+- `src/rekor.ts` — Sigstore Rekor offline verification:
+  `src/rekor.ts:85` `export function computeRekorLogIdHex(`, and
+  `src/rekor.ts:648` `export function verifyRekorReceipt(`, which checks the SET signature, the
+  signed checkpoint and the inclusion proof, with no network call.
+- `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
+  compiled-in trust anchor (audit-verifier/README.md:530-534).
+- `src/http-receipt.ts` — `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION`,
+  `src/http-receipt.ts:32` `export function httpTargetKeyFingerprint(`,
+  `src/http-receipt.ts:37` `export function httpRequestCommitment(`,
+  `src/http-receipt.ts:41` `export function verifyHttpReceipt(` — verifies independently-pinned
+  HTTP target receipts (README.md:877).
+- `src/aibom.ts` — verifyAibomAttestation: be's attested AIBOM envelope
+  (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001).
+- `src/proofs.ts` — AV-0010: PROOF_COMPONENTS / deriveProofs / formatProofLines map components to
+  six proof types (table below).
+- `src/index.ts` — the package's public export surface.
 
 ## Verification pipeline (high level)
 
-`cli.ts:725`'s `main()` reads CLI flags, reads the bundle path, and calls into
-`verify.ts:1189`'s `verifyBundle()`. That function is the load-bearing piece described in the
-README's "What it verifies" section (`audit-verifier/README.md:116-411`): per-row signature
-checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless `--no-rekor`) Rekor
-receipt verification via `rekor.ts:549`. `cli.ts:644`'s `mainVerifySet()` is the newer
-cross-bundle continuity entrypoint (`verify-set`, SCAN2-004) that checks chain fields are present
-across a *set* of bundles rather than one — it fails closed when chain fields are absent
-(pinned by a dedicated test, `f13793e`).
+`src/cli.ts:1096` `async function main(` reads the CLI flags and the bundle file, and calls
+`src/verify.ts:1465` `export async function verifyBundle(`. That function is the load-bearing
+piece described in the README's "What it verifies" section (`audit-verifier/README.md:116-411`):
+per-row signature checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless
+`--no-rekor`) Rekor receipt verification via `src/rekor.ts:648` `export function verifyRekorReceipt(`.
+`src/cli.ts:1025` `async function mainVerifySet(` is the newer cross-bundle continuity entrypoint
+(`verify-set`, SCAN2-004) that checks chain fields are present across a *set* of bundles rather
+than one — it fails closed when chain fields are absent (pinned by a dedicated test, `f13793e`).
 
 Component statuses (`ComponentStatus`, `verify.ts`; README "Verdict shape"):
 
