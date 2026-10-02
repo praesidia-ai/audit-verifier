@@ -592,14 +592,14 @@ builds accept an all-zero key with an all-zero signature (AV-2701):
    Sigstore Rekor public key. The inclusion proof's C2SP signed checkpoint
    is verified under that same pin, its authenticated tree size/root must
    match the proof metadata, and the proof is then walked to that root. Its
-   `hashedrekord` body must also contain the exact
-   audit root hash and root signature from the bundle, preventing a genuine
-   but unrelated receipt from being reattached. A receipt that is not a
-   genuine, SET-signed, log-included entry (e.g. an empty `{}`) **fails**.
-   The pinned key
-   is baked in at build time (never fetched at verify time); a sovereign
-   Rekor instance can pass its own key via `verifyBundle`'s
-   `rekorPublicKeyPem` option.
+   `hashedrekord` body must bind this root: `data.hash` must be the SHA-256 of
+   the bytes the root signature covers (canonical JSON `{periodEnd, periodStart,
+   rootHash, rowCount}`, prefixed `praesidia:merkle-root:v2\n` at format 2), and
+   `signature.content` must be the root's signature, valid over those bytes
+   under the root's key. A receipt that is not a genuine, SET-signed,
+   log-included entry (e.g. an empty `{}`) **fails**. The pinned key is baked in
+   at build time (never fetched at verify time); a sovereign Rekor instance can
+   pass its own key via `verifyBundle`'s `rekorPublicKeyPem` option.
    Legacy receipts that omit `inclusionProof.checkpoint` fail closed with
    `checkpoint_missing`; producers must persist the log's signed checkpoint,
    not only the unauthenticated `treeSize`/`rootHash` proof fields.

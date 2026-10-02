@@ -269,6 +269,12 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   No new status, exit code or export.
 
 ### Fixed
+- **README "What it verifies" step 6 states the AV-2771 Rekor body rule** (AV-2773). It
+  still said the `hashedrekord` body must contain the root hash itself. It now says what
+  the verifier checks: `data.hash` is the SHA-256 of the bytes the root signature covers,
+  and `signature.content` is the root's signature, valid over them under the root's key.
+  `docs/ARCHITECTURE.md` cites that README line next to the code that enforces it, so the
+  compatibility spec goes red if either drifts. Documentation only; no verdict changes.
 - **`verify-set`'s genesis check follows doubly-signed sealed-purge bridges** (AV-2758).
   The earliest bundle with rows had to start at `GENESIS_PREV_ROW_HASH`, so every set
   whose oldest hours were legitimately seal-purged read `chain_head_not_genesis`

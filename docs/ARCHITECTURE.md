@@ -24,7 +24,12 @@ exactly that line, or when an anchor has no quote.
 - `src/rekor.ts` — Sigstore Rekor offline verification:
   `src/rekor.ts:95` `export function computeRekorLogIdHex(`, and
   `src/rekor.ts:685` `export function verifyRekorReceipt(`, which checks the SET signature, the
-  signed checkpoint and the inclusion proof, with no network call.
+  signed checkpoint and the inclusion proof, with no network call. The body binding (AV-2771)
+  rejects a `data.hash` other than the SHA-256 of the root's signed bytes
+  (`src/rekor.ts:597` `hash.value.toLowerCase() !== sha256(signedBytes)`) and a logged signature
+  that does not verify over those bytes under the root's key
+  (`src/rekor.ts:603` `verifySignature(expected.signatureAlgorithm, signedBytes, signature.content`).
+  README step 6 states that rule (`README.md:596` `the bytes the root signature covers`).
 - `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
   compiled-in trust anchor (`README.md:1040` `The platform public key this build trusts is compiled into`).
 - `src/http-receipt.ts` — `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION`,
