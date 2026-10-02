@@ -150,7 +150,8 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   reported. An unsigned, re-pointed, non-increasing, period-mismatched, branching or
   row-dropping link fails. Bundles without the fields verify exactly as before.
   Older verifiers fail such bundles closed. The wire contract is in README "Root
-  coverage" and `.claude/backlog/AV-0016.md`.
+  coverage": the two root fields, the signed `praesidia.root-supersession.v1`
+  envelope and the per-root inclusion-proof rules.
 - `docs/COMPATIBILITY.md` (AV-0012) — which verifier version reads which bundle
   manifest, audit package, decision disclosure, HTTP receipt and AIBOM formats, and
   its minimum Node version. Each current-row cell cites the code that decides it.
