@@ -100,9 +100,23 @@ describe('AV-0001 aibom — one-byte mutation sweep over the signed content', ()
     expect(spans.map(([k]) => k).filter((k) => !UNSIGNED.has(k)).sort()).toEqual(Object.keys(ALLOWED).sort());
   });
 
-  it.each(Object.keys(ALLOWED))('every flipped byte of `%s` fails with a field-specific reason', (field) => {
-    const [, start, end] = spans.find(([k]) => k === field)!;
-    for (let i = start; i < end; i += 1) {
+  // AV-2763 — the 2.6 kB `document` member is swept in fixed 256-byte chunks,
+  // one test each, so no single test carries the whole sweep (it timed out
+  // under load). Every byte of every member is still flipped with every mask.
+  const CHUNK = 256;
+  const sweeps: Array<[string, string, number, number]> = [];
+  for (const [field, start, end] of spans) {
+    if (!(field in ALLOWED)) continue;
+    const step = field === 'document' ? CHUNK : end - start;
+    for (let from = start; from < end; from += step) {
+      const to = Math.min(from + step, end);
+      sweeps.push([step < end - start ? `\`${field}\` bytes ${from - start}-${to - start - 1}` : `\`${field}\``, field, from, to]);
+    }
+  }
+
+  it.each(sweeps)('every flipped byte of %s fails with a field-specific reason', (_label, field, from, to) => {
+    const [, start] = spans.find(([k]) => k === field)!;
+    for (let i = from; i < to; i += 1) {
       for (const mask of [0x01, 0x02, 0x20]) {
         const mutated = Buffer.from(bytes);
         mutated[i] = mutated[i]! ^ mask;
