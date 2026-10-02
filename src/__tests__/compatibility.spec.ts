@@ -16,13 +16,16 @@ const pkg = JSON.parse(read('package.json')) as { version: string; engines: { no
 const maxManifest = Number(/^const MAX_SUPPORTED_MANIFEST_VERSION = (\d+);$/m.exec(read('src/verify.ts'))?.[1]);
 
 const cells = (line: string) => line.split('|').slice(1, -1).map((c) => c.trim());
+/** Header cells and body rows of the first markdown table in `text`. */
+const firstTable = (text: string) => {
+  const lines = text.split('\n');
+  const start = lines.findIndex((l) => l.startsWith('|'));
+  const end = lines.findIndex((l, i) => i > start && !l.startsWith('|'));
+  const [head = '', , ...body] = lines.slice(start, end === -1 ? undefined : end);
+  return { header: cells(head), rows: body.map(cells) };
+};
 /** The matrix is the first table in the file (later tables are provenance notes). */
-const lines = doc.split('\n');
-const start = lines.findIndex((l) => l.startsWith('|'));
-const end = lines.findIndex((l, i) => i > start && !l.startsWith('|'));
-const tableLines = lines.slice(start, end === -1 ? undefined : end);
-const header = cells(tableLines[0] ?? '');
-const rows = tableLines.slice(2).map(cells);
+const { header, rows } = firstTable(doc);
 const col = (name: string) => header.findIndex((h) => h.toLowerCase().includes(name));
 /** Highest manifest version a cell like `1–5` / `1-5` / `≥ 1 (no ceiling)` names. */
 const manifestMax = (cell: string) => Math.max(...(cell.match(/\d+/g) ?? []).map(Number));
@@ -92,15 +95,45 @@ describe.each([
  * globalSetup just built) plus package.json, which npm always packs. A
  * `files` entry that is missing or a glob throws here, so the spec fails.
  */
-const shipped = (rel: string): string[] =>
+const filesUnder = (rel: string): string[] =>
   fs.statSync(path.join(root, rel)).isDirectory()
-    ? fs.readdirSync(path.join(root, rel)).flatMap((name) => shipped(`${rel}/${name}`))
+    ? fs.readdirSync(path.join(root, rel)).flatMap((name) => filesUnder(`${rel}/${name}`))
     : [rel];
+const shipped = pkg.files.flatMap(filesUnder);
 
-describe.each(['package.json', ...pkg.files.flatMap(shipped)])('%s (in the npm tarball)', (rel) => {
+describe.each(['package.json', ...shipped])('%s (in the npm tarball)', (rel) => {
   it('cites no workspace-internal `.claude/` path', () => {
     const hits = read(rel).split('\n').flatMap((l, i) => (l.includes('.claude/') ? [`${rel}:${i + 1}`] : []));
     expect(hits).toEqual([]);
+  });
+});
+
+/**
+ * AV-2770 — the file table in docs/INDEX.md (its first table) names exactly
+ * the files under docs/: a doc with no row, or a row for a doc that is gone,
+ * fails. Every "In the npm tarball" cell is `yes` or `no`, and the `yes` rows
+ * are exactly the docs/ files the shipped set above holds.
+ */
+describe('docs/INDEX.md file table', () => {
+  const { header: indexHeader, rows: indexRows } = firstTable(read('docs/INDEX.md'));
+  const fileCol = indexHeader.indexOf('File');
+  const tarballCol = indexHeader.indexOf('In the npm tarball');
+  const named = (rs: string[][]) => rs.map((r) => /^`([^`]+)`$/.exec(r[fileCol]!)?.[1] ?? r[fileCol]).sort();
+  const inDocs = (files: string[]) =>
+    files.filter((f) => f.startsWith('docs/')).map((f) => f.slice('docs/'.length)).sort();
+
+  it('has the File and In the npm tarball columns', () => {
+    expect(fileCol, 'column "File"').toBeGreaterThanOrEqual(0);
+    expect(tarballCol, 'column "In the npm tarball"').toBeGreaterThanOrEqual(0);
+  });
+
+  it('names every file under docs/ and no other', () => {
+    expect(named(indexRows)).toEqual(inDocs(filesUnder('docs')));
+  });
+
+  it('marks `yes` exactly the docs/ files package.json `files` ships', () => {
+    expect(indexRows.filter((r) => r[tarballCol] !== 'yes' && r[tarballCol] !== 'no')).toEqual([]);
+    expect(named(indexRows.filter((r) => r[tarballCol] === 'yes'))).toEqual(inDocs(shipped));
   });
 });
 

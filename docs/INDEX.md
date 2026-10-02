@@ -15,8 +15,9 @@ verifies, trust anchor); read that first. This `docs/` directory holds these fil
 | `trust-anchor-verification.md` | Where the platform public key is pinned in this CLI, and how an auditor confirms that pin out-of-band. | yes |
 | `design/platform-key-hierarchy.md` | Design only, not built: an offline root key that cross-signs rotating operational keys. | yes |
 
-The last column follows the `files` list in `package.json`, which names exactly the four `docs/`
-files marked yes. The other three are in the source repository only.
+The last column follows the `files` list in `package.json`, which names exactly the `docs/` files
+marked yes. The others are in the source repository only. `src/__tests__/compatibility.spec.ts`
+fails if this table misses a file under `docs/`, names one that is gone, or disagrees with `files`.
 
 `INDEX.md`, `ARCHITECTURE.md` and `OPERATIONS.md` are the DOCS-0001 triad: a platform-fit
 statement, a module map, and a condensed build/test/CLI-usage reference.
