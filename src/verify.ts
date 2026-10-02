@@ -499,6 +499,35 @@ function supersessionSignable(root: BundleRoot, supersededRootHash: string): Buf
 }
 
 /**
+ * AV-2754 (BE-2979) — the bytes a seal's link signature covers (format 1;
+ * format 2 prefixes `praesidia:retention-seal-link:v2\n`): the seal's period,
+ * row count and root plus its two boundary links, under a `version` key that
+ * keeps them distinct from every other envelope. Wire strings are used
+ * as-is, like the 6-field seal envelope. Exported for the golden-vector test
+ * only; not re-exported by `index.ts`.
+ */
+export function retentionSealLinkMessage(seal: {
+  organizationId: string;
+  periodStart: string;
+  periodEnd: string;
+  rowCount: string;
+  rootHash: string;
+  chainLinkIn: string;
+  chainLinkOut: string;
+}): Buffer {
+  return canonicalJson({
+    version: 'praesidia.retention-seal-link.v1',
+    organizationId: seal.organizationId,
+    periodStart: seal.periodStart,
+    periodEnd: seal.periodEnd,
+    rowCount: seal.rowCount,
+    rootHash: seal.rootHash,
+    chainLinkIn: seal.chainLinkIn,
+    chainLinkOut: seal.chainLinkOut,
+  });
+}
+
+/**
  * AV-0016 — valid supersession links (superseded root id → superseding root)
  * plus one error per invalid link. A link is valid when its target is another
  * root in this bundle with the same period, a strictly lower `rowCount` (so
@@ -583,6 +612,21 @@ interface BundleSealedPurge {
   deletedBy: string;
   /** approval_requests.id of the consumed two-person-approval. */
   approvalId: string;
+  /**
+   * AV-2754 (BE-2979) — the purged run's boundary chain links, emitted only
+   * on seals that signed them, all five together (`chainLinkSignatureFormat`
+   * only when 2). `chainLinkIn` = the first purged leaf's `prevRowHash`
+   * (= link(P)); `chainLinkOut` = link(last purged leaf) (= the survivor's
+   * `prevRowHash`). Base64 of 32 bytes. The second signature covers
+   * {@link retentionSealLinkMessage} under purpose `retention-seal-link`;
+   * see `verifySealLinkAuthenticity`. Absent on every older seal.
+   */
+  chainLinkIn?: string;
+  chainLinkOut?: string;
+  chainLinkSignature?: string;
+  chainLinkSigningKeyVersion?: number;
+  chainLinkSignatureAlgorithm?: BundleSignatureAlgorithm;
+  chainLinkSignatureFormat?: number;
 }
 
 interface BundleProofEntry {
@@ -1556,19 +1600,8 @@ export async function verifyBundle(
   const rowSigResult = withEvidenceStatus(
     verifyRowSignatures(rows, publicKeys, manifest.signatureAlgorithm, cutoverMs),
   );
-  // SCAN2-004 — `chainRaw` carries the head/tail endpoint fields
-  // `ChainVerification` adds on top of `RawComponentResult`; narrow
-  // explicitly before `withStatus` so those extra fields never leak into
-  // the public `chain: ComponentResult` surface. They are surfaced
-  // separately, on `bundle`, for `verify-set` to consume.
-  const chainRaw = verifyChain(rows);
-  const chainResult = withEvidenceStatus({
-    ok: chainRaw.ok,
-    checked: chainRaw.checked,
-    failed: chainRaw.failed,
-    firstFailure: chainRaw.firstFailure,
-    reason: chainRaw.reason,
-  });
+  // The chain (`verifyChain`) is verified at 6c, once the sealed-purge
+  // bridges it may follow are authenticated.
 
   // 5) Parse + verify roots.
   const roots = await parseGzipNdjson<BundleRoot>(
@@ -1633,6 +1666,25 @@ export async function verifyBundle(
     : [];
   assertSealedPurgesStructure(sealedPurges, manifest.orgId);
   const verifiedSeals = verifySealedPurgeAuthenticity(sealedPurges, publicKeys, cutoverMs);
+
+  // SCAN2-004 — `chainRaw` carries the head/tail endpoint fields
+  // `ChainVerification` adds on top of `RawComponentResult`; narrow
+  // explicitly before `withStatus` so those extra fields never leak into
+  // the public `chain: ComponentResult` surface. They are surfaced
+  // separately, on `bundle`, for `verify-set` to consume. AV-2754: the
+  // chain may cross a purged run only through a seal whose 6-field AND
+  // link signatures both verify.
+  const chainRaw = verifyChain(
+    rows,
+    verifySealLinkAuthenticity(verifiedSeals, publicKeys, cutoverMs),
+  );
+  const chainResult = withEvidenceStatus({
+    ok: chainRaw.ok,
+    checked: chainRaw.checked,
+    failed: chainRaw.failed,
+    firstFailure: chainRaw.firstFailure,
+    reason: chainRaw.reason,
+  });
 
   const integrityCheckpointsResult = withEvidenceStatus(
     verifyIntegrityCheckpoints(
@@ -4457,7 +4509,21 @@ interface ChainVerification extends RawComponentResult {
   tailChainLink?: string | null;
 }
 
-function verifyChain(rows: BundleRow[]): ChainVerification {
+/**
+ * AV-2754 (BE-2979) — sealed-purge bridges. A retention purge deletes a run
+ * of leaves; the survivor S keeps `prevRowHash` = link(last purged leaf).
+ * `bridges` (from `verifySealLinkAuthenticity` only) map link(P) → that
+ * value. Rules, all fail closed:
+ *  - two bridges sharing a `linkIn` or a `linkOut` are all dropped (the gap
+ *    then fails as before);
+ *  - a row whose `prevRowHash` is reachable from a row link through bridges
+ *    is not a head candidate;
+ *  - a link value with both a direct successor row and a bridge is a fork;
+ *  - the walk follows bridges only when no row follows directly, and a link
+ *    value reached twice is a cycle.
+ * With no bridges this is the pre-AV-2754 algorithm, verdicts unchanged.
+ */
+function verifyChain(rows: BundleRow[], bridges: ChainBridge[] = []): ChainVerification {
   if (rows.length === 0) {
     return { ok: true, checked: 0, failed: 0 };
   }
@@ -4499,13 +4565,50 @@ function verifyChain(rows: BundleRow[]): ChainVerification {
     }
   }
 
+  // AV-2754 — in → out over the signed bridges; a duplicated in or out
+  // drops every pair carrying it.
+  const countOf = (values: string[]): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const v of values) m.set(v, (m.get(v) ?? 0) + 1);
+    return m;
+  };
+  const inCount = countOf(bridges.map((b) => b.linkIn));
+  const outCount = countOf(bridges.map((b) => b.linkOut));
+  const bridgeOut = new Map<string, string>();
+  for (const b of bridges) {
+    if (inCount.get(b.linkIn) === 1 && outCount.get(b.linkOut) === 1) {
+      bridgeOut.set(b.linkIn, b.linkOut);
+    }
+  }
+  for (const linkIn of bridgeOut.keys()) {
+    const direct = byDeclaredPrev.get(linkIn);
+    if (direct) {
+      return {
+        ok: false,
+        checked: rows.length,
+        failed: 1,
+        firstFailure: direct[0]!.id,
+        reason: `chain fork: row ${direct[0]!.id} and a sealed-purge bridge both succeed the same link`,
+      };
+    }
+  }
+  // Link values a row link reaches through one or more bridges.
+  const bridged = new Set<string>();
+  for (const link of chainLinkToRow.keys()) {
+    let next = bridgeOut.get(link);
+    while (next !== undefined && !bridged.has(next)) {
+      bridged.add(next);
+      next = bridgeOut.get(next);
+    }
+  }
+
   // Rows with no in-bundle predecessor. Exactly one is expected (the
   // leading row's opaque anchor); any other count means the rows do not
   // form a single connected chain.
   const headCandidates = rows.filter(
     (row) =>
       typeof row.prevRowHash !== 'string' ||
-      !chainLinkToRow.has(row.prevRowHash),
+      (!chainLinkToRow.has(row.prevRowHash) && !bridged.has(row.prevRowHash)),
   );
   if (headCandidates.length !== 1) {
     return {
@@ -4525,13 +4628,29 @@ function verifyChain(rows: BundleRow[]): ChainVerification {
   let current: BundleRow | undefined = headCandidates[0];
   let tailRow: BundleRow = headCandidates[0]!;
   const visited = new Set<string>();
+  const visitedLinks = new Set<string>();
   let steps = 0;
   while (current) {
     visited.add(current.id);
     tailRow = current;
     steps += 1;
-    const link = computeChainLink(current);
-    current = link !== null ? byDeclaredPrev.get(link)?.[0] : undefined;
+    let link = computeChainLink(current);
+    current = undefined;
+    while (link !== null) {
+      if (visitedLinks.has(link)) {
+        return {
+          ok: false,
+          checked: rows.length,
+          failed: 1,
+          firstFailure: tailRow.id,
+          reason: 'chain cycle: a sealed-purge bridge leads back to a link already walked',
+        };
+      }
+      visitedLinks.add(link);
+      current = byDeclaredPrev.get(link)?.[0];
+      if (current) break;
+      link = bridgeOut.get(link) ?? null;
+    }
   }
   if (visited.size !== rows.length) {
     const orphan = rows.find((r) => !visited.has(r.id));
@@ -5923,7 +6042,8 @@ function assertSealedPurgesStructure(
       typeof p.deletedBy !== 'string' ||
       p.deletedBy.length === 0 ||
       typeof p.approvalId !== 'string' ||
-      p.approvalId.length === 0
+      p.approvalId.length === 0 ||
+      !sealChainLinkFieldsWellFormed(p)
     ) {
       throw new Error(
         `sealed-purges.ndjson.gz has an invalid/duplicate entry: ${String(p?.id)}`,
@@ -5931,6 +6051,36 @@ function assertSealedPurgesStructure(
     }
     ids.add(p.id);
   }
+}
+
+const SEAL_CHAIN_LINK_FIELDS = [
+  'chainLinkIn',
+  'chainLinkOut',
+  'chainLinkSignature',
+  'chainLinkSigningKeyVersion',
+  'chainLinkSignatureAlgorithm',
+  'chainLinkSignatureFormat',
+] as const;
+
+/**
+ * AV-2754 — the link fields are all absent (a seal from before BE-2979), or
+ * all five present and well-formed with a format of absent, 1 or 2. Any other
+ * combination is an invalid entry, never a seal that silently cannot bridge.
+ */
+function sealChainLinkFieldsWellFormed(p: BundleSealedPurge): boolean {
+  if (SEAL_CHAIN_LINK_FIELDS.every((k) => p[k] === undefined)) return true;
+  return (
+    decodeBase64Strict(p.chainLinkIn, 32) !== null &&
+    decodeBase64Strict(p.chainLinkOut, 32) !== null &&
+    decodeBase64Strict(p.chainLinkSignature) !== null &&
+    Number.isSafeInteger(p.chainLinkSigningKeyVersion) &&
+    p.chainLinkSigningKeyVersion! >= 1 &&
+    (p.chainLinkSignatureAlgorithm === 'Ed25519' ||
+      p.chainLinkSignatureAlgorithm === 'ECDSA_P256_SHA256') &&
+    (p.chainLinkSignatureFormat === undefined ||
+      p.chainLinkSignatureFormat === 1 ||
+      p.chainLinkSignatureFormat === 2)
+  );
 }
 
 /**
@@ -6014,6 +6164,59 @@ function verifySealedPurgeAuthenticity(
     }
   }
   return verified;
+}
+
+/** AV-2754 — a signed purge-boundary link pair: link(P) → the survivor's `prevRowHash`. */
+interface ChainBridge {
+  linkIn: string;
+  linkOut: string;
+}
+
+/**
+ * AV-2754 (BE-2979) — the bridges `verifyChain` may follow. `seals` MUST be
+ * the output of `verifySealedPurgeAuthenticity` (6-field signature already
+ * verified); of those, a seal bridges only if it carries links AND its link
+ * signature verifies under purpose `retention-seal-link` over
+ * {@link retentionSealLinkMessage}, with key `chainLinkSigningKeyVersion`
+ * present and not REVOKED and the format-2 cutover checked against
+ * `periodEnd` (as for the seal). The envelope names the seal's own
+ * `organizationId`, which `assertSealedPurgesStructure` pinned to the
+ * manifest's org, so a link signed for another org never verifies.
+ */
+function verifySealLinkAuthenticity(
+  seals: BundleSealedPurge[],
+  publicKeys: Map<number, PublicKeyRecord>,
+  cutoverMs: number | null,
+): ChainBridge[] {
+  const bridges: ChainBridge[] = [];
+  for (const p of seals) {
+    // `sealChainLinkFieldsWellFormed` guarantees all-or-none.
+    if (p.chainLinkIn === undefined || p.chainLinkOut === undefined) continue;
+    const entry = publicKeys.get(p.chainLinkSigningKeyVersion!);
+    if (!entry || entry.status === 'REVOKED') continue;
+    const authentic = verifyTenantSignature(
+      p.chainLinkSignatureAlgorithm!,
+      p.chainLinkSignatureFormat,
+      'retention-seal-link',
+      retentionSealLinkMessage({
+        organizationId: p.organizationId,
+        periodStart: p.periodStart,
+        periodEnd: p.periodEnd,
+        rowCount: p.rowCount,
+        rootHash: p.rootHash,
+        chainLinkIn: p.chainLinkIn,
+        chainLinkOut: p.chainLinkOut,
+      }),
+      p.chainLinkSignature!,
+      entry.publicKey,
+      p.periodEnd,
+      cutoverMs,
+    );
+    if (authentic === true) {
+      bridges.push({ linkIn: p.chainLinkIn, linkOut: p.chainLinkOut });
+    }
+  }
+  return bridges;
 }
 
 function assertRowsStructure(rows: BundleRow[], orgId: string): void {

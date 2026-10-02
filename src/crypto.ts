@@ -421,6 +421,8 @@ export const SIGNATURE_PURPOSES = [
   'merkle-supersession',
   'integrity-checkpoint',
   'retention-seal',
+  // AV-2754 (BE-2979) — a sealed purge's boundary chain links.
+  'retention-seal-link',
   'bundle-manifest',
   'approval-decision',
   'permit',

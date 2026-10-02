@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   verifyBundle as verifyBundleStrict,
+  retentionSealLinkMessage,
   type VerifyOptions,
   type VerifyReport,
 } from '../verify.js';
@@ -3934,6 +3935,426 @@ describe('verifyBundle', () => {
       expect(report.manifest.status).toBe('valid');
       expect(report.completeness.status).toBe('valid');
       expect(report.keyBinding.status).toBe('valid');
+    });
+  });
+
+  /**
+   * AV-2754 (BE-2979 AV-1) — a sealed purge deletes a contiguous run of chain
+   * leaves; the successor S keeps `prevRowHash` = link(last purged leaf). A
+   * seal bridges link(P) → S.prevRowHash only when BOTH its 6-field signature
+   * (`retention-seal`) and its link signature (`retention-seal-link`, over the
+   * `praesidia.retention-seal-link.v1` envelope) verify. Fixtures use the
+   * throwaway seed keys of this file; envelopes and the format-2 prefix are
+   * written out literally here, never built with the verifier's helpers.
+   */
+  describe('AV-2754 (BE-2979 AV-1) — a doubly-signed sealed purge bridges the chain gap', () => {
+    const ORG = '00000000-0000-0000-0000-000000000001';
+    const BASE = Date.UTC(2026, 4, 1);
+    const at = (sec: number): string => new Date(BASE + sec * 1000).toISOString();
+    const HOUR = 3600;
+    /** Hour of each chained row: r0 H0, r1 H1, r2 + r3 H2, r4 H3, r5 H4. */
+    const HOUR_OF = [0, 1, 2, 2, 3, 4];
+    const KEY1 = keypairFromSeed(Buffer.alloc(32, 7));
+    const KEY2 = keypairFromSeed(Buffer.alloc(32, 9));
+    const b64 = (u: Uint8Array): string => Buffer.from(u).toString('base64');
+    const ndjson = (xs: unknown[]): Buffer =>
+      gzipDeterministic(Buffer.from(xs.map((x) => JSON.stringify(x)).join('\n') + (xs.length > 0 ? '\n' : ''), 'utf8'));
+
+    type Fmt = 1 | 2 | undefined;
+    /** be's signed bytes: format 2 prepends the ADR-0004 prefix. */
+    const sign = (format: Fmt, purpose: string, payload: Buffer, key: Uint8Array = KEY1.privateKey): string =>
+      signEd25519(format === 2 ? Buffer.concat([Buffer.from(`praesidia:${purpose}:v2\n`, 'ascii'), payload]) : payload, key);
+    const flip = (sig: string): string => {
+      const b = Buffer.from(sig, 'base64');
+      b[0] = (b[0]! + 1) % 256;
+      return b.toString('base64');
+    };
+
+    interface LinkFields {
+      organizationId: string;
+      periodStart: string;
+      periodEnd: string;
+      rowCount: string;
+      rootHash: string;
+      chainLinkIn: string;
+      chainLinkOut: string;
+    }
+    /** The v1 link envelope, written out independently of `retentionSealLinkMessage`. */
+    const linkEnvelope = (f: LinkFields): Buffer =>
+      canonicalJson({
+        version: 'praesidia.retention-seal-link.v1',
+        organizationId: f.organizationId,
+        periodStart: f.periodStart,
+        periodEnd: f.periodEnd,
+        rowCount: f.rowCount,
+        rootHash: f.rootHash,
+        chainLinkIn: f.chainLinkIn,
+        chainLinkOut: f.chainLinkOut,
+      });
+
+    interface SealOpts {
+      id?: string;
+      /** The purged hour the seal covers (its 6-field envelope names that hour's root). */
+      hour: number;
+      /** false = a legacy seal, no link fields. */
+      links?: boolean;
+      chainLinkIn?: string;
+      chainLinkOut?: string;
+      /** Links actually signed, when they differ from the wire values (tamper). */
+      signedLinks?: { chainLinkIn: string; chainLinkOut: string };
+      linkFormat?: Fmt;
+      linkPurpose?: string;
+      linkKeyVersion?: 1 | 2;
+      /** Organization named inside the signed link envelope (the wire keeps ORG). */
+      linkEnvelopeOrg?: string;
+      unsigned?: boolean;
+      tamperSeal?: boolean;
+      tamperLink?: boolean;
+    }
+
+    /**
+     * Six chained rows (HOUR_OF), one Merkle root per hour, the rows of
+     * `purgedHours` removed. `seals` receives link(i) and prev(i) of the full
+     * chain. v7 signs every slot in format 2 with the cutover at `cutover`.
+     */
+    function build(o: {
+      version?: 1 | 7;
+      cutover?: string;
+      purgedHours: number[];
+      seals: (c: { link: (i: number) => string; prev: (i: number) => string }) => SealOpts[];
+      /** Adds a validly signed row whose prevRowHash is link(row i). */
+      forkAfter?: number;
+      key2Status?: 'ACTIVE' | 'REVOKED';
+      post?: (seals: Record<string, unknown>[]) => void;
+    }): Buffer {
+      const v7 = o.version === 7;
+      const fmt: Fmt = v7 ? 2 : undefined;
+      const fmtField = (f: Fmt, key = 'signatureFormat') => (f === 2 ? { [key]: 2 } : {});
+      const rows: Record<string, unknown>[] = [];
+      const leaves: Buffer[] = [];
+      const links: string[] = [];
+      const prevs: string[] = [];
+      const addRow = (id: string, hour: number, minute: number, prevRowHash: string): string => {
+        const signable = {
+          organizationId: ORG, action: 'agent.created', actorId: null, actorType: 'user', resourceType: 'agent',
+          resourceId: id, teamId: null, agentId: null, summary: null, details: null,
+          createdAt: at(hour * HOUR + minute * 60),
+        };
+        const canonical = canonicalJson(signable);
+        const signature = sign(fmt, 'audit-record', Buffer.concat([canonical, Buffer.from(prevRowHash, 'base64')]));
+        rows.push({
+          id, ...signable, signature, keyVersion: 1, signedAt: at(hour * HOUR + minute * 60 + 1), prevRowHash,
+          ...(v7 ? { signatureAlgorithm: 'Ed25519' } : {}), ...fmtField(fmt),
+        });
+        const leaf = Buffer.concat([canonical, Buffer.from(signature, 'base64')]);
+        leaves.push(leaf);
+        return sha256(leaf).toString('base64');
+      };
+      let prev = GENESIS_PREV_ROW_HASH;
+      HOUR_OF.forEach((hour, i) => {
+        prevs.push(prev);
+        prev = addRow(`row-${i}`, hour, i + 1, prev);
+        links.push(prev);
+      });
+      if (o.forkAfter !== undefined) addRow('row-fork', HOUR_OF[o.forkAfter]!, 30, links[o.forkAfter]!);
+
+      const roots: Record<string, unknown>[] = [];
+      const proofs: unknown[] = [];
+      for (let h = 0; h <= HOUR_OF[HOUR_OF.length - 1]!; h++) {
+        const idx = HOUR_OF.flatMap((hh, i) => (hh === h ? [i] : []));
+        const ls = idx.map((i) => new Uint8Array(leaves[i]!));
+        const rootHash = Buffer.from(merkleBuild(ls).root).toString('base64');
+        const env = { rootHash, periodStart: at(h * HOUR), periodEnd: at((h + 1) * HOUR), rowCount: idx.length };
+        roots.push({
+          id: `root-h${h}`, organizationId: ORG, ...env, signature: sign(fmt, 'merkle-root', canonicalJson(env)),
+          keyVersion: 1, signedAt: at((h + 1) * HOUR + 5), anchoredAt: null, anchorReceipt: null,
+          ...(v7 ? { signatureAlgorithm: 'Ed25519' } : {}), ...fmtField(fmt),
+        });
+        if (o.purgedHours.includes(h)) continue;
+        idx.forEach((rowIdx, j) => {
+          const p = merkleProof(ls, j);
+          proofs.push({ rowId: `row-${rowIdx}`, index: p.index, proof: p.siblings.map((s) => b64(s)), rootHash });
+        });
+      }
+      const present = rows.filter((r) => r.id === 'row-fork' || !o.purgedHours.includes(HOUR_OF[Number(String(r.id).slice(4))]!));
+
+      const seals = o.seals({ link: (i) => links[i]!, prev: (i) => prevs[i]! }).map((s) => {
+        const idx = HOUR_OF.flatMap((hh, i) => (hh === s.hour ? [i] : []));
+        const env = {
+          organizationId: ORG, periodStart: at(s.hour * HOUR), periodEnd: at((s.hour + 1) * HOUR),
+          rowCount: String(idx.length), rootHash: roots[s.hour]!.rootHash as string, rekorReceipt: null,
+        };
+        const signature = sign(fmt, 'retention-seal', canonicalJson(env));
+        const wire: Record<string, unknown> = {
+          id: s.id ?? `seal-h${s.hour}`, ...env,
+          ...(s.unsigned
+            ? { signature: null, signingKeyVersion: null, signatureAlgorithm: null }
+            : { signature: s.tamperSeal ? flip(signature) : signature, signingKeyVersion: 1, signatureAlgorithm: 'Ed25519', ...fmtField(fmt) }),
+          deletedAt: at(5 * HOUR + 60), deletedBy: 'user-1', approvalId: `approval-h${s.hour}`,
+        };
+        if (s.links !== false) {
+          const chainLinkIn = s.chainLinkIn ?? prevs[idx[0]!]!;
+          const chainLinkOut = s.chainLinkOut ?? links[idx[idx.length - 1]!]!;
+          const linkFormat = s.linkFormat ?? fmt;
+          const kv = s.linkKeyVersion ?? 1;
+          const chainLinkSignature = sign(
+            linkFormat,
+            s.linkPurpose ?? 'retention-seal-link',
+            linkEnvelope({ ...env, organizationId: s.linkEnvelopeOrg ?? ORG, ...(s.signedLinks ?? { chainLinkIn, chainLinkOut }) }),
+            kv === 2 ? KEY2.privateKey : KEY1.privateKey,
+          );
+          Object.assign(wire, {
+            chainLinkIn, chainLinkOut,
+            chainLinkSignature: s.tamperLink ? flip(chainLinkSignature) : chainLinkSignature,
+            chainLinkSigningKeyVersion: kv, chainLinkSignatureAlgorithm: 'Ed25519',
+            ...fmtField(linkFormat, 'chainLinkSignatureFormat'),
+          });
+        }
+        return wire;
+      });
+      o.post?.(seals);
+
+      const key2 = o.key2Status ? { publicKey: b64(KEY2.publicKey), status: o.key2Status, revokedAt: o.key2Status === 'REVOKED' ? at(-HOUR) : null } : null;
+      const publicKeys: Record<string, unknown> = {
+        1: v7 ? { publicKey: b64(KEY1.publicKey), status: 'ACTIVE', revokedAt: null } : b64(KEY1.publicKey),
+        ...(key2 ? { 2: key2 } : {}),
+      };
+      const keyVersions = [
+        { keyVersion: 1, publicKey: b64(KEY1.publicKey), ...(v7 ? { status: 'ACTIVE', revokedAt: null } : {}) },
+        ...(key2 ? [{ keyVersion: 2, ...(v7 ? key2 : { publicKey: key2.publicKey }) }] : []),
+      ];
+      const manifestSans: Record<string, unknown> = {
+        version: v7 ? 7 : 1, orgId: ORG, from: at(0), to: at(5 * HOUR), rowCount: present.length, rootCount: roots.length,
+        keyVersions, generatedAt: at(5 * HOUR + 30), signatureAlgorithm: 'Ed25519',
+      };
+      if (v7) {
+        Object.assign(manifestSans, {
+          chainSeqCeiling: rows.length, chainSeqSnapshotAt: at(5 * HOUR + 30), integrityCheckpointCount: 0,
+          actionEventCount: 0, captureScopeDigest: sha256(Buffer.from('scope')).toString('hex'),
+          evidenceGradeSummary: { A: 0, B: 0, C: 0, D: 0, enforcementMode: 'observe' },
+          evidencePrivacy: { modes: [{ mode: 'FULL', effectiveFrom: at(0) }], schemaVersion: 1 },
+          signatureFormat: 2, signatureFormatCutoverAt: o.cutover ?? at(0),
+        });
+      }
+      const manifest = { ...manifestSans, signature: sign(fmt, 'bundle-manifest', canonicalJson(manifestSans)), signatureKeyVersion: 1 };
+      return writeZip([
+        { name: 'manifest.json', data: Buffer.from(JSON.stringify(manifest), 'utf8') },
+        { name: 'rows.ndjson.gz', data: ndjson(present) },
+        { name: 'roots.ndjson.gz', data: ndjson(roots) },
+        { name: 'proofs.ndjson.gz', data: ndjson(proofs) },
+        { name: 'public-keys.json', data: Buffer.from(JSON.stringify(publicKeys), 'utf8') },
+        ...(v7
+          ? [
+              { name: 'integrity-checkpoints.ndjson.gz', data: ndjson([]) },
+              { name: 'action-events.ndjson.gz', data: ndjson([]) },
+            ]
+          : []),
+        { name: 'sealed-purges.ndjson.gz', data: ndjson(seals) },
+        { name: 'README.md', data: Buffer.from('# Test bundle\n', 'utf8') },
+      ]);
+    }
+
+    const verify = (zip: Buffer): Promise<VerifyReport> => verifyBundle(zip, { noRekor: true });
+    /** Hour 2 (row-2, row-3) purged and NOT bridged: exactly today's chain verdict. */
+    const GAP = {
+      ok: false, checked: 4, failed: 2, firstFailure: 'row-4',
+      reason: 'prev_row_hash does not chain to previous row',
+    };
+    async function expectGap(zip: Buffer, sealsVerified: number): Promise<void> {
+      const r = await verify(zip);
+      expect(r.bundle.sealedPurgesVerified).toBe(sealsVerified);
+      expect(r.chain).toMatchObject(GAP);
+      expect(r.ok).toBe(false);
+    }
+
+    it('V1: the link envelope v1 equals the golden vector byte-for-byte (BE-2979 BE-1 asserts the same string)', () => {
+      const inputs: LinkFields = {
+        organizationId: '00000000-0000-0000-0000-000000000001',
+        periodStart: '2026-05-01T02:00:00.000Z',
+        periodEnd: '2026-05-01T03:00:00.000Z',
+        rowCount: '2',
+        rootHash: Buffer.alloc(32, 0x33).toString('base64'),
+        chainLinkIn: Buffer.alloc(32, 0x11).toString('base64'),
+        chainLinkOut: Buffer.alloc(32, 0xfb).toString('base64'),
+      };
+      const GOLDEN =
+        '{"chainLinkIn":"ERERERERERERERERERERERERERERERERERERERERERE=",' +
+        '"chainLinkOut":"+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/v7+/s=",' +
+        '"organizationId":"00000000-0000-0000-0000-000000000001",' +
+        '"periodEnd":"2026-05-01T03:00:00.000Z",' +
+        '"periodStart":"2026-05-01T02:00:00.000Z",' +
+        '"rootHash":"MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",' +
+        '"rowCount":"2",' +
+        '"version":"praesidia.retention-seal-link.v1"}';
+      expect(retentionSealLinkMessage(inputs).toString('utf8')).toBe(GOLDEN);
+      // The fixtures below sign exactly these bytes.
+      expect(linkEnvelope(inputs).toString('utf8')).toBe(GOLDEN);
+      expect(cryptoPrimitives.tenantSignedBytes(2, 'retention-seal-link', Buffer.from(GOLDEN, 'utf8')).toString('utf8'))
+        .toBe(`praesidia:retention-seal-link:v2\n${GOLDEN}`);
+    });
+
+    it('V2: a doubly-signed seal bridges link(P) to S.prevRowHash; the bundle verifies', async () => {
+      const r = await verify(build({ purgedHours: [2], seals: () => [{ hour: 2 }] }));
+      expect(r.bundle.sealedPurgesVerified).toBe(1);
+      expect(r.chain).toMatchObject({ ok: true, checked: 3, failed: 0 });
+      expect(r.rootCoverage.ok).toBe(true);
+      expect(r.ok).toBe(true);
+    });
+
+    it('V3: adjacent seals bridge two purged hours, in either file order', async () => {
+      for (const order of [[2, 3], [3, 2]]) {
+        const r = await verify(build({ purgedHours: [2, 3], seals: () => order.map((hour) => ({ hour })) }));
+        expect(r.bundle.sealedPurgesVerified).toBe(2);
+        expect(r.chain).toMatchObject({ ok: true, checked: 2, failed: 0 });
+        expect(r.ok).toBe(true);
+      }
+    });
+
+    it('V3b: a verified bridge leaving the bundle tail (a purge after the range) leaves a passing chain passing', async () => {
+      const r = await verify(build({
+        purgedHours: [],
+        seals: ({ link }) => [{ hour: 2, chainLinkIn: link(5), chainLinkOut: Buffer.alloc(32, 0x44).toString('base64') }],
+      }));
+      expect(r.bundle.sealedPurgesVerified).toBe(1);
+      expect(r.chain).toMatchObject({ ok: true, checked: 5, failed: 0 });
+    });
+
+    it('V4: a tampered link (flipped signature, or links edited after signing) does not bridge', async () => {
+      await expectGap(build({ purgedHours: [2], seals: () => [{ hour: 2, tamperLink: true }] }), 1);
+      await expectGap(build({
+        purgedHours: [2],
+        seals: ({ link }) => [{ hour: 2, signedLinks: { chainLinkIn: link(0), chainLinkOut: link(3) } }],
+      }), 1);
+    });
+
+    it('V5: a flipped 6-field seal signature does not bridge, even with a valid link signature', async () => {
+      await expectGap(build({ purgedHours: [2], seals: () => [{ hour: 2, tamperSeal: true }] }), 0);
+    });
+
+    it('V6: a signed chainLinkIn other than link(P) does not bridge', async () => {
+      // link(row-2) is interior to the purged run, not the predecessor's link.
+      await expectGap(build({ purgedHours: [2], seals: ({ link }) => [{ hour: 2, chainLinkIn: link(2) }] }), 1);
+    });
+
+    it('V7: a row S\' directly after P plus S bridged after P is a fork', async () => {
+      const r = await verify(build({ purgedHours: [2], forkAfter: 1, seals: () => [{ hour: 2 }] }));
+      expect(r.bundle.sealedPurgesVerified).toBe(1);
+      expect(r.chain).toMatchObject({
+        ok: false,
+        firstFailure: 'row-fork',
+        reason: 'chain fork: row row-fork and a sealed-purge bridge both succeed the same link',
+      });
+      expect(r.ok).toBe(false);
+    });
+
+    it('V8: a legacy seal without link fields gives exactly the pre-AV-2754 result', async () => {
+      const r = await verify(build({ purgedHours: [2], seals: () => [{ hour: 2, links: false }] }));
+      expect(r.bundle.sealedPurgesVerified).toBe(1);
+      expect(r.rootCoverage.ok).toBe(true);
+      expect(r.chain).toMatchObject(GAP);
+      expect(r.ok).toBe(false);
+    });
+
+    it('V9: a format-2 link signature under another purpose, or relabelled as format 1, does not bridge', async () => {
+      const control = await verify(build({ version: 7, purgedHours: [2], seals: () => [{ hour: 2 }] }));
+      expect(control.bundle.sealedPurgesVerified).toBe(1);
+      expect(control.chain).toMatchObject({ ok: true, checked: 3 });
+      await expectGap(build({ version: 7, purgedHours: [2], seals: () => [{ hour: 2, linkPurpose: 'retention-seal' }] }), 1);
+      // Signed with the format-2 prefix, wire claims format 1 (no cutover on a v1 manifest).
+      await expectGap(build({
+        purgedHours: [2],
+        seals: () => [{ hour: 2, linkFormat: 2 }],
+        post: (s) => { delete s[0]!.chainLinkSignatureFormat; },
+      }), 1);
+    });
+
+    it('V10: a format-1 link signature at or after the cutover (periodEnd) does not bridge', async () => {
+      const periodEnd = at(3 * HOUR);
+      await expectGap(build({ version: 7, cutover: periodEnd, purgedHours: [2], seals: () => [{ hour: 2, linkFormat: 1 }] }), 1);
+      const before = await verify(build({
+        version: 7, cutover: at(3 * HOUR + 1), purgedHours: [2], seals: () => [{ hour: 2, linkFormat: 1 }],
+      }));
+      expect(before.chain).toMatchObject({ ok: true, checked: 3 });
+    });
+
+    it('V11: a partial or malformed link field set is an invalid entry', async () => {
+      const mutations: Array<[string, (s: Record<string, unknown>) => void]> = [
+        ...['chainLinkIn', 'chainLinkOut', 'chainLinkSignature', 'chainLinkSigningKeyVersion', 'chainLinkSignatureAlgorithm']
+          .map((k): [string, (s: Record<string, unknown>) => void] => [`missing ${k}`, (s) => { delete s[k]; }]),
+        ['31-byte chainLinkIn', (s) => { s.chainLinkIn = Buffer.alloc(31, 1).toString('base64'); }],
+        ['base64url chainLinkOut', (s) => { s.chainLinkOut = String(s.chainLinkOut).replace(/\+/g, '-').replace(/\//g, '_'); }],
+        ['null chainLinkIn', (s) => { s.chainLinkIn = null; }],
+        ['non-base64 signature', (s) => { s.chainLinkSignature = 'not base64!'; }],
+        ['key version 0', (s) => { s.chainLinkSigningKeyVersion = 0; }],
+        ['key version as string', (s) => { s.chainLinkSigningKeyVersion = '1'; }],
+        ['unknown algorithm', (s) => { s.chainLinkSignatureAlgorithm = 'RSA_PKCS1_SHA256'; }],
+        ['format 3', (s) => { s.chainLinkSignatureFormat = 3; }],
+        ['format as string', (s) => { s.chainLinkSignatureFormat = '2'; }],
+      ];
+      for (const [label, mutate] of mutations) {
+        await expect(
+          verify(build({ purgedHours: [2], seals: () => [{ hour: 2 }], post: (s) => mutate(s[0]!) })),
+          label,
+        ).rejects.toThrow(/sealed-purges\.ndjson\.gz has an invalid\/duplicate entry: seal-h2/);
+      }
+      // A lone link field on an otherwise legacy seal is a partial set too.
+      await expect(verify(build({
+        purgedHours: [2], seals: () => [{ hour: 2, links: false }], post: (s) => { s[0]!.chainLinkSignatureFormat = 2; },
+      }))).rejects.toThrow(/invalid\/duplicate entry: seal-h2/);
+      // An explicit format 1 is well-formed.
+      const explicit1 = await verify(build({
+        purgedHours: [2], seals: () => [{ hour: 2 }], post: (s) => { s[0]!.chainLinkSignatureFormat = 1; },
+      }));
+      expect(explicit1.chain.ok).toBe(true);
+    });
+
+    it('V12: a link signed under a REVOKED or absent key version does not bridge', async () => {
+      const active = await verify(build({ purgedHours: [2], key2Status: 'ACTIVE', seals: () => [{ hour: 2, linkKeyVersion: 2 }] }));
+      expect(active.chain).toMatchObject({ ok: true, checked: 3 });
+      const revoked = await verify(build({ purgedHours: [2], key2Status: 'REVOKED', seals: () => [{ hour: 2, linkKeyVersion: 2 }] }));
+      expect(revoked.bundle.sealedPurgesVerified).toBe(1);
+      expect(revoked.chain).toMatchObject(GAP);
+      // Key version 2 is not in the bundle's key set at all.
+      const absent = await verify(build({ purgedHours: [2], seals: () => [{ hour: 2, linkKeyVersion: 2 }] }));
+      expect(absent.bundle.sealedPurgesVerified).toBe(1);
+      expect(absent.chain).toMatchObject(GAP);
+    });
+
+    it('V13: a cycle of signed bridges never bridges the gap and fails closed off the tail', async () => {
+      const x = Buffer.alloc(32, 0x55).toString('base64');
+      await expectGap(build({
+        purgedHours: [2],
+        seals: ({ link }) => [{ hour: 2, chainLinkOut: x }, { id: 'seal-back', hour: 3, chainLinkIn: x, chainLinkOut: link(1) }],
+      }), 2);
+      const tail = await verify(build({
+        purgedHours: [2],
+        seals: ({ link }) => [
+          { hour: 2 },
+          { id: 'seal-out', hour: 3, chainLinkIn: link(5), chainLinkOut: x },
+          { id: 'seal-back', hour: 4, chainLinkIn: x, chainLinkOut: link(5) },
+        ],
+      }));
+      expect(tail.bundle.sealedPurgesVerified).toBe(3);
+      expect(tail.chain.ok).toBe(false);
+      expect(tail.chain.reason).toMatch(/cycle/);
+    });
+
+    it('V14: a link envelope signed for another organization does not bridge', async () => {
+      await expectGap(build({
+        purgedHours: [2], seals: () => [{ hour: 2, linkEnvelopeOrg: '00000000-0000-0000-0000-000000000002' }],
+      }), 1);
+    });
+
+    it('V15: link fields on an unsigned (legacy backfilled) seal do not bridge', async () => {
+      await expectGap(build({ purgedHours: [2], seals: () => [{ hour: 2, unsigned: true }] }), 0);
+    });
+
+    it('V16: two verified seals claiming the same chainLinkIn or chainLinkOut drop both (fail closed)', async () => {
+      await expectGap(build({ purgedHours: [2], seals: () => [{ hour: 2 }, { id: 'seal-h2-dup', hour: 2 }] }), 2);
+      await expectGap(build({
+        purgedHours: [2],
+        seals: ({ link }) => [{ hour: 2 }, { id: 'seal-same-out', hour: 3, chainLinkIn: Buffer.alloc(32, 0x66).toString('base64'), chainLinkOut: link(3) }],
+      }), 2);
     });
   });
 

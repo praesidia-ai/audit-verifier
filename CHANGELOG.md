@@ -51,6 +51,19 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **A doubly-signed sealed purge bridges the hash-chain gap** (AV-2754, be BE-2979).
+  A `sealed-purges.ndjson.gz` entry may now carry the purged run's boundary links
+  (`chainLinkIn`, `chainLinkOut`) signed under the new purpose `retention-seal-link`
+  (`chainLinkSignature`, `chainLinkSigningKeyVersion`, `chainLinkSignatureAlgorithm`,
+  `chainLinkSignatureFormat` when 2) over `canonicalJson({version:
+  "praesidia.retention-seal-link.v1", organizationId, periodStart, periodEnd, rowCount,
+  rootHash, chainLinkIn, chainLinkOut})`. Only a seal whose 6-field seal signature AND
+  link signature both verify with a non-`REVOKED` key bridges the chain across the purged
+  rows. A partial or malformed link field set is an invalid entry (bundle-format error).
+  A bridge that collides with a direct successor fails as a fork, and one that leads back
+  to a walked link fails as a cycle. Seals without link fields and bundles without seals
+  verify exactly as before; any seal that does not pass both signatures leaves the gap
+  failing as before.
 - **Offline RFC 3161 timestamp verification on Merkle roots** (AV-0019). An
   `anchorReceipts` entry with `provider: 'rfc3161'` (base64 DER TimeStampToken,
   produced by be BE-1960) is now verified offline instead of failing as

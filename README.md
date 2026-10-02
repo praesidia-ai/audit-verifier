@@ -445,6 +445,7 @@ Every tenant-key signature carries `signatureFormat` next to its algorithm (abse
 | integrity checkpoint | `integrity-checkpoint` | `signatureFormat` | `asOf` |
 | protected-action event | `protected-action-event` | `signatureFormat` | `receivedAt` |
 | sealed purge (retention seal) | `retention-seal` | `signatureFormat` | `periodEnd` |
+| sealed purge chain links | `retention-seal-link` | `chainLinkSignatureFormat` | the seal's `periodEnd` |
 
 A format-2 signature minted for one purpose does not verify in any other slot.
 
@@ -508,7 +509,15 @@ builds accept an all-zero key with an all-zero signature (AV-2701):
    row missing an in-bundle predecessor, or two rows claiming the same
    predecessor (a fork), fails closed; leading truncation is caught by
    **completeness** (see 7) and per-period trailing truncation is caught
-   by **root coverage** (see 10).
+   by **root coverage** (see 10). The one exception is a sealed retention
+   purge: a row whose `prev_row_hash` is reached from an in-bundle row's
+   link through the signed boundary links of one or more seals
+   (`chainLinkIn` → `chainLinkOut`, invariant 12) is accepted as that
+   row's successor. Only a seal whose own signature AND link signature
+   both verify can bridge. Two such seals sharing a `chainLinkIn` or a
+   `chainLinkOut` bridge nothing. A link with both a direct successor row
+   and a bridge is a fork, and a bridge leading back to a link already
+   walked is a cycle; both fail closed.
 4. **Merkle root signatures** — every root in `roots.ndjson.gz` is
    re-canonicalized and verified.
 5. **Inclusion proofs** — exactly one valid proof into a current root is
@@ -720,6 +729,27 @@ builds accept an all-zero key with an all-zero signature (AV-2701):
     a different period/root than the finding under evaluation is likewise
     not used — a near-miss is not evidence.
 
+    **Chain links (BE-2979).** A seal written by a current `be` also
+    carries the purged run's boundary links: `chainLinkIn` (the first
+    purged row's `prev_row_hash`, i.e. the link of the last row before the
+    purge) and `chainLinkOut` (the link of the last purged row, i.e. the
+    surviving successor's `prev_row_hash`), both base64 of 32 bytes, plus
+    `chainLinkSignature`, `chainLinkSigningKeyVersion`,
+    `chainLinkSignatureAlgorithm` and, for format 2 only,
+    `chainLinkSignatureFormat`. The second signature covers
+    `canonicalJson({version: "praesidia.retention-seal-link.v1",
+    organizationId, periodStart, periodEnd, rowCount, rootHash,
+    chainLinkIn, chainLinkOut})` under purpose `retention-seal-link`. The
+    fields are all absent (older seals, unchanged behaviour) or all
+    present and well-formed; any other combination is an invalid entry
+    and fails the bundle. A seal whose own signature verifies AND whose
+    link signature verifies (key present and not `REVOKED`, format-2
+    cutover checked against `periodEnd`) lets the chain check cross the
+    purged run (invariant 3). Any other seal never bridges, so the chain
+    fails exactly as it did before. A verifier older than 0.11.0 ignores
+    these fields: it still verifies the seal and still fails the chain
+    across the gap, never a false pass.
+
     **Why this entry is unsigned at the manifest level:** the shipped
     verifier's signable set (`verifyManifest`'s `signable` object) is a
     closed field-by-field whitelist keyed by `manifest.version` — an extra
@@ -842,9 +872,12 @@ fields in the same change.
   even computed.
 - The rows form a single, internally consistent hash chain (order-independent
   reconstruction — see invariant 3) with no fork, no orphan, and no broken
-  link, up to one accepted opaque anchor for a date-ranged export.
-- No row or Merkle root has been added, removed from the middle, or had its
-  content altered since it was signed.
+  link, up to one accepted opaque anchor for a date-ranged export. The only
+  gap the chain may cross is a purged run bridged by a sealed purge whose
+  seal and chain-link signatures both verify (invariants 3 and 12).
+- No row or Merkle root has been added, removed from the middle (other than
+  by such a doubly-signed sealed purge), or had its content altered since it
+  was signed.
 - For every Merkle-root period fully inside the bundle's declared date
   range, the number of rows and proofs present matches what that root's own
   signature committed to at anchor time (invariant 10) — this is what lets
