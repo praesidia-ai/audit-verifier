@@ -65,6 +65,7 @@ describe.each([
   ['docs/COMPATIBILITY.md', 6],
   ['docs/ARCHITECTURE.md', 4],
   ['docs/OPERATIONS.md', 2],
+  ['docs/INDEX.md', 5],
 ])('%s citations', (rel, floor) => {
   const text = read(rel);
 
