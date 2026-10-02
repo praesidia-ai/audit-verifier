@@ -1,11 +1,8 @@
 # DESIGN — platform key hierarchy (offline root + rotating operational keys)
 
-MIL-0002 item 3. **Design only — not built.** This is the in-repo copy of record; the original
-was drafted at `.claude/tickets/DESIGN-platform-key-hierarchy.md` (internal ticket tracking,
-not part of this package's Git history) and is mirrored here so it ships with the source tree
-an engineer would actually be looking at, survives ticket-tracking cleanup, and is visible to
-anyone auditing the public repo — not just whoever has access to internal tickets. Keep both in
-sync until DoD 3 sign-off; this file is authoritative if they ever diverge.
+MIL-0002 item 3. **Design only — not built.** This file is the design of record. It ships in
+the npm package so that anyone auditing the verifier can read how platform keys are meant to
+rotate and be revoked.
 
 Building this is a two-repo change (`be` mints/rotates, `audit-verifier` pins/verifies) and
 touches the bundle wire format, so it needs `backend-dev` + `audit-verifier-dev` sign-off before

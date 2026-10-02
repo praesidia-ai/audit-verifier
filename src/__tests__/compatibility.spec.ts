@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const read = (rel: string) => fs.readFileSync(path.join(root, rel), 'utf8');
 const doc = read('docs/COMPATIBILITY.md');
-const pkg = JSON.parse(read('package.json')) as { version: string; engines: { node: string } };
+const pkg = JSON.parse(read('package.json')) as { version: string; engines: { node: string }; files: string[] };
 const maxManifest = Number(/^const MAX_SUPPORTED_MANIFEST_VERSION = (\d+);$/m.exec(read('src/verify.ts'))?.[1]);
 
 const cells = (line: string) => line.split('|').slice(1, -1).map((c) => c.trim());
@@ -82,6 +82,25 @@ describe.each([
 
   it('has no line anchor outside a `path:line` `quote` citation', () => {
     expect(text.replace(CITE, '').match(BARE) ?? []).toEqual([]);
+  });
+});
+
+/**
+ * AV-2769 — a customer gets the npm tarball, not the workspace, so no shipped
+ * file may cite a workspace-internal `.claude/` path. The shipped set is
+ * package.json `files` (directories walked; dist/ is the one the vitest
+ * globalSetup just built) plus package.json, which npm always packs. A
+ * `files` entry that is missing or a glob throws here, so the spec fails.
+ */
+const shipped = (rel: string): string[] =>
+  fs.statSync(path.join(root, rel)).isDirectory()
+    ? fs.readdirSync(path.join(root, rel)).flatMap((name) => shipped(`${rel}/${name}`))
+    : [rel];
+
+describe.each(['package.json', ...pkg.files.flatMap(shipped)])('%s (in the npm tarball)', (rel) => {
+  it('cites no workspace-internal `.claude/` path', () => {
+    const hits = read(rel).split('\n').flatMap((l, i) => (l.includes('.claude/') ? [`${rel}:${i + 1}`] : []));
+    expect(hits).toEqual([]);
   });
 });
 
