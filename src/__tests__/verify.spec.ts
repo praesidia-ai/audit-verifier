@@ -4568,6 +4568,43 @@ describe('verifyBundle', () => {
         expect(setOf([0, 3, 4, 5], { purgedHours: [4], seals: () => [{ hour: 4 }] })).toEqual(CONTINUOUS);
       });
     });
+
+    /**
+     * AV-2757 — documented limit. At a boundary, fork and cycle checks see
+     * only the two end links (left tail, right head), not the rows inside
+     * either bundle. A seal exported by one bundle whose links contradict
+     * rows inside the other is therefore not reported. Every such vector
+     * needs the tenant key to sign contradictory links, and a holder of that
+     * key could sign a clean bridge instead. Indexing the rows' links would
+     * also fail a legitimate set (A1): be exports a seal with every bundle
+     * whose window holds its `deletedAt`, so a pre-purge archive meets the
+     * seal of its own later purge, and `deletedAt` is unsigned, so it cannot
+     * tell the two apart. These tests pin the current verdicts.
+     */
+    describe('AV-2757 — boundary fork/cycle checks see only the two end links (documented limit)', () => {
+      const x = Buffer.alloc(32, 0x88).toString('base64');
+      const pair = (o: Omit<Parameters<typeof build>[0], 'range'>): SetResult =>
+        verifySetOf([build({ ...o, range: [0, 3] }), build({ ...o, range: [3, 5] })]);
+
+      it('D1-D3: a seal link into the interior of the other bundle (fork or cycle) is not seen at the boundary', () => {
+        const interior: Array<[string, Parameters<typeof build>[0]['seals']]> = [
+          ['left seal forks off right-interior link(4)', ({ link }) => [{ hour: 1, chainLinkIn: link(4), chainLinkOut: x }]],
+          ['right seal forks off left-interior link(0)', ({ link }) => [{ hour: 4, chainLinkIn: link(0), chainLinkOut: x }]],
+          ['left seal from the right tail back to left-interior link(0)', ({ link }) => [{ hour: 1, chainLinkIn: link(5), chainLinkOut: link(0) }]],
+        ];
+        for (const [label, seals] of interior) {
+          expect(pair({ purgedHours: [], seals }), label).toEqual(CONTINUOUS);
+        }
+      });
+
+      it('A1: a pre-purge archive plus a later export carrying that purge\'s seal is continuous', () => {
+        // The seal's chainLinkIn, link(1), is still declared by row-2 in the archive.
+        expect(verifySetOf([
+          build({ purgedHours: [], seals: () => [], range: [0, 3] }),
+          build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 4 }], range: [3, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+    });
   });
 
   /**

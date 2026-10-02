@@ -4722,6 +4722,17 @@ function nextDeclaredLink(
  * bundle's head row) is a fork and a bridge back to a walked link is a
  * cycle; both carry a reason. Only the two endpoint links are visible here;
  * each bundle's own `verifyChain` holds its bridges against its row links.
+ *
+ * AV-2757 — documented limit, kept on purpose: a bridge from one bundle that
+ * forks off, or cycles back to, a row link inside the OTHER bundle is not
+ * seen here. Such a bridge needs two valid tenant-key signatures, and a
+ * holder of that key can sign a clean bridge anyway, so it adds no attack.
+ * Indexing the other bundle's row links would also report a false fork: be
+ * exports a seal with every bundle whose window holds its `deletedAt`, so a
+ * pre-purge archive meets the seal of its own later purge, and `deletedAt`
+ * is unsigned, so nothing tells that apart from a contradiction. The index
+ * would cost about 170 bytes per row (about 41 MiB at the 250k-row limit),
+ * held for every bundle in the set. Pinned by the AV-2757 tests.
  */
 export function verifyChainBoundary(
   tailLink: string,
