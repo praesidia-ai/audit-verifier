@@ -269,6 +269,19 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   link signatures both verify. …`, and `… is not genesis-rooted — chain fork: …` /
   `— chain cycle: …`. Only link-bearing seals (this release) change a verdict, so
   existing bundles and sets verify as before.
+- **A proven quiet window no longer makes `verify-set` `bundle_incomplete`** (AV-2759).
+  A bundle with zero rows and no evidence component `valid` is `incomplete` on its own
+  (AV-0008), so a set of archives spanning one quiet hour could never be `continuous`.
+  This applies to manifest v1-v4 only: be exports v6/v7 today, whose signed action-event
+  and grade counts already make an empty bundle `valid`. The signed chain now proves the
+  window empty: a verified stitch across the empty bundle, or a passing genesis check
+  before the earliest bundle with rows, shows that no row was chained in it, so the set
+  no longer counts it. The bundle keeps its own `incomplete` status in `bundles[]`, and
+  single-bundle verdicts are unchanged. A trailing empty bundle, a set with no rows, or
+  an empty bundle with a component left `incomplete` still makes the set
+  `bundle_incomplete`. A truncated or forged empty bundle is `bundle_invalid` as before.
+  No new status, finding kind, reason text or exit code; the exit 3 help line gained a
+  parenthesis.
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command
   every `be` audit package's `verification.txt` and the ui proof page tell the auditor
   to run, but the CLI only knew `<bundle.zip>`, `verify-set` and `aibom`, so it exited 2
@@ -306,6 +319,12 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `npm pack` builds, including one whose ECDSA check is a no-op.
 
 ### Compatibility
+- AV-2759 is a **scoped strictness relaxation at set level**, from `bundle_incomplete`
+  (exit 3) to `continuous` (exit 0). It applies only to a `verify-set` whose
+  zero-evidence empty bundles (manifest v1-v4) are each spanned by a verified chain
+  stitch or the genesis check. Per-bundle statuses, single-bundle `verify` and every
+  other set verdict are unchanged. It narrows the `verify-set` half of the AV-0008 note
+  below.
 - AV-2750 tightens verification only for a build whose embedded DER and fingerprint
   disagree, which `check:trust-anchor-ci` and `prepack` already refuse to build. No bundle
   changes verdict under a consistent pin, `--platform-key` or `--trust-anchor`.

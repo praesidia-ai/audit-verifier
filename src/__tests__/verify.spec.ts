@@ -4494,8 +4494,9 @@ describe('verifyBundle', () => {
      * transparent: each bundle with rows is stitched to the previous bundle
      * with rows through the bridges of every bundle in between, and the
      * genesis check applies to the earliest bundle with rows. A zero-row,
-     * zero-root bundle is itself `incomplete` (README), so a set holding a
-     * quiet window is `bundle_incomplete` (exit 3) when nothing else is wrong.
+     * zero-root bundle is itself `incomplete` (README); AV-2759: the set
+     * proves it quiet when a stitch or the genesis check spans it, and only a
+     * trailing quiet window keeps the set `bundle_incomplete` (exit 3).
      */
     describe('AV-2756 — verify-set checks chain continuity across empty bundles', () => {
       /** One bundle per window [hours[i], hours[i + 1]), written as bundle-<i>.zip. */
@@ -4518,8 +4519,8 @@ describe('verifyBundle', () => {
       });
 
       it('E3: with no gap, an empty middle bundle adds no finding', () => {
-        // Hour 2 is a quiet window: nothing was ever written in it.
-        expect(setOf([0, 2, 3, 6], { hourOf: [0, 1, 3, 3, 4, 5], purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        // Hour 2 is a quiet window: nothing was ever written in it (AV-2759: the stitch proves it).
+        expect(setOf([0, 2, 3, 6], { hourOf: [0, 1, 3, 3, 4, 5], purgedHours: [], seals: () => [] })).toEqual(CONTINUOUS);
       });
 
       it('E4: a doubly-signed sealed purge that empties the middle bundle bridges its neighbours', () => {
@@ -4536,7 +4537,7 @@ describe('verifyBundle', () => {
         const erased = setOf([0, 2, 3, 4, 5], { purgedHours: [], erasedHours: [2, 3], seals: () => [] });
         expectBoundaryBreak(erased, /\(across empty bundle\(s\) \S*bundle-1\.zip, \S*bundle-2\.zip\)/);
         expect(erased.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 3 });
-        expect(setOf([0, 2, 3, 4, 7], { hourOf: [0, 1, 4, 4, 5, 6], purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        expect(setOf([0, 2, 3, 4, 7], { hourOf: [0, 1, 4, 4, 5, 6], purgedHours: [], seals: () => [] })).toEqual(CONTINUOUS);
         // One bridge exported by each empty bundle: link(1) -> link(3) -> link(4).
         expect(setOf([0, 2, 3, 4, 5], { purgedHours: [2, 3], seals: () => [{ hour: 2 }, { hour: 3 }] })).toEqual(CONTINUOUS);
       });
@@ -4550,8 +4551,8 @@ describe('verifyBundle', () => {
           rightIndex: 1,
           reason: expect.stringMatching(/^earliest bundle with rows in this set \(\S*bundle-1\.zip, after empty bundle\(s\) \S*bundle-0\.zip\) is not genesis-rooted/),
         }]);
-        // A quiet window before the history starts adds no finding.
-        expect(setOf([-1, 0, 3, 5], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        // A quiet window before the history starts adds no finding (AV-2759: the genesis check proves it).
+        expect(setOf([-1, 0, 3, 5], { purgedHours: [], seals: () => [] })).toEqual(CONTINUOUS);
         // Hour 0 purged under a legacy seal (no links): the same verdict whether or not an empty bundle
         // holds the purged window. A doubly-signed linked seal bridges the genesis check (AV-2758).
         for (const [hours, firstWithRows] of [[[0, 1, 5], 1], [[0, 3, 5], 0]] as const) {
@@ -4562,6 +4563,7 @@ describe('verifyBundle', () => {
       });
 
       it('E7: trailing empty bundles add no finding', () => {
+        // Nothing after it is chained, so nothing proves the trailing window quiet (AV-2759).
         expect(setOf([0, 3, 5, 6], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
         expect(setOf([0, 3, 4, 5], { purgedHours: [4], seals: () => [{ hour: 4 }] })).toEqual(CONTINUOUS);
       });
@@ -4644,6 +4646,57 @@ describe('verifyBundle', () => {
           build({ purgedHours: [], seals: () => [], range: [0, 5] }),
         ]);
         expectNotGenesis(r, 1, /is not genesis-rooted — chain fork/);
+      });
+    });
+
+    /**
+     * AV-2759 — a zero-row, zero-root bundle is `incomplete` on its own
+     * (AV-0008): its signed manifest says the window was empty, but nothing
+     * in it shows that no rows were deleted before the export. In a set the
+     * signed chain does: a stitch across it (or the genesis check, before the
+     * earliest bundle with rows) proves no row was ever chained in its window.
+     * A proven quiet window no longer makes the set `bundle_incomplete`;
+     * truncated or unsigned emptiness never passes, and nothing proves a
+     * trailing window, or a set with no rows at all, quiet.
+     */
+    describe('AV-2759 — a quiet window the set proves empty does not make it bundle_incomplete', () => {
+      const QUIET: SetResult = { code: 3, status: 'bundle_incomplete', findings: [] };
+      const none = { purgedHours: [], seals: () => [] };
+      /** Hour 2 quiet: bundle-1 [2, 3) is empty. */
+      const quietHour2 = { ...none, hourOf: [0, 1, 3, 3, 4, 5] };
+      /** `zip` with every entry passed through `edit` after export. */
+      const rezip = (zip: Buffer, edit: (e: { name: string; data: Buffer }) => { name: string; data: Buffer }): Buffer =>
+        writeZip(readZip(zip).map(edit));
+
+      it('Q1: a manifest v5+ quiet window is valid on its own (signed zero action-event and grade counts)', () => {
+        // AV-0008: those counts are evidence, so only a v1-v4 quiet window needs the set's proof.
+        const v7 = { ...quietHour2, version: 7 as const };
+        expect(verifySetOf([build({ ...v7, range: [0, 2] }), build({ ...v7, range: [2, 3] }), build({ ...v7, range: [3, 6] })]))
+          .toEqual(CONTINUOUS);
+      });
+
+      it('C1: a bundle truncated after export is invalid, never a quiet window', () => {
+        // Hour 2 holds row-2 and row-3; bundle-1's rows, root and proofs are stripped, its signed manifest kept.
+        const strip = new Set(['rows.ndjson.gz', 'roots.ndjson.gz', 'proofs.ndjson.gz']);
+        const truncated = rezip(build({ ...none, range: [2, 3] }), (e) => (strip.has(e.name) ? { ...e, data: ndjson([]) } : e));
+        expect(verifySetOf([build({ ...none, range: [0, 2] }), truncated, build({ ...none, range: [3, 5] })]))
+          .toMatchObject({ code: 1, status: 'bundle_invalid' });
+      });
+
+      it('C2: an empty bundle whose manifest signature does not verify is invalid, never a quiet window', () => {
+        // (A manifest with no signature at all is a bundle format error, exit 2.)
+        const forged = rezip(build({ ...quietHour2, range: [2, 3] }), (e) => {
+          if (e.name !== 'manifest.json') return e;
+          const manifest = JSON.parse(e.data.toString('utf8')) as Record<string, unknown>;
+          manifest.signature = flip(manifest.signature as string);
+          return { ...e, data: Buffer.from(JSON.stringify(manifest), 'utf8') };
+        });
+        expect(verifySetOf([build({ ...quietHour2, range: [0, 2] }), forged, build({ ...quietHour2, range: [3, 6] })]))
+          .toMatchObject({ code: 1, status: 'bundle_invalid' });
+      });
+
+      it('C3: a set with no rows at all proves nothing quiet', () => {
+        expect(verifySetOf([build({ ...none, range: [-3, -2] }), build({ ...none, range: [-2, -1] })])).toEqual(QUIET);
       });
     });
 

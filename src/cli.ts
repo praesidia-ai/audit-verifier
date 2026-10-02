@@ -194,7 +194,8 @@ EXIT CODES (verify-set)
   2   I/O or bundle-format error (including: fewer than 2 bundles supplied,
       or bundles that do not share one organizationId).
   3   status: bundle_incomplete — no bundle invalid, no discontinuity found,
-      but at least one bundle's own evidence was insufficient to decide.
+      but at least one bundle's own evidence was insufficient to decide
+      (an empty bundle a verified chain check spans is not counted).
   4   status: discontinuous   — every bundle individually verifies, but the
       set has a named gap, overlap, forged boundary, or non-genesis first
       bundle (AUDIT-03).
@@ -808,8 +809,9 @@ function buildVerifySetReport(
   const findings: ContinuityFinding[] = [];
 
   const bundleInvalid = sorted.some((e) => e.report.status === 'invalid');
-  const bundleIncomplete = sorted.some((e) => e.report.status === 'incomplete');
   const bundleUnanchored = sorted.some((e) => e.report.status === 'unanchored');
+  /** AV-2759 — indices of empty bundles a verified chain check spans (see `bundleIncomplete`). */
+  const provenQuiet = new Set<number>();
 
   // AUDIT-03 — the earliest bundle in a set an auditor is treating as the
   // complete history must be genesis-rooted. An opaque anchor there means
@@ -850,6 +852,8 @@ function buildVerifySetReport(
               'sealed-purge bridges whose seal and link signatures both verify. Either an earlier bundle is ' +
               'missing from this set, or the chain has been tampered with.'),
       });
+    } else {
+      for (let k = 0; k < firstWithRows; k++) provenQuiet.add(k);
     }
   }
 
@@ -928,9 +932,24 @@ function buildVerifySetReport(
                 `declared chain-head anchor${across} — the boundary is date-adjacent but not ` +
                 'cryptographically continuous (adjacent-but-forged boundary)',
         });
+      } else {
+        for (let k = stitchFrom + 1; k <= i; k++) provenQuiet.add(k);
       }
     }
   }
+
+  // AV-2759 — a zero-row bundle with no evidence component `valid` is
+  // `incomplete` on its own (AV-0008: its signed manifest says the window
+  // was empty, but not that no rows were deleted before the export). A
+  // verified stitch across it, or the genesis check before the earliest
+  // bundle with rows, proves that no row was ever chained in its window, so
+  // the set does not count it. Only that case: a component left incomplete
+  // still counts, and nothing proves a trailing empty bundle quiet.
+  const bundleIncomplete = sorted.some(
+    (e, k) =>
+      e.report.status === 'incomplete' &&
+      !(provenQuiet.has(k) && Object.values(e.report.proofs).every((p) => p === 'pass' || p === 'not_present')),
+  );
 
   const status: VerifySetReport['status'] = bundleInvalid
     ? 'bundle_invalid'

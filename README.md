@@ -225,6 +225,14 @@ It sorts the given bundles by their manifest `from`, then asserts:
   between, and the genesis check applies to the earliest bundle with rows.
   Rows deleted under an empty bundle are a `boundary_chain_mismatch` (or
   `chain_head_not_genesis`) finding naming the empty bundles, never silence.
+  An empty bundle with no evidence component `valid` (a manifest v1-v4
+  quiet window) is `incomplete` on its own; a verified stitch across it, or
+  a passing genesis check before the earliest bundle with rows, proves no
+  row was chained in its window, so it does not make the set
+  `bundle_incomplete` (AV-2759). It keeps its own `incomplete` status in
+  `bundles[]`. Nothing proves a trailing empty bundle, or a set without
+  rows, quiet, and an empty bundle with a component left `incomplete`
+  still counts.
 
 Known limit (AV-2757): the boundary check sees the two end links of each
 boundary, not the rows inside the bundles. A seal from one bundle whose
@@ -244,7 +252,8 @@ to "just a gap". Exit codes let a script tell the three outcomes apart:
 2   I/O or bundle-format error (including fewer than 2 bundles, or bundles
     that do not share one organizationId).
 3   status: bundle_incomplete — no bundle invalid, no discontinuity found,
-    but at least one bundle's own evidence was insufficient to decide.
+    but at least one bundle's own evidence was insufficient to decide
+    (an empty bundle a verified chain check spans is not counted).
 4   status: discontinuous   — every bundle individually verifies, but the
     set has a named gap, overlap, forged boundary, or non-genesis first
     bundle.

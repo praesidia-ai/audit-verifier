@@ -7,8 +7,8 @@ exactly that line, or when a `src/` anchor has no quote. `README.md` line anchor
 ## `src/` layout
 
 - `src/cli.ts` — entrypoint and flag parsing. `runCli` dispatches on the first argument: to
-  `src/cli.ts:1110` `async function main(` for one bundle (no subcommand, or `verify`), to
-  `src/cli.ts:1039` `async function mainVerifySet(` for `verify-set`, or to `mainAibom` for `aibom`.
+  `src/cli.ts:1129` `async function main(` for one bundle (no subcommand, or `verify`), to
+  `src/cli.ts:1058` `async function mainVerifySet(` for `verify-set`, or to `mainAibom` for `aibom`.
 - `src/verify.ts` — `src/verify.ts:1465` `export async function verifyBundle(` is the bundle
   verification pipeline: signatures, Merkle proofs, chain continuity. `verifyChainBoundary` is the
   cross-bundle boundary rule that `verify-set` uses (SCAN2-004).
@@ -40,12 +40,12 @@ exactly that line, or when a `src/` anchor has no quote. `README.md` line anchor
 
 ## Verification pipeline (high level)
 
-`src/cli.ts:1110` `async function main(` reads the CLI flags and the bundle file, and calls
+`src/cli.ts:1129` `async function main(` reads the CLI flags and the bundle file, and calls
 `src/verify.ts:1465` `export async function verifyBundle(`. That function is the load-bearing
 piece described in the README's "What it verifies" section (`audit-verifier/README.md:116-411`):
 per-row signature checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless
 `--no-rekor`) Rekor receipt verification via `src/rekor.ts:648` `export function verifyRekorReceipt(`.
-`src/cli.ts:1039` `async function mainVerifySet(` is the newer cross-bundle continuity entrypoint
+`src/cli.ts:1058` `async function mainVerifySet(` is the newer cross-bundle continuity entrypoint
 (`verify-set`, SCAN2-004) that checks chain fields are present across a *set* of bundles rather
 than one — it fails closed when chain fields are absent (pinned by a dedicated test, `f13793e`).
 
