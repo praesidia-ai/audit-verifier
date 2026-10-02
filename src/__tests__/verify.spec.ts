@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   verifyBundle as verifyBundleStrict,
+  verifyBundleAndBridges,
   retentionSealLinkMessage,
   type VerifyOptions,
   type VerifyReport,
@@ -4846,6 +4847,167 @@ describe('verifyBundle', () => {
         expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 2 });
         // Control: the quiet window with the same later export stays continuous.
         expect(setOf([0, 3, 5, 6], QUIET_TAIL)).toEqual(CONTINUOUS);
+      });
+    });
+
+    /**
+     * AV-2775 — the mirror of AV-2757 A1. A later export of the LEFT window
+     * carries the seal of a purge whose rows a pre-purge archive of the right
+     * window still holds: the bridge leaves the right bundle's head anchor and
+     * lands on one of the right bundle's own row links. Both paths reach the
+     * same row, so this is no fork. A bridge out of the head anchor to any
+     * other link stays a fork (AV-2755 C4, AV-2758 C4, F1-F3 below), and the
+     * rev2-av tamper sets T1-T8 (tickets/REVIEW-EUFIX-audit-verifier-r2.md)
+     * stay rejected.
+     */
+    describe('AV-2775 — a post-purge left export beside a pre-purge right archive is no fork', () => {
+      const setOf = (hours: number[], o: Omit<Parameters<typeof build>[0], 'range'>): Buffer[] =>
+        hours.slice(1).map((to, i) => build({ ...o, range: [hours[i]!, to] }));
+      const gunzipLines = (b: Buffer): Record<string, unknown>[] =>
+        zlib.gunzipSync(b).toString('utf8').split('\n').filter((l) => l.length > 0).map((l) => JSON.parse(l) as Record<string, unknown>);
+      const entry = (zip: Buffer, name: string): Buffer => readZip(zip).find((e) => e.name === name)!.data;
+      /** A pre-purge archive: every row still present, no seal yet. */
+      const ARCHIVE = { purgedHours: [], seals: () => [] };
+
+      it('M1 (T9): hour 2 purged after the right window was archived, the seal exported with the left window', () => {
+        expect(verifySetOf([
+          build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }),
+          build({ ...ARCHIVE, range: [2, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('M2 (T11): two purged hours, both seals exported with the left window', () => {
+        expect(verifySetOf([
+          build({ purgedHours: [2, 3], seals: () => [{ hour: 2, deletedHour: 1 }, { hour: 3, deletedHour: 1 }], range: [0, 2] }),
+          build({ ...ARCHIVE, range: [2, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('M3: the purged run ends on the right bundle\'s newest row', () => {
+        // link(3), the seal's chainLinkOut, is the middle archive's tail link; no row of it declares that link.
+        expect(verifySetOf([
+          build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }),
+          build({ ...ARCHIVE, range: [2, 3] }),
+          build({ ...ARCHIVE, range: [3, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('M4 (T10): the genesis mirror, the oldest hour\'s seal exported by an empty leading bundle', () => {
+        expect(verifySetOf([
+          build({ purgedHours: [0], seals: () => [{ hour: 0, deletedHour: -1 }], range: [-1, 0] }),
+          build({ ...ARCHIVE, range: [0, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('B1 (memory bound): a bundle returns only the asked-for links that are its row links, and none unasked', async () => {
+        let link!: (i: number) => string;
+        const zip = build({ purgedHours: [], seals: (c) => { link = c.link; return []; }, range: [2, 5] });
+        expect((await verifyBundleAndBridges(zip, { noRekor: true })).rowLinks).toEqual(new Set());
+        // Rows 2-5 are in the bundle: link(0) is not, nor is an arbitrary value.
+        const query = new Set([link(0), link(3), link(5), Buffer.alloc(32, 0x99).toString('base64')]);
+        expect((await verifyBundleAndBridges(zip, { noRekor: true }, query)).rowLinks).toEqual(new Set([link(3), link(5)]));
+      });
+
+      it('F1: a bridge out of the right head anchor back to a LEFT row link is still a fork', () => {
+        // Hour 2 is quiet; the empty middle bundle exports a seal (deletedAt in its window) bridging link(1) to link(0).
+        const o = { hourOf: [0, 1, 3, 3, 4, 5], purgedHours: [], seals: ({ link }: { link: (i: number) => string }) => [
+          { hour: 5, deletedHour: 2, chainLinkIn: link(1), chainLinkOut: link(0) },
+        ] };
+        const r = verifySetOf(setOf([0, 2, 3, 4], o));
+        expectBoundaryBreak(r, /across empty bundle\(s\) \S*bundle-1\.zip\) boundary: chain fork/);
+        expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 2 });
+      });
+
+      it('F2 (documented limit): a purged run that ends in a LATER bundle than the right one stays a fork', () => {
+        // One row per hour; the seal bridges link(1) to link(3), past the right archive [2, 3) into the next one.
+        const hourOf = [0, 1, 2, 3, 4, 5];
+        const r = verifySetOf([
+          build({ hourOf, purgedHours: [2, 3], seals: ({ link }) => [{ hour: 2, deletedHour: 1, chainLinkOut: link(3) }], range: [0, 2] }),
+          build({ hourOf, ...ARCHIVE, range: [2, 3] }),
+          build({ hourOf, ...ARCHIVE, range: [3, 5] }),
+        ]);
+        expectBoundaryBreak(r, /chain fork/);
+        expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 1 });
+      });
+
+      it('F3: a right bundle that carries the bridge out of its own head row is bundle_invalid', () => {
+        const r = verifySetOf([
+          build({ ...ARCHIVE, range: [0, 2] }),
+          build({ purgedHours: [], seals: () => [{ hour: 2, deletedHour: 4 }], range: [2, 5] }),
+        ]);
+        expect(r).toMatchObject({ code: 1, status: 'bundle_invalid' });
+      });
+
+      it('T1: a dropped middle bundle that had rows, a sealed purge elsewhere in the set, is a date_gap', () => {
+        const [a, , c] = setOf([0, 2, 3, 5], { purgedHours: [3], seals: () => [{ hour: 3 }] });
+        const r = verifySetOf([a!, c!]);
+        expect(r.code).toBe(4);
+        expect(r.findings.map((f) => f.kind)).toContain('date_gap');
+      });
+
+      it('T2: rows erased with no seal under an empty v7 middle bundle break the boundary', () => {
+        expectBoundaryBreak(
+          verifySetOf(setOf([0, 2, 3, 5], { version: 7, purgedHours: [], erasedHours: [2], seals: () => [] })),
+          /across empty bundle/,
+        );
+      });
+
+      it('T3: rows dropped next to a sealed run are caught in one bundle, at a boundary and across an empty bundle', async () => {
+        const o = { purgedHours: [2], erasedHours: [3], seals: () => [{ hour: 2 }] };
+        const one = await verify(build({ ...o, range: [0, 5] }));
+        expect(one.chain.ok).toBe(false);
+        expect(one.ok).toBe(false);
+        expectBoundaryBreak(verifySetOf(setOf([0, 3, 5], o)));
+        expectBoundaryBreak(verifySetOf(setOf([0, 2, 4, 5], o)), /across empty bundle/);
+      });
+
+      it('T4: the same set in reverse order gives the same finding', () => {
+        const r = verifySetOf(setOf([0, 2, 3, 5], { purgedHours: [], erasedHours: [2], seals: () => [] }).reverse());
+        expect(r).toMatchObject({ code: 4, status: 'discontinuous' });
+        expect(r.findings).toHaveLength(1);
+        expect(r.findings[0]).toMatchObject({ kind: 'boundary_chain_mismatch', leftIndex: 0, rightIndex: 2 });
+      });
+
+      it('T5a: a forged purge, the 6-field signature copied into the link-signature slot, never bridges', () => {
+        const reuse = (s: Record<string, unknown>[]) => { for (const x of s) x.chainLinkSignature = x.signature; };
+        expectBoundaryBreak(verifySetOf(setOf([0, 2, 3, 5], { purgedHours: [2], seals: () => [{ hour: 2 }], post: reuse })), /across empty bundle/);
+        expectBoundaryBreak(verifySetOf(setOf([0, 3, 5], { purgedHours: [2], seals: () => [{ hour: 2 }], post: reuse })));
+      });
+
+      it('T5b: a genuine seal replayed into a pre-purge archive whose purged rows were then cut is invalid', async () => {
+        const later = build({ purgedHours: [2], seals: () => [{ hour: 2 }], range: [0, 5] });
+        const cut = new Set(['row-2', 'row-3']);
+        const tampered = writeZip(readZip(build({ ...ARCHIVE, range: [0, 5] })).map((e) => {
+          if (e.name === 'rows.ndjson.gz') return { ...e, data: ndjson(gunzipLines(e.data).filter((r) => !cut.has(r.id as string))) };
+          if (e.name === 'proofs.ndjson.gz') return { ...e, data: ndjson(gunzipLines(e.data).filter((p) => !cut.has(p.rowId as string))) };
+          if (e.name === 'sealed-purges.ndjson.gz') return { ...e, data: entry(later, 'sealed-purges.ndjson.gz') };
+          return e;
+        }));
+        const r = await verify(tampered);
+        expect(r.bundle.sealedPurgesVerified).toBe(1);
+        expect(r.ok).toBe(false);
+        expect(r.status).toBe('invalid');
+      });
+
+      it('T6: the oldest hour sealed and the next erased with no seal is not genesis-rooted, for both window splits', () => {
+        const o = { purgedHours: [0], erasedHours: [1], seals: () => [{ hour: 0 }] };
+        for (const hours of [[0, 1, 5], [0, 2, 5]]) {
+          const r = verifySetOf(setOf(hours, o));
+          expect(r, hours.join(',')).toMatchObject({ code: 4, status: 'discontinuous' });
+          expect(r.findings.map((f) => f.kind)).toEqual(['chain_head_not_genesis']);
+        }
+      });
+
+      it('T7: the genesis bundle dropped, a later purge\'s seal carried by the new first bundle, is not genesis-rooted', () => {
+        const [, b] = setOf([0, 2, 5], { purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 3 }] });
+        const r = verifySetOf([b!, build({ purgedHours: [2], seals: () => [], range: [5, 6] })]);
+        expect(r.findings.map((f) => f.kind)).toContain('chain_head_not_genesis');
+      });
+
+      it('T8: a v1 empty middle bundle over erased rows stays discontinuous, and so does a window exported twice', () => {
+        expect(verifySetOf(setOf([0, 2, 3, 5], { purgedHours: [], erasedHours: [2], seals: () => [] })).code).toBe(4);
+        const [a, b, c] = setOf([0, 2, 3, 6], { purgedHours: [], seals: () => [], hourOf: [0, 1, 3, 3, 4, 5] });
+        expect(verifySetOf([a!, b!, b!, c!]).code).toBe(4);
       });
     });
   });

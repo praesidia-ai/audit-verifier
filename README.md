@@ -206,7 +206,7 @@ It sorts the given bundles by their manifest `from`, then asserts:
   hours is crossed by the boundary rule below (AV-2758): the head may be
   reached from the genesis anchor through seals, exported by that bundle
   or an empty bundle before it, whose own signature AND link signature
-  both verify; a bridge out of a genesis head is a fork;
+  both verify; a bridge out of a genesis head is a fork, as below;
 - every adjacent pair's date range is exactly contiguous — a gap or an
   overlap is reported as a named finding, never silently accepted;
 - every adjacent pair's boundary is cryptographically continuous — the
@@ -215,10 +215,10 @@ It sorts the given bundles by their manifest `from`, then asserts:
   bundle is still caught, not just a date gap. A sealed retention purge
   that falls exactly on the boundary is crossed by the same rule as inside
   one bundle (invariants 3 and 12): only through seals, from either bundle,
-  whose own signature AND link signature both verify. A seal exported in
-  both bundles counts once. A bridge beside the right bundle's head row is
-  a fork, and a bridge leading back to a link already walked is a cycle;
-  both are a `boundary_chain_mismatch` finding naming that reason;
+  whose own signature AND link signature both verify, once each. A bridge
+  beside the right bundle's head row is a fork, unless it lands on a row of
+  that bundle (a later purge, AV-2775); one back to a walked link is a
+  cycle. Both are a `boundary_chain_mismatch` finding naming the reason;
 - an empty bundle (no rows) has no chain link of its own and is looked
   through (AV-2756): each bundle with rows is stitched to the previous
   bundle with rows by the rule above, through the seals of every bundle in
@@ -238,14 +238,14 @@ It sorts the given bundles by their manifest `from`, then asserts:
   set is `continuous` (exit 0), exactly as for a quiet window. See
   `docs/OPERATIONS.md` for the conditions and what an auditor can do.
 
-Known limit (AV-2757): the boundary check sees the two end links of each
-boundary, not the rows inside the bundles. A seal from one bundle whose
-signed links fork off, or loop back to, a row inside the other bundle is
-not reported by `verify-set`. Such a seal must be signed twice with the
-tenant key, and whoever holds that key can sign a clean bridge instead.
-Checking against every row would also wrongly reject a valid set: an
-archive exported before a purge, next to a later export that carries
-that purge's seal.
+Known limit (AV-2757): at each boundary `verify-set` sees the two end
+links, and asks the right bundle's rows only where a bridge out of its
+head lands. A seal from one bundle whose signed links fork off, or loop
+back to, a row inside the other bundle is not reported: it must be signed
+twice with the tenant key, whose holder can sign a clean bridge instead.
+Checking every row would wrongly reject a valid set: a pre-purge archive
+next to a later export carrying that purge's seal. Known limit (AV-2775):
+a purged run that two pre-purge archives split between them is a fork.
 
 A bundle that is itself invalid is reported as such and never downgraded
 to "just a gap". Exit codes let a script tell the three outcomes apart:

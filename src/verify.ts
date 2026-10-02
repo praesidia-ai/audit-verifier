@@ -1474,12 +1474,15 @@ export async function verifyBundle(
  * AV-2755 — `verifyBundle`, plus the sealed-purge bridges whose seal AND link
  * signatures verified (the ones its chain check may follow), for
  * `verify-set`'s boundary check. Not re-exported by `index.ts`; `report` is
- * exactly `verifyBundle`'s.
+ * exactly `verifyBundle`'s. AV-2775: `rowLinks` holds the members of
+ * `rowLinkQuery` that are chain links of this bundle's rows, so it never
+ * holds more than the query, however many rows the bundle has.
  */
 export async function verifyBundleAndBridges(
   bundle: Buffer,
   options: VerifyOptions = {},
-): Promise<{ report: VerifyReport; chainBridges: ChainBridge[] }> {
+  rowLinkQuery: ReadonlySet<string> = new Set(),
+): Promise<{ report: VerifyReport; chainBridges: ChainBridge[]; rowLinks: Set<string> }> {
   const resourceLimits = resolveResourceLimits(options.resourceLimits);
 
   // 1) Read & validate the zip envelope.
@@ -1690,6 +1693,13 @@ export async function verifyBundleAndBridges(
   // link signatures both verify.
   const chainBridges = verifySealLinkAuthenticity(verifiedSeals, publicKeys, cutoverMs);
   const chainRaw = verifyChain(rows, chainBridges);
+  const rowLinks = new Set<string>();
+  if (rowLinkQuery.size > 0) {
+    for (const row of rows) {
+      const link = computeChainLink(row);
+      if (link !== null && rowLinkQuery.has(link)) rowLinks.add(link);
+    }
+  }
   const chainResult = withEvidenceStatus({
     ok: chainRaw.ok,
     checked: chainRaw.checked,
@@ -1932,7 +1942,7 @@ export async function verifyBundleAndBridges(
         : {}),
     },
   };
-  return { report: { ...report, proofs: deriveProofs(report) }, chainBridges };
+  return { report: { ...report, proofs: deriveProofs(report) }, chainBridges, rowLinks };
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -4718,33 +4728,43 @@ function nextDeclaredLink(
 /**
  * AV-2755 — `verify-set`'s boundary between two date-adjacent bundles, under
  * `verifyChain`'s bridge rules. `tailLink` is the left bundle's
- * `chainTailLinkHash`, `headAnchor` the right bundle's `chainHeadAnchor`,
- * `bridges` both bundles' `chainBridges` (a seal exported by both counts
- * once, by id). Continuous when the tail link is the head anchor or reaches
- * it through bridges. A bridge out of the head anchor (beside the right
- * bundle's head row) is a fork and a bridge back to a walked link is a
- * cycle; both carry a reason. Only the two endpoint links are visible here;
- * each bundle's own `verifyChain` holds its bridges against its row links.
+ * `chainTailLinkHash` (GENESIS_PREV_ROW_HASH for the genesis check),
+ * `headAnchor` the right bundle's `chainHeadAnchor`, `bridges` the
+ * `chainBridges` of every bundle from the left one to the right one (for the
+ * genesis check, of the bundles up to the earliest one with rows). A seal
+ * exported by several of them counts once, by (sealId, linkIn, linkOut).
+ * Continuous when the tail link is the head anchor or reaches it through
+ * bridges. A bridge back to a walked link is a cycle. A bridge out of the
+ * head anchor (beside the right bundle's head row) is a fork, unless it lands
+ * on one of `rightRowLinks`, the right bundle's own row links (AV-2775): that
+ * is a purge of rows the right bundle still holds, its seal exported after
+ * the right bundle with a bundle on the left. Fork and cycle carry a reason.
+ * Each bundle's own `verifyChain` holds its bridges against its row links, so
+ * a right bundle that carries a bridge out of its own head row is invalid.
  *
  * AV-2757 — documented limit, kept on purpose: a bridge from one bundle that
  * forks off, or cycles back to, a row link inside the OTHER bundle is not
  * seen here. Such a bridge needs two valid tenant-key signatures, and a
  * holder of that key can sign a clean bridge anyway, so it adds no attack.
  * Indexing the other bundle's row links would also report a false fork: be
- * exports a seal with every bundle whose window holds its `deletedAt`, so a
- * pre-purge archive meets the seal of its own later purge, and `deletedAt`
- * is unsigned, so nothing tells that apart from a contradiction. The index
- * would cost about 170 bytes per row (about 41 MiB at the 250k-row limit),
- * held for every bundle in the set. Pinned by the AV-2757 tests.
+ * exports a seal with every bundle whose window its purged period overlaps or
+ * holds its `deletedAt`, so a pre-purge archive meets the seal of its own
+ * later purge, and `deletedAt` is unsigned, so nothing tells that apart from
+ * a contradiction. The index would cost about 170 bytes per row (about 41 MiB
+ * at the 250k-row limit), held for every bundle in the set. Pinned by the
+ * AV-2757 tests. `rightRowLinks` is no such index: it holds only the
+ * `linkOut`s of bridges out of the head anchor that are row links.
  */
 export function verifyChainBoundary(
   tailLink: string,
   headAnchor: string,
   bridges: readonly ChainBridge[],
+  rightRowLinks: ReadonlySet<string> = new Set(),
 ): { ok: boolean; reason?: string } {
   const unique = new Map(bridges.map((b) => [JSON.stringify([b.sealId, b.linkIn, b.linkOut]), b]));
   const bridgeOut = bridgeSuccessors([...unique.values()]);
-  if (bridgeOut.has(headAnchor)) {
+  const outOfHead = bridgeOut.get(headAnchor);
+  if (outOfHead !== undefined && !rightRowLinks.has(outOfHead)) {
     return {
       ok: false,
       reason: "chain fork: the right bundle's leading row and a sealed-purge bridge both succeed the same link",

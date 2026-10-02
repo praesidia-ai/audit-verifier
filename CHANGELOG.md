@@ -275,6 +275,18 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   and `signature.content` is the root's signature, valid over them under the root's key.
   `docs/ARCHITECTURE.md` cites that README line next to the code that enforces it, so the
   compatibility spec goes red if either drifts. Documentation only; no verdict changes.
+- **`verify-set` no longer reads a purge after an archive as a chain fork** (AV-2775). A
+  later export of the left window carries the seal of a purge whose rows a pre-purge
+  archive of the right window still holds. Its bridge leaves the right bundle's head
+  anchor and lands on one of that bundle's rows, and `verify-set` reported a fork (exit 4,
+  `boundary_chain_mismatch`, or `chain_head_not_genesis` at the genesis check). Such a
+  bridge out of the head anchor is now a fork only when it lands on no row of the right
+  bundle. To learn that, `verify-set` reads a bundle a bridge leaves the head of a second
+  time, requires the same SHA-256 (else exit 2), and keeps only the links it asked for:
+  what it holds grows with the bridges in the set, never with the rows. A bridge to any
+  other link (a left row, an unknown link, a row of a later bundle) is still a fork. The
+  comments on `verifyChainBoundary` and the genesis check now state be's seal export rule
+  (period overlaps the window, or `deletedAt` falls in it) and the dedupe key.
 - **`verify-set`'s genesis check follows doubly-signed sealed-purge bridges** (AV-2758).
   The earliest bundle with rows had to start at `GENESIS_PREV_ROW_HASH`, so every set
   whose oldest hours were legitimately seal-purged read `chain_head_not_genesis`
@@ -345,6 +357,12 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   for a signed root, because Rekor rejects it (HTTP 400), so no anchored archive changes
   verdict. Receipts be submits from BE-3074 on fail `body_root_mismatch` under 0.10.0,
   which has the old binding; verify them with 0.11.0 or later.
+- AV-2775 is a **scoped strictness relaxation at set level**, from `discontinuous`
+  (exit 4) to `continuous` (exit 0). It applies only where a verified bridge leaves the
+  right bundle's head anchor (or the genesis link) and lands on one of that bundle's own
+  rows. Single-bundle `verify`, per-bundle statuses, exit codes and finding kinds are
+  unchanged, and every other fork stays a fork. A purged run that two pre-purge archives
+  split between them still reads as a fork (README, "Known limit (AV-2775)").
 - AV-2759 is a **scoped strictness relaxation at set level**, from `bundle_incomplete`
   (exit 3) to `continuous` (exit 0). It applies only to a `verify-set` whose
   zero-evidence empty bundles (manifest v1-v4) are each spanned by a verified chain

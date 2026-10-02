@@ -795,13 +795,23 @@ interface VerifySetReport {
 }
 
 /**
+ * One verified bundle of a set: its report, the sealed-purge bridges its
+ * chain check may follow, and which of the links verify-set asked about are
+ * its row links (AV-2775; empty unless a bridge leaves its head anchor).
+ */
+interface VerifySetEntry {
+  path: string;
+  report: VerifyReport;
+  chainBridges: readonly ChainBridge[];
+  rowLinks: ReadonlySet<string>;
+}
+
+/**
  * Sorts the given bundles' reports by manifest `from` and cross-checks
  * every adjacent pair. Pure function over already-computed `VerifyReport`s
  * so it is trivially testable and never re-parses a bundle.
  */
-function buildVerifySetReport(
-  entries: ReadonlyArray<{ path: string; report: VerifyReport; chainBridges: readonly ChainBridge[] }>,
-): VerifySetReport {
+function buildVerifySetReport(entries: ReadonlyArray<VerifySetEntry>): VerifySetReport {
   const sorted = [...entries].sort(
     (a, b) => Date.parse(a.report.bundle.from) - Date.parse(b.report.bundle.from),
   );
@@ -826,16 +836,23 @@ function buildVerifySetReport(
   // history before the set, so its head is checked like a boundary by
   // `verifyChainBoundary`: reached through doubly-signed bridges (a purge
   // of the oldest hours) is genesis-rooted, a bridge out of a genesis head
-  // is a fork. Only bridges of the bundles up to this one count: be exports
-  // a seal with every bundle its purged period overlaps, and a later export
-  // of an old purge would otherwise fork a pre-purge archive's genesis row.
+  // is a fork unless it lands on one of this bundle's own row links
+  // (AV-2775). Only bridges of the bundles up to this one count: be also
+  // exports a seal with every bundle whose window holds its `deletedAt`, so
+  // a later export of an old purge could otherwise fork a pre-purge
+  // archive's genesis row.
   const firstWithRows = sorted.findIndex((e) => e.report.bundle.rowsSeen > 0);
   const first = sorted[firstWithRows]?.report;
   if (first !== undefined && first.status !== 'invalid') {
     const head = first.bundle.chainHeadAnchor;
     const genesis =
       typeof head === 'string'
-        ? verifyChainBoundary(GENESIS_PREV_ROW_HASH, head, sorted.slice(0, firstWithRows + 1).flatMap((e) => e.chainBridges))
+        ? verifyChainBoundary(
+            GENESIS_PREV_ROW_HASH,
+            head,
+            sorted.slice(0, firstWithRows + 1).flatMap((e) => e.chainBridges),
+            sorted[firstWithRows]!.rowLinks,
+          )
         : { ok: false };
     if (!genesis.ok) {
       const leading = sorted.slice(0, firstWithRows).map((e) => e.path);
@@ -916,7 +933,7 @@ function buildVerifySetReport(
       const head = right.report.bundle.chainHeadAnchor;
       const boundary =
         typeof tail === 'string' && typeof head === 'string'
-          ? verifyChainBoundary(tail, head, sorted.slice(stitchFrom, i + 2).flatMap((e) => e.chainBridges))
+          ? verifyChainBoundary(tail, head, sorted.slice(stitchFrom, i + 2).flatMap((e) => e.chainBridges), right.rowLinks)
           : { ok: false };
       if (!boundary.ok) {
         const empties = sorted.slice(stitchFrom + 1, i + 1).map((e) => e.path);
@@ -1076,8 +1093,12 @@ async function mainVerifySet(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const entries: Array<{ path: string; report: VerifyReport; chainBridges: ChainBridge[] }> = [];
-  for (const bundlePath of args.bundlePaths) {
+  // Reads and verifies one bundle; null (exit 2) on a read or format error.
+  // AV-2775: with `query`, a second look that must see the bytes the first
+  // one verified (`digest`) and learns which of `query` are row links.
+  const entries: VerifySetEntry[] = [];
+  const digests: string[] = [];
+  const look = async (bundlePath: string, query?: ReadonlySet<string>, digest?: string) => {
     let buffer: Buffer;
     try {
       buffer = await readBundleFileBounded(path.resolve(bundlePath));
@@ -1085,17 +1106,44 @@ async function mainVerifySet(argv: string[]): Promise<number> {
       process.stderr.write(
         `error: cannot read bundle ${bundlePath}: ${(err as Error).message}\n`,
       );
-      return 2;
+      return null;
+    }
+    const sha = crypto.createHash('sha256').update(buffer).digest('hex');
+    if (digest !== undefined && sha !== digest) {
+      process.stderr.write(`error: cannot read bundle ${bundlePath}: it changed while verify-set was reading it\n`);
+      return null;
     }
     try {
-      const { report, chainBridges } = await verifyBundleAndBridges(buffer, options);
-      entries.push({ path: bundlePath, report, chainBridges });
+      return { sha, ...(await verifyBundleAndBridges(buffer, options, query)) };
     } catch (err) {
       process.stderr.write(
         `error: bundle format error in ${bundlePath}: ${(err as Error).message}\n`,
       );
-      return 2;
+      return null;
     }
+  };
+  for (const bundlePath of args.bundlePaths) {
+    const seen = await look(bundlePath);
+    if (seen === null) return 2;
+    entries.push({ path: bundlePath, report: seen.report, chainBridges: seen.chainBridges, rowLinks: seen.rowLinks });
+    digests.push(seen.sha);
+  }
+  // A bridge out of a bundle's head anchor is no fork when it lands on that
+  // bundle's own row links (`verifyChainBoundary`). The bridges come from
+  // every bundle, so only a bundle some bridge leaves the head of is looked
+  // at again, and only the links asked for are kept: what verify-set holds
+  // grows with the bridges in the set, never with the rows.
+  const outsOf = new Map<string, Set<string>>();
+  for (const b of entries.flatMap((e) => e.chainBridges)) {
+    outsOf.set(b.linkIn, (outsOf.get(b.linkIn) ?? new Set<string>()).add(b.linkOut));
+  }
+  for (const [i, entry] of entries.entries()) {
+    const head = entry.report.bundle.chainHeadAnchor;
+    const query = head === undefined ? undefined : outsOf.get(head);
+    if (query === undefined) continue;
+    const seen = await look(entry.path, query, digests[i]);
+    if (seen === null) return 2;
+    entry.rowLinks = seen.rowLinks;
   }
 
   // A gap/overlap/boundary comparison across two different orgs is

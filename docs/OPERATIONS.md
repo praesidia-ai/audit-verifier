@@ -70,7 +70,7 @@ SLSA attestation binding the tarball to the exact GitHub Actions run/commit that
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `README.md:379` `## Verdict shape`, `src/verify.ts` |
-| `verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1058` `async function mainVerifySet(`; `f13793e` pins this behavior |
+| `verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1075` `async function mainVerifySet(`; `f13793e` pins this behavior |
 | Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:685` `export function verifyRekorReceipt(` |
 | `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `README.md:1088` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve` |
 | Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` `export const MAX_ZIP_` |
