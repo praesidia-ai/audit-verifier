@@ -53,6 +53,21 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `rekor_integrated_time_out_of_window`. Roots that carry a receipt but record no
   anchor time keep their (unbounded-above) legacy behaviour, so archives anchored
   by a later backfill run still verify.
+- **A Rekor receipt must bind the bytes the root signature covers** (AV-2771, in
+  lockstep with be BE-3074). Rekor's `hashedrekord` checks `spec.signature.content`
+  over `spec.data.hash` as a prehash. be signs the root envelope, not the bare Merkle
+  root, so a log only accepts an entry whose `data.hash` is the SHA-256 of the signed
+  bytes. Those bytes are the canonical JSON
+  `{"periodEnd":…,"periodStart":…,"rootHash":…,"rowCount":…}`, prefixed with
+  `praesidia:merkle-root:v2\n` for a format-2 root. The verifier used to require
+  `data.hash` = hex(`rootHash`), the shape be submitted before BE-3074, which no Rekor
+  accepts. It now rebuilds the signed bytes with the code the root-signature check
+  uses and requires `data.hash` to be their SHA-256 and `signature.content` to be the
+  root's signature (else `body_root_mismatch`). That signature must also verify over
+  those bytes under the root's key (else `body_signature_invalid`). A root whose key
+  version is not in `public-keys.json` fails `root_key_unavailable`; an unknown
+  `signatureFormat` fails `expected_root_malformed`. AIBOM anchor step A8 applies the
+  same binding.
 - **The platform attestation is now bound to the export it vouches for**
   (SEC-2026-09-12 MCPSDK-01). `issuedAt` may not precede `manifest.generatedAt`
   by more than 24h (`attestation_predates_manifest`). Attestations carrying the
@@ -319,6 +334,11 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `npm pack` builds, including one whose ECDSA check is a no-op.
 
 ### Compatibility
+- AV-2771 **tightens** Rekor receipt verification. A receipt whose `data.hash` is
+  hex(`rootHash`) now fails `body_root_mismatch`. No genuine log can hold such an entry
+  for a signed root, because Rekor rejects it (HTTP 400), so no anchored archive changes
+  verdict. Receipts be submits from BE-3074 on fail `body_root_mismatch` under 0.10.0,
+  which has the old binding; verify them with 0.11.0 or later.
 - AV-2759 is a **scoped strictness relaxation at set level**, from `bundle_incomplete`
   (exit 3) to `continuous` (exit 0). It applies only to a `verify-set` whose
   zero-evidence empty bundles (manifest v1-v4) are each spanned by a verified chain

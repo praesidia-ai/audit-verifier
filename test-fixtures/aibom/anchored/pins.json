@@ -1,10 +1,10 @@
 {
   "trustedKeyFingerprints": [
-    "dd514ec082411e168a4b17f975641a40abe663791ec4a65c9d2e7bebc0dc120f"
+    "78b3c249b9b7d31f0997a5a8865997bb7a5aa27db4d1f87567b12c8e467ded0f"
   ],
   "rekorPublicKeysPem": [
-    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEiNfNmy0gMYAF21DVlusz2RpdzdUz\njy0B+zQ4aXDRPMdmj3hJO4mZf1s0j/L7+yZmWRjs2zNJWSSxgXsjpqtQpA==\n-----END PUBLIC KEY-----\n",
-    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOvPkVRuFakKAfVpc4IvJv2e3bpSz\nt3e6Hguh9B7K636qR32I9uA4aIPFIvTQ52SgpaxKHvPBtgCAz6aA9NYjJw==\n-----END PUBLIC KEY-----\n",
-    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEpuBfMsNs3labtj3JVIzWl4dsZxNk\nKD81gApBN2CKM5sGZuam66kVSPeefAvNxis/X75VHaXn4x6AsVrBiz+Dog==\n-----END PUBLIC KEY-----\n"
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE16cxfNFB8YRdDCaYabdTmPUuqeAd\nb2BSEj4Istf+F4BJ/djREBanljembOMr8NZxHpMlXY6eZT1nvmePn0X+CQ==\n-----END PUBLIC KEY-----\n",
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQ5t8hmEdA268fb4ccCrkjiVgulvW\nFol6Rhiv2W3BmzN2dM9BoogqY0CJDZooVkyizqCeTzy6R1rLHdv/cOsUkg==\n-----END PUBLIC KEY-----\n",
+    "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECgUw3GC6DrYufp9zHVAFIePYr13H\nwGOwl+/QSvwfZVGgVD0cceTTefll5HLTuv6hgt09JN6mmuLXUjAuUT1j2Q==\n-----END PUBLIC KEY-----\n"
   ]
 }

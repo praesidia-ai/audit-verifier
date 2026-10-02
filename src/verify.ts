@@ -80,6 +80,7 @@ import {
   sha256,
   verifySignature,
   tenantSignedBytes,
+  merkleRootEnvelope,
   type BundleSignatureAlgorithm,
   type SignaturePurpose,
   merkleVerify,
@@ -1785,7 +1786,9 @@ export async function verifyBundleAndBridges(
     : withStatus({ ok: true, checked: 0, failed: 0 }, 'unsupported');
 
   // 7) Optional Rekor fetch.
-  const rekorResult = withEvidenceStatus(await verifyRekorReceipts(roots, options));
+  const rekorResult = withEvidenceStatus(
+    await verifyRekorReceipts(roots, options, publicKeys, manifest.signatureAlgorithm),
+  );
 
   // 8) AUDIT-2026-05-30 — Platform key-binding attestation.
   // The entry remains optional in the ZIP grammar for backwards parsing,
@@ -4787,12 +4790,7 @@ function verifyRootSignatures(
     }
     // Mirror the writer's envelope exactly — see MerkleRootService
     // (AGV-033) `computeRootForPeriod`.
-    const bytes = canonicalJson({
-      rootHash: root.rootHash,
-      periodStart: root.periodStart,
-      periodEnd: root.periodEnd,
-      rowCount: root.rowCount,
-    });
+    const bytes = merkleRootEnvelope(root);
     // AUDIT-2026-05-01 — Per-root algorithm dispatch with manifest
     // fallback (mirrors `verifyRowSignatures`). A bundle whose history
     // straddles a substrate cutover ships roots of both algorithms;
@@ -5092,6 +5090,8 @@ function unrootedStubFailure(
 async function verifyRekorReceipts(
   roots: BundleRoot[],
   options: VerifyOptions,
+  publicKeys: Map<number, PublicKeyRecord>,
+  manifestAlgorithm: BundleSignatureAlgorithm,
 ): Promise<RawComponentResult> {
   if (roots.length === 0) {
     return {
@@ -5158,7 +5158,7 @@ async function verifyRekorReceipts(
       checked += 1;
       let result: { ok: boolean; reason?: string };
       try {
-        result = await verifyAnchorReceipt(root, entry, options);
+        result = await verifyAnchorReceipt(root, entry, options, publicKeys, manifestAlgorithm);
       } catch (err) {
         result = {
           ok: false,
@@ -5281,6 +5281,8 @@ async function verifyAnchorReceipt(
   root: BundleRoot,
   entry: AnchorReceiptEntry,
   options: VerifyOptions,
+  publicKeys: Map<number, PublicKeyRecord>,
+  manifestAlgorithm: BundleSignatureAlgorithm,
 ): Promise<{ ok: boolean; reason?: string }> {
   if (typeof entry.receipt !== 'string' || entry.receipt.length === 0) {
     return { ok: false, reason: 'empty_receipt' };
@@ -5312,9 +5314,19 @@ async function verifyAnchorReceipt(
       const ok = await options.rekorFetcher(entry.receipt, expectedRoot);
       return ok ? { ok: true } : { ok: false, reason: 'rekor_fetch_failed' };
     }
+    // AV-2771 — the binding verifies the logged signature under the root's
+    // key, with the same algorithm dispatch as `verifyRootSignatures`.
+    const rootKey = publicKeys.get(root.keyVersion);
+    if (!rootKey) return { ok: false, reason: 'root_key_unavailable' };
     return verifyRekorReceipt(entry.receipt, options.rekorPublicKeyPem, {
       rootHashB64: root.rootHash,
+      periodStart: root.periodStart,
+      periodEnd: root.periodEnd,
+      rowCount: root.rowCount,
+      ...(root.signatureFormat !== undefined ? { signatureFormat: root.signatureFormat } : {}),
       signatureB64: root.signature,
+      signatureAlgorithm: root.signatureAlgorithm ?? manifestAlgorithm,
+      publicKey: rootKey.publicKey,
       // SEC-2026-09-12 (MCPSDK-01) — hand the root's own time window to the
       // receipt verifier so Rekor's signed `integratedTime` bounds it.
       signedAt: root.signedAt,

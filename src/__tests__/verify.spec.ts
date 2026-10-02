@@ -2079,6 +2079,15 @@ describe('verifyBundle', () => {
       const rootHash = opts?.unrelatedRoot
         ? Buffer.alloc(32, 0xee).toString('base64')
         : fixtureRoot.rootHash;
+      // AV-2771 (be BE-3074) — Rekor verifies the signature over `data.hash`
+      // as a prehash, so a genuine entry logs SHA-256 of the bytes the root
+      // signature covers (this fixture's roots are format 1: no prefix).
+      const rootSignedBytes = canonicalJson({
+        rootHash,
+        periodStart: fixtureRoot.periodStart,
+        periodEnd: fixtureRoot.periodEnd,
+        rowCount: fixtureRoot.rowCount,
+      });
       const body = Buffer.from(
         JSON.stringify({
           apiVersion: '0.0.1',
@@ -2087,7 +2096,7 @@ describe('verifyBundle', () => {
             data: {
               hash: {
                 algorithm: 'sha256',
-                value: Buffer.from(rootHash, 'base64').toString('hex'),
+                value: sha256(rootSignedBytes).toString('hex'),
               },
             },
             signature: {

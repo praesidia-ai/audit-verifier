@@ -71,15 +71,17 @@ function rootOver(rows: Json[], withReceipt: boolean): Json {
     helper.canonicalizeRow(helper.buildSignableRow(r)), Buffer.from(r.signature, 'base64'),
   ])));
   const rootHash = Buffer.from(cu.merkleBuild(leaves).root).toString('base64');
-  const signature = cu.signEd25519(canonicalJson({
+  const rootMessage = canonicalJson({
     rootHash, periodStart: PERIOD_START.toISOString(), periodEnd: PERIOD_END.toISOString(), rowCount: rows.length,
-  }), tenantKey.privateKey);
+  });
+  const signature = cu.signEd25519(rootMessage, tenantKey.privateKey);
   const rekor = buildRekorFixture({
     integratedTime: Date.parse(LOG_TIME) / 1000,
     body: JSON.stringify({
       apiVersion: '0.0.1', kind: 'hashedrekord',
       spec: {
-        data: { hash: { algorithm: 'sha256', value: Buffer.from(rootHash, 'base64').toString('hex') } },
+        // AV-2771 (be BE-3074) — SHA-256 of the bytes the root signature covers (format 1).
+        data: { hash: { algorithm: 'sha256', value: crypto.createHash('sha256').update(rootMessage).digest('hex') } },
         signature: { content: signature, publicKey: { content: 'cGs=' } },
       },
     }),
@@ -129,7 +131,7 @@ async function exportAnchored(opts: { commitment?: boolean; redacted?: boolean; 
   };
   const unused = {};
   const service = new AibomService(
-    unused, unused, unused, { findOne: async () => snapshot }, unused, unused,
+    unused, unused, unused, { findOne: async () => snapshot }, unused, unused, unused,
     { findOne: async () => ({ id: SYSTEM_ID }) }, proof, undefined, auditService,
   );
   return (await service.exportSnapshot(ORG, SYSTEM_ID, 'snap-1', 'attested')).bytes as Buffer;

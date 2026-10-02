@@ -23,15 +23,25 @@
  * hostile intermediary cannot swap it; sovereign/private Rekor instances
  * (or tests) supply their own key via `VerifyOptions.rekorPublicKeyPem`.
  *
- *   4. Decode the hashedrekord body and bind its digest and signature to
- *      the exact Merkle root being verified. A genuine unrelated Rekor
- *      receipt therefore cannot be reattached to another bundle root.
+ *   4. Decode the hashedrekord body and bind it to the exact Merkle root
+ *      being verified (AV-2771): `data.hash` must be SHA-256 of the bytes
+ *      the root signature covers (format prefix + canonical root envelope),
+ *      `signature.content` must be the root's signature, and that signature
+ *      must verify over those bytes under the root's key. A genuine unrelated
+ *      Rekor receipt therefore cannot be reattached to another bundle root.
  *   5. SEC-2026-09-12 (MCPSDK-01) — bind the log's SIGNED `integratedTime`
  *      to the root's self-asserted `signedAt`/`anchoredAt` window, so a
  *      freshly-anchored forgery cannot claim an old period.
  */
 
 import * as crypto from 'node:crypto';
+
+import {
+  merkleRootEnvelope,
+  tenantSignedBytes,
+  verifySignature,
+  type BundleSignatureAlgorithm,
+} from './crypto.js';
 
 // Public Rekor v1 limits uploaded attestations to 100 KiB. Leave ample room
 // for the SET, inclusion proof, and private-instance metadata while still
@@ -137,9 +147,22 @@ interface NormalizedEntry {
 
 export type RekorVerifyResult = { ok: boolean; reason?: string };
 
+/**
+ * The root a receipt must bind (AV-2771). The envelope fields and
+ * `signatureFormat` rebuild the bytes the root signature covers; the
+ * receipt's `data.hash` must be their SHA-256.
+ */
 export interface ExpectedRekorRoot {
   rootHashB64: string;
+  periodStart: string;
+  periodEnd: string;
+  rowCount: number;
+  /** AV-0018 — 1 or 2; absent = 1. Anything else fails `expected_root_malformed`. */
+  signatureFormat?: number;
   signatureB64: string;
+  signatureAlgorithm: BundleSignatureAlgorithm;
+  /** The root's key as `public-keys.json` carries it (SPKI DER for ECDSA, raw 32 bytes for Ed25519). */
+  publicKey: Uint8Array;
   /**
    * SEC-2026-09-12 (MCPSDK-01) — the root's own `signedAt` (ISO-8601).
    * A genuine transparency-log entry for this root CANNOT have been
@@ -532,8 +555,9 @@ function verifyBodyBinding(
 ): RekorVerifyResult {
   const bodyBytes = decodeCanonicalBase64(bodyB64);
   const rootHash = decodeCanonicalBase64(expected.rootHashB64);
+  const format = expected.signatureFormat === undefined ? 1 : expected.signatureFormat;
   if (bodyBytes === null) return { ok: false, reason: 'body_unparseable' };
-  if (rootHash === null || rootHash.length !== 32) {
+  if (rootHash === null || rootHash.length !== 32 || (format !== 1 && format !== 2)) {
     return { ok: false, reason: 'expected_root_malformed' };
   }
   let decoded: unknown;
@@ -560,11 +584,24 @@ function verifyBodyBinding(
   ) {
     return { ok: false, reason: 'body_binding_malformed' };
   }
+  // AV-2771 (be BE-3074) — Rekor verifies `signature.content` over
+  // `data.hash` as a prehash, so the only entry a genuine log accepts for
+  // this root carries the SHA-256 of the bytes the root signature covers.
+  const signedBytes = tenantSignedBytes(format, 'merkle-root', merkleRootEnvelope({
+    rootHash: expected.rootHashB64,
+    periodStart: expected.periodStart,
+    periodEnd: expected.periodEnd,
+    rowCount: expected.rowCount,
+  }));
   if (
-    hash.value.toLowerCase() !== rootHash.toString('hex') ||
+    hash.value.toLowerCase() !== sha256(signedBytes).toString('hex') ||
     signature.content !== expected.signatureB64
   ) {
     return { ok: false, reason: 'body_root_mismatch' };
+  }
+  // The logged signature is the root's own; it must verify under the root key.
+  if (!verifySignature(expected.signatureAlgorithm, signedBytes, signature.content, expected.publicKey)) {
+    return { ok: false, reason: 'body_signature_invalid' };
   }
   return { ok: true };
 }

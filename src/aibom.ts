@@ -26,7 +26,8 @@
  * for the receipt. Verdicts and reasons equal be's own offline verifier.
  */
 import {
-  canonicalJson, decodeBase64Strict, merkleVerify, sha256, verifySignature, type BundleSignatureAlgorithm,
+  canonicalJson, decodeBase64Strict, merkleRootEnvelope, merkleVerify, sha256, verifySignature,
+  type BundleSignatureAlgorithm,
 } from './crypto.js';
 import { computeRekorLogIdHex, resolvePinnedRekorPem, verifyRekorReceipt } from './rekor.js';
 import type { VerifyReport } from './verify.js';
@@ -266,8 +267,11 @@ function checkAnchorProof(proof: unknown, env: AnchorContext, options: AibomVeri
   }
   // A7
   const rootSignature = at(p, 'rootSignature') as string;
-  const rootMessage = canonicalJson({ rootHash: rootHashB64, periodStart: at(p, 'periodStart'), periodEnd: at(p, 'periodEnd'), rowCount });
-  if (!verifySignature(at(p, 'rootSignatureAlgorithm') as BundleSignatureAlgorithm, rootMessage, rootSignature, rootKey)) {
+  const periodStart = at(p, 'periodStart') as string;
+  const periodEnd = at(p, 'periodEnd') as string;
+  const rootAlgorithm = at(p, 'rootSignatureAlgorithm') as BundleSignatureAlgorithm;
+  const rootMessage = merkleRootEnvelope({ rootHash: rootHashB64, periodStart, periodEnd, rowCount });
+  if (!verifySignature(rootAlgorithm, rootMessage, rootSignature, rootKey)) {
     return unanchored('anchor_root_signature_invalid');
   }
   // A8-A9 — be's `classifyRootAnchorReceipts` over the proof's receipts only (no legacy columns).
@@ -287,7 +291,11 @@ function checkAnchorProof(proof: unknown, env: AnchorContext, options: AibomVeri
     const pem = resolvePem(parsed.logId);
     const verdict = pem === null
       ? { ok: false, reason: 'unknown_log_id' }
-      : verifyRekorReceipt(receipt as string, pem, { rootHashB64, signatureB64: rootSignature });
+      : verifyRekorReceipt(receipt as string, pem, {
+        // AV-2771 — A7 verified the root signature as format 1 over this envelope.
+        rootHashB64, periodStart, periodEnd, rowCount, signatureFormat: 1,
+        signatureB64: rootSignature, signatureAlgorithm: rootAlgorithm, publicKey: rootKey,
+      });
     if (!verdict.ok) {
       firstFailure ??= verdict.reason ?? 'anchor_proof_malformed';
       continue;

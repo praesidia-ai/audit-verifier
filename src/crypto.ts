@@ -445,6 +445,26 @@ export function tenantSignedBytes(
   return Buffer.concat([Buffer.from(`praesidia:${purpose}:v2\n`, 'ascii'), payload]);
 }
 
+/**
+ * The `merkle-root` payload, as be's `MerkleRootService` signs it: canonical
+ * JSON of the root envelope. The root-signature check, the Rekor body binding
+ * (AV-2771) and AIBOM step A7 all build the payload here, so there is one
+ * canonicalisation.
+ */
+export function merkleRootEnvelope(root: {
+  rootHash: unknown;
+  periodStart: unknown;
+  periodEnd: unknown;
+  rowCount: unknown;
+}): Buffer {
+  return canonicalJson({
+    rootHash: root.rootHash,
+    periodStart: root.periodStart,
+    periodEnd: root.periodEnd,
+    rowCount: root.rowCount,
+  });
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Merkle (RFC 6962, SHA-256, duplicate-last for odd levels)
 // ════════════════════════════════════════════════════════════════════════

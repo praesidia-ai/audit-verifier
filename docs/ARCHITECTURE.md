@@ -9,7 +9,7 @@ exactly that line, or when an anchor has no quote.
 - `src/cli.ts` — entrypoint and flag parsing. `runCli` dispatches on the first argument: to
   `src/cli.ts:1129` `async function main(` for one bundle (no subcommand, or `verify`), to
   `src/cli.ts:1058` `async function mainVerifySet(` for `verify-set`, or to `mainAibom` for `aibom`.
-- `src/verify.ts` — `src/verify.ts:1465` `export async function verifyBundle(` is the bundle
+- `src/verify.ts` — `src/verify.ts:1466` `export async function verifyBundle(` is the bundle
   verification pipeline: signatures, Merkle proofs, chain continuity. `verifyChainBoundary` is the
   cross-bundle boundary rule that `verify-set` uses (SCAN2-004).
 - `src/crypto.ts` — vendored Ed25519/ECDSA-P256 primitives, byte-for-byte compatible with be's
@@ -22,8 +22,8 @@ exactly that line, or when an anchor has no quote.
   The archive/entry size caps `src/zip.ts:71-73` `export const MAX_ZIP_` reject oversized bundles
   before full decompression.
 - `src/rekor.ts` — Sigstore Rekor offline verification:
-  `src/rekor.ts:85` `export function computeRekorLogIdHex(`, and
-  `src/rekor.ts:648` `export function verifyRekorReceipt(`, which checks the SET signature, the
+  `src/rekor.ts:95` `export function computeRekorLogIdHex(`, and
+  `src/rekor.ts:685` `export function verifyRekorReceipt(`, which checks the SET signature, the
   signed checkpoint and the inclusion proof, with no network call.
 - `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
   compiled-in trust anchor (`README.md:1040` `The platform public key this build trusts is compiled into`).
@@ -41,10 +41,10 @@ exactly that line, or when an anchor has no quote.
 ## Verification pipeline (high level)
 
 `src/cli.ts:1129` `async function main(` reads the CLI flags and the bundle file, and calls
-`src/verify.ts:1465` `export async function verifyBundle(`. That function is the load-bearing
+`src/verify.ts:1466` `export async function verifyBundle(`. That function is the load-bearing
 piece described in the README's "What it verifies" section (`README.md:505` `## What it verifies`):
 per-row signature checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless
-`--no-rekor`) Rekor receipt verification via `src/rekor.ts:648` `export function verifyRekorReceipt(`.
+`--no-rekor`) Rekor receipt verification via `src/rekor.ts:685` `export function verifyRekorReceipt(`.
 `src/cli.ts:1058` `async function mainVerifySet(` is the newer cross-bundle continuity entrypoint
 (`verify-set`, SCAN2-004) that checks chain fields are present across a *set* of bundles rather
 than one — it fails closed when chain fields are absent (pinned by a dedicated test, `f13793e`).
