@@ -42,7 +42,7 @@ function cliPathOrThrow(): string {
   if (!fs.existsSync(cliPath)) {
     throw new Error(
       'dist/cli.js not found — `npm run build` must run before `npm test` ' +
-        '(the standard gate order in .claude/bin/verify.sh already does this).',
+        '(the vitest globalSetup, scripts/vitest-build-dist.mjs, already does this).',
     );
   }
   return cliPath;

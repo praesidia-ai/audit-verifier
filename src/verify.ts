@@ -252,10 +252,10 @@ interface BundleManifest {
  * **Fixed** by `be` commit `3eb81950` ("ship the 6 missing action-event
  * preimage fields + repoint verifier round trip at v5, PA-0027,
  * PA-0031") — `bundle-exporter.service.ts:2040-2051` now emits all six
- * fields, plus `organizationId`/`issuerType`/`dispatched`. Tracked to
- * closure as `.claude/backlog/PA-0027.md` and `.claude/backlog/PA-0031.md`
- * (both `state: done`). This verifier can independently verify
- * action-event signatures against a real `be`-produced v5 bundle today.
+ * fields, plus `organizationId`/`issuerType`/`dispatched`, with no manifest
+ * version bump. `be`'s exporter spec feeds a non-empty, signed, chained
+ * event file to this CLI and expects `RESULT: OK`: this verifier
+ * independently verifies action-event signatures in a `be`-produced v5 bundle.
  * The fields below remain declared REQUIRED to match the contract — no
  * behavior change here — so a bundle missing any of them still fails
  * closed as a bundle-format error (`assertActionEventsStructure`),

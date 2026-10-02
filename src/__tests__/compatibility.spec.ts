@@ -90,10 +90,11 @@ describe.each([
 
 /**
  * AV-2769 — a customer gets the npm tarball, not the workspace, so no shipped
- * file may cite a workspace-internal `.claude/` path. The shipped set is
- * package.json `files` (directories walked; dist/ is the one the vitest
- * globalSetup just built) plus package.json, which npm always packs. A
- * `files` entry that is missing or a glob throws here, so the spec fails.
+ * file may cite a path under the workspace-internal `.claude` directory. The
+ * shipped set is package.json `files` (directories walked; dist/ is the one
+ * the vitest globalSetup just built) plus package.json, which npm always
+ * packs. A `files` entry that is missing or a glob throws here, so the spec
+ * fails.
  */
 const filesUnder = (rel: string): string[] =>
   fs.statSync(path.join(root, rel)).isDirectory()
@@ -102,21 +103,25 @@ const filesUnder = (rel: string): string[] =>
 const shipped = pkg.files.flatMap(filesUnder);
 
 /**
- * AV-2772 — nor a workspace agent-role name (`backend-dev` and the like):
- * it names no team a customer can reach. Say "the API" or "the verifier".
- * Both rules also hold for the docs/ files outside the tarball: the
- * repository is public. AV-2781 — and for CHANGELOG.md, for the same reason.
+ * AV-2772 — nor a workspace agent-role name (`<team>-dev`, `<team>-writer`
+ * and the like): it names no team a customer can reach. Say "the API" or
+ * "the verifier". Both rules also hold for the docs/ files outside the
+ * tarball: the repository is public. AV-2781 — and for CHANGELOG.md, for the
+ * same reason. AV-2792 — and for SECURITY.md and every file under src/
+ * (comments and spec text are public too). This file is under src/, so
+ * neither needle below may match its own source line.
  */
 const AGENT_ROLE =
-  /\b((audit-verifier|backend|frontend|gateway|infra|mcp|sdk|shared|website|worker)-dev|(content|docs)-writer|(database|devops|iac|qa|security)-engineer|release-manager)\b/;
+  /\b((audit-verifier|backend|frontend|gateway|infra|mcp|sdk|shared|website|worker)-dev|(content|docs)-writer|(database|devops|iac|qa|security)-engineer|(release)-manager)\b/;
 const repoOnlyDocs = filesUnder('docs').filter((f) => !shipped.includes(f));
+const publicFiles = ['package.json', 'CHANGELOG.md', 'SECURITY.md', ...shipped, ...repoOnlyDocs, ...filesUnder('src')];
 
-describe.each(['package.json', 'CHANGELOG.md', ...shipped, ...repoOnlyDocs])('%s (in the npm tarball, docs/ or CHANGELOG.md)', (rel) => {
+describe.each(publicFiles)('%s (in the npm tarball or the public repository)', (rel) => {
   const lines = read(rel).split('\n');
   const hitsOf = (match: (l: string) => boolean) => lines.flatMap((l, i) => (match(l) ? [`${rel}:${i + 1}`] : []));
 
-  it('cites no workspace-internal `.claude/` path', () => {
-    expect(hitsOf((l) => l.includes('.claude/'))).toEqual([]);
+  it('cites no path under the workspace-internal `.claude` directory', () => {
+    expect(hitsOf((l) => /\.claude\//.test(l))).toEqual([]);
   });
 
   it('names no workspace agent role (AV-2772)', () => {

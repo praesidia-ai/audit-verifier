@@ -5682,8 +5682,8 @@ describe('verifyBundle', () => {
    * REAL, unmodified `canonicalJson` via `node -r ts-node/register`
    * against `be/src/common/security/utils/canonical-json.ts` — not
    * re-derived by reading it, not re-derived from this package's own copy.
-   * Closed `resolved-no-change` (`.claude/backlog/SCAN-AV-02.md`); this
-   * test locks the now-verified-safe behavior in against regression.
+   * SCAN-AV-02 was closed with no code change; this test locks the
+   * now-verified-safe behavior in against regression.
    */
   describe('SCAN-AV-02 — __proto__-keyed object is not a canonicalization divergence or a pollution vector', () => {
     it('canonicalizes a __proto__ key created via JSON.parse to its own value (realistic path: jsonb/bundle round-trip)', () => {
@@ -6782,7 +6782,7 @@ describe('verifyBundle', () => {
         if (!fs.existsSync(cliPath)) {
           throw new Error(
             'dist/cli.js not found — `npm run build` must run before `npm test` ' +
-              '(the standard gate order in .claude/bin/verify.sh already does this).',
+              '(the vitest globalSetup, scripts/vitest-build-dist.mjs, already does this).',
           );
         }
         const tmpDir = fs.mkdtempSync(
@@ -6823,7 +6823,7 @@ describe('verifyBundle', () => {
       if (!fs.existsSync(cliPath)) {
         throw new Error(
           'dist/cli.js not found — `npm run build` must run before `npm test` ' +
-            '(the standard gate order in .claude/bin/verify.sh already does this).',
+            '(the vitest globalSetup, scripts/vitest-build-dist.mjs, already does this).',
         );
       }
       return cliPath;
