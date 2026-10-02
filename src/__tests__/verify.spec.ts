@@ -4036,6 +4036,13 @@ describe('verifyBundle', () => {
       range?: [number, number];
       hourOf?: readonly number[];
       erasedHours?: number[];
+      /**
+       * AV-2762 — v7 only: one protected action's PA-0010 lifecycle (six
+       * events, grade C) observed in `hour`, exported by the bundle whose
+       * window holds that hour. `redacted`: its CALLER_RESULT_OBSERVED payload
+       * is legitimately redacted (`payload: null` with a payload commitment).
+       */
+      action?: { hour: number; redacted?: boolean };
     }): Buffer {
       const [fromHour, toHour] = o.range ?? [0, 5];
       const hourOf = o.hourOf ?? HOUR_OF;
@@ -4143,6 +4150,41 @@ describe('verifyBundle', () => {
         { keyVersion: 1, publicKey: b64(KEY1.publicKey), ...(v7 ? { status: 'ACTIVE', revokedAt: null } : {}) },
         ...(key2 ? [{ keyVersion: 2, ...(v7 ? key2 : { publicKey: key2.publicKey }) }] : []),
       ];
+      const actionEvents: Record<string, unknown>[] = [];
+      if (v7 && o.action && inRange(o.action.hour)) {
+        const actionId = 'aaaaaaaa-0000-7000-8000-000000002762';
+        const permitId = `permit-nonce-${actionId}`;
+        const requestCommitment = 'a'.repeat(64);
+        const redacted = o.action.redacted === true;
+        const lifecycle: Array<[string, Record<string, unknown> | null, Record<string, unknown>?]> = [
+          ['ACTION_PROPOSED', { actionClass: 'mcp.tool.call', protocol: 'mcp' }],
+          ['PERMIT_ISSUED', { permitId, requestCommitment, exp: 9999999999 }, { issuerId: 'permit-service' }],
+          ['PERMIT_CONSUMED', { permitNonce: permitId, requestCommitment, destinationIdempotencyCommitment: null }, { permitNonce: permitId }],
+          ['DISPATCH_ATTEMPTED', { requestCommitment, permitId, enforcementMode: 'observe' }, { dispatched: true }],
+          ['CALLER_RESULT_OBSERVED', redacted ? null : { success: true, resultCommitment: 'b'.repeat(64) }, redacted ? { payloadCommitment: 'c'.repeat(64) } : {}],
+          ['ACTION_CLOSED', { closure: 'SUCCEEDED', reason: 'EVIDENCED' }],
+        ];
+        let prevEventCommitment = '0'.repeat(64);
+        lifecycle.forEach(([eventType, payload, fields], k) => {
+          const t = at(o.action!.hour * HOUR + 600 + k);
+          // be's signed preimage (`canonicalizeEventRow`, protected-action-canonical.helper.ts), written out here.
+          const signable = {
+            organizationId: ORG, actionId, actionSeq: String(k + 1), eventType, schemaVersion: '0.1', issuerType: 'system',
+            issuerId: 'mcp-proof-edge', trustDomain: 'praesidia', timeSource: 'system', observedAt: t, receivedAt: t,
+            dispatched: false, permitNonce: null, payload, payloadCommitment: null, producerVersion: '1.0.0', edgeVersion: null,
+            adapterVersion: null, externalReceiptRef: null, artifactStorageRef: null, ...fields, prevEventCommitment,
+          };
+          const canonical = canonicalJson(signable);
+          const signature = sign(fmt, 'protected-action-event', Buffer.concat([canonical, Buffer.from(prevEventCommitment, 'hex')]));
+          const { issuerId, ...wire } = signable;
+          const eventCommitment = sha256(Buffer.concat([canonical, Buffer.from(signature, 'base64')])).toString('hex');
+          actionEvents.push({
+            ...wire, actionSeq: k + 1, schemaVersion: 0.1, issuer: issuerId, signature, signatureAlgorithm: 'Ed25519',
+            keyVersion: 1, eventCommitment, ...fmtField(fmt),
+          });
+          prevEventCommitment = eventCommitment;
+        });
+      }
       const manifestSans: Record<string, unknown> = {
         version: v7 ? 7 : 1, orgId: ORG, from: at(fromHour * HOUR), to: at(toHour * HOUR), rowCount: present.length, rootCount: roots.length,
         keyVersions, generatedAt: at(5 * HOUR + 30), signatureAlgorithm: 'Ed25519',
@@ -4150,8 +4192,8 @@ describe('verifyBundle', () => {
       if (v7) {
         Object.assign(manifestSans, {
           chainSeqCeiling: rows.length, chainSeqSnapshotAt: at(5 * HOUR + 30), integrityCheckpointCount: 0,
-          actionEventCount: 0, captureScopeDigest: sha256(Buffer.from('scope')).toString('hex'),
-          evidenceGradeSummary: { A: 0, B: 0, C: 0, D: 0, enforcementMode: 'observe' },
+          actionEventCount: actionEvents.length, captureScopeDigest: sha256(Buffer.from('scope')).toString('hex'),
+          evidenceGradeSummary: { A: 0, B: 0, C: actionEvents.length > 0 ? 1 : 0, D: 0, enforcementMode: 'observe' },
           evidencePrivacy: { modes: [{ mode: 'FULL', effectiveFrom: at(fromHour * HOUR) }], schemaVersion: 1 },
           signatureFormat: 2, signatureFormatCutoverAt: o.cutover ?? at(0),
         });
@@ -4166,7 +4208,7 @@ describe('verifyBundle', () => {
         ...(v7
           ? [
               { name: 'integrity-checkpoints.ndjson.gz', data: ndjson([]) },
-              { name: 'action-events.ndjson.gz', data: ndjson([]) },
+              { name: 'action-events.ndjson.gz', data: ndjson(actionEvents) },
             ]
           : []),
         { name: 'sealed-purges.ndjson.gz', data: ndjson(seals) },
@@ -4668,9 +4710,12 @@ describe('verifyBundle', () => {
       const rezip = (zip: Buffer, edit: (e: { name: string; data: Buffer }) => { name: string; data: Buffer }): Buffer =>
         writeZip(readZip(zip).map(edit));
 
-      it('Q1: a manifest v5+ quiet window is valid on its own (signed zero action-event and grade counts)', () => {
+      it('Q1: a manifest v5+ quiet window is valid on its own (signed zero action-event and grade counts)', async () => {
         // AV-0008: those counts are evidence, so only a v1-v4 quiet window needs the set's proof.
         const v7 = { ...quietHour2, version: 7 as const };
+        const alone = await verify(build({ ...v7, range: [2, 3] }));
+        expect(alone.status, JSON.stringify(alone.proofs)).toBe('valid');
+        expect(alone.bundle.rowsSeen).toBe(0);
         expect(verifySetOf([build({ ...v7, range: [0, 2] }), build({ ...v7, range: [2, 3] }), build({ ...v7, range: [3, 6] })]))
           .toEqual(CONTINUOUS);
       });
@@ -4697,6 +4742,22 @@ describe('verifyBundle', () => {
 
       it('C3: a set with no rows at all proves nothing quiet', () => {
         expect(verifySetOf([build({ ...none, range: [-3, -2] }), build({ ...none, range: [-2, -1] })])).toEqual(QUIET);
+      });
+
+      it('C4 (AV-2762): a proven-quiet v5+ bundle with another gap (a redacted caller result) keeps the set bundle_incomplete', async () => {
+        // The stitch proves hour 2 has no rows; it proves nothing about the action evidence exported with it.
+        const v7 = { ...quietHour2, version: 7 as const };
+        const setWith = (redacted: boolean): SetResult => verifySetOf(
+          ([[0, 2], [2, 3], [3, 6]] as const).map(([from, to]) => build({ ...v7, range: [from, to], action: { hour: 2, redacted } })),
+        );
+        const alone = await verify(build({ ...v7, range: [2, 3], action: { hour: 2, redacted: true } }));
+        expect(alone).toMatchObject({ status: 'incomplete', bundle: { rowsSeen: 0, actionEventsSeen: 6 } });
+        expect(alone.proofs).toEqual({
+          signature: 'pass', hashChain: 'pass', decisionReceipt: 'not_present', policyReference: 'not_present',
+          evidenceIntegrity: 'incomplete', targetReceipt: 'not_present',
+        });
+        expect(setWith(false)).toEqual(CONTINUOUS); // control: the same action, its result not redacted
+        expect(setWith(true)).toEqual(QUIET);
       });
     });
 
