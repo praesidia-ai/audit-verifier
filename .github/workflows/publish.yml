@@ -14,22 +14,27 @@ permissions:
   contents: read
 
 jobs:
-  publish:
-    name: npm publish (@praesidia/audit-verifier)
+  # AV-2753 (INFRA-REVIEW CI-12) — every step that executes dependency or repo
+  # code (npm ci, tsc, vitest, the prepack build, the npx SBOM tool) runs here,
+  # in a job with no `id-token` and no publish secret, so a malicious
+  # dependency cannot mint the OIDC token behind a provenance-attested publish.
+  # The publish job below only downloads the packed tarball and publishes it.
+  # src/__tests__/publish-workflow.spec.ts enforces the split.
+  build:
+    name: build, test and pack (@praesidia/audit-verifier)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Configure this environment with required reviewers. Its fingerprint
     # variable is the operator-owned approval input from the production key
     # ceremony; the release assertion refuses to trust a fingerprint copied
-    # only from this source tree.
+    # only from this source tree. Both jobs bind it (the variables live here,
+    # the npm secret and the publish approval there), so a release asks for
+    # approval twice: once before the build, once before the publish.
     environment: audit-verifier-production
     env:
       PRAESIDIA_RELEASE_APPROVED_PLATFORM_KEY_FINGERPRINT: ${{ vars.PRODUCTION_PLATFORM_KEY_FINGERPRINT }}
-    # MIL-0002 F4 — SLSA/npm provenance requires the OIDC token exchange;
-    # `id-token: write` is scoped to this job only (least privilege).
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -114,6 +119,34 @@ jobs:
           path: sbom.cdx.json
           if-no-files-found: error
 
+  # Only this job can mint the OIDC token, and it never checks out or runs repo
+  # or dependency code: it publishes the exact tarball the build job packed,
+  # gated and checksummed. Publishing a tarball runs no lifecycle scripts.
+  publish:
+    name: npm publish (@praesidia/audit-verifier)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: audit-verifier-production
+    # MIL-0002 F4 — SLSA/npm provenance requires the OIDC token exchange;
+    # `id-token: write` is scoped to this job only (least privilege).
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release
+
+      - name: Re-check checksums
+        working-directory: release
+        run: sha256sum -c --strict SHA256SUMS
+
       - name: Publish to npm
         # MIL-0002 F4 — `--provenance` publishes a signed SLSA provenance
         # attestation (build workflow + commit + subject digest) to the npm
@@ -121,9 +154,15 @@ jobs:
         # published tarball corresponds to this exact CI run/commit, not
         # just trust an npm-token holder's say-so. Requires the `id-token`
         # permission above; npm's publish tooling handles the OIDC exchange.
-        run: npm publish --access public --provenance
+        # The build job already proved RELEASE_TAG == v<package.json version>.
+        working-directory: release
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          TARBALL="praesidia-audit-verifier-${RELEASE_TAG#v}.tgz"
+          test -f "$TARBALL"
+          npm publish "./${TARBALL}" --access public --provenance
 
   # AV-0015 — the only job with `contents: write`. Runs after npm publish
   # succeeds, uploads exactly the files SHA256SUMS covers (after re-checking
