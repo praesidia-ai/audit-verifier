@@ -2,11 +2,24 @@
 
 Dated 2026-09-12. Written for `DOCS-0001-audit-verifier`.
 
-This `docs/` directory holds `design/platform-key-hierarchy.md` and
-`trust-anchor-verification.md` plus the DOCS-0001 triad added here. The root
-`audit-verifier/README.md` is the primary reference (usage, verdict shape, what it verifies, trust
-anchor); read that first. This triad adds a platform-fit statement, a module map with
-`path:line` anchors, and a condensed build/test/CLI-usage reference.
+The root `audit-verifier/README.md` is the primary reference (usage, verdict shape, what it
+verifies, trust anchor); read that first. This `docs/` directory holds these files:
+
+| File | Purpose | In the npm tarball |
+|---|---|---|
+| `INDEX.md` | This file: what the package is, where it sits in the platform, and a map of `docs/`. | no |
+| `ARCHITECTURE.md` | Module map of `src/` and `scripts/` with checked `path:line` anchors, the verification pipeline, and byte-for-byte compatibility with `be`. | no |
+| `OPERATIONS.md` | Condensed build, test and CLI-usage reference: release and contract-drift gates, failure modes, and the `verify-set` limit on rows deleted from the end of the history. | no |
+| `COMPATIBILITY.md` | Which verifier version reads which bundle manifest version and artefact format, and where the code decides each cell. | yes |
+| `decision-disclosures.md` | Format of the unsigned `evidence/decision-receipts.ndjson` audit-package file, and how each line is trusted only through the signed bundle row it opens. | yes |
+| `trust-anchor-verification.md` | Where the platform public key is pinned in this CLI, and how an auditor confirms that pin out-of-band. | yes |
+| `design/platform-key-hierarchy.md` | Design only, not built: an offline root key that cross-signs rotating operational keys. | yes |
+
+The last column follows the `files` list in `package.json`, which names exactly the four `docs/`
+files marked yes. The other three are in the source repository only.
+
+`INDEX.md`, `ARCHITECTURE.md` and `OPERATIONS.md` are the DOCS-0001 triad: a platform-fit
+statement, a module map, and a condensed build/test/CLI-usage reference.
 
 ## What it is
 
@@ -45,6 +58,3 @@ sites. Every `README.md:N` `quote` citation here is checked by
 live compliance bundle export/verify round-trip in this pass — the README's own "What it
 verifies" and Changelog sections carry that history (e.g. `0.10.0`'s `detailsCommitment`
 addition), not this triad.
-
-See also: `ARCHITECTURE.md`, `OPERATIONS.md`, `design/platform-key-hierarchy.md`,
-`trust-anchor-verification.md`.
