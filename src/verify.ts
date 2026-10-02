@@ -1466,6 +1466,19 @@ export async function verifyBundle(
   bundle: Buffer,
   options: VerifyOptions = {},
 ): Promise<VerifyReport> {
+  return (await verifyBundleAndBridges(bundle, options)).report;
+}
+
+/**
+ * AV-2755 — `verifyBundle`, plus the sealed-purge bridges whose seal AND link
+ * signatures verified (the ones its chain check may follow), for
+ * `verify-set`'s boundary check. Not re-exported by `index.ts`; `report` is
+ * exactly `verifyBundle`'s.
+ */
+export async function verifyBundleAndBridges(
+  bundle: Buffer,
+  options: VerifyOptions = {},
+): Promise<{ report: VerifyReport; chainBridges: ChainBridge[] }> {
   const resourceLimits = resolveResourceLimits(options.resourceLimits);
 
   // 1) Read & validate the zip envelope.
@@ -1674,10 +1687,8 @@ export async function verifyBundle(
   // separately, on `bundle`, for `verify-set` to consume. AV-2754: the
   // chain may cross a purged run only through a seal whose 6-field AND
   // link signatures both verify.
-  const chainRaw = verifyChain(
-    rows,
-    verifySealLinkAuthenticity(verifiedSeals, publicKeys, cutoverMs),
-  );
+  const chainBridges = verifySealLinkAuthenticity(verifiedSeals, publicKeys, cutoverMs);
+  const chainRaw = verifyChain(rows, chainBridges);
   const chainResult = withEvidenceStatus({
     ok: chainRaw.ok,
     checked: chainRaw.checked,
@@ -1918,7 +1929,7 @@ export async function verifyBundle(
         : {}),
     },
   };
-  return { ...report, proofs: deriveProofs(report) };
+  return { report: { ...report, proofs: deriveProofs(report) }, chainBridges };
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -4565,21 +4576,7 @@ function verifyChain(rows: BundleRow[], bridges: ChainBridge[] = []): ChainVerif
     }
   }
 
-  // AV-2754 — in → out over the signed bridges; a duplicated in or out
-  // drops every pair carrying it.
-  const countOf = (values: string[]): Map<string, number> => {
-    const m = new Map<string, number>();
-    for (const v of values) m.set(v, (m.get(v) ?? 0) + 1);
-    return m;
-  };
-  const inCount = countOf(bridges.map((b) => b.linkIn));
-  const outCount = countOf(bridges.map((b) => b.linkOut));
-  const bridgeOut = new Map<string, string>();
-  for (const b of bridges) {
-    if (inCount.get(b.linkIn) === 1 && outCount.get(b.linkOut) === 1) {
-      bridgeOut.set(b.linkIn, b.linkOut);
-    }
-  }
+  const bridgeOut = bridgeSuccessors(bridges);
   for (const linkIn of bridgeOut.keys()) {
     const direct = byDeclaredPrev.get(linkIn);
     if (direct) {
@@ -4634,23 +4631,12 @@ function verifyChain(rows: BundleRow[], bridges: ChainBridge[] = []): ChainVerif
     visited.add(current.id);
     tailRow = current;
     steps += 1;
-    let link = computeChainLink(current);
-    current = undefined;
-    while (link !== null) {
-      if (visitedLinks.has(link)) {
-        return {
-          ok: false,
-          checked: rows.length,
-          failed: 1,
-          firstFailure: tailRow.id,
-          reason: 'chain cycle: a sealed-purge bridge leads back to a link already walked',
-        };
-      }
-      visitedLinks.add(link);
-      current = byDeclaredPrev.get(link)?.[0];
-      if (current) break;
-      link = bridgeOut.get(link) ?? null;
+    const link = computeChainLink(current);
+    const next = link === null ? null : nextDeclaredLink(link, bridgeOut, byDeclaredPrev, visitedLinks);
+    if (next === BRIDGE_CYCLE) {
+      return { ok: false, checked: rows.length, failed: 1, firstFailure: tailRow.id, reason: BRIDGE_CYCLE_REASON };
     }
+    current = next === null ? undefined : byDeclaredPrev.get(next)![0];
   }
   if (visited.size !== rows.length) {
     const orphan = rows.find((r) => !visited.has(r.id));
@@ -4677,6 +4663,82 @@ function verifyChain(rows: BundleRow[], bridges: ChainBridge[] = []): ChainVerif
     tailRowId: tailRow.id,
     tailChainLink: computeChainLink(tailRow),
   };
+}
+
+/**
+ * AV-2754 — in → out over the signed bridges. A `linkIn` or `linkOut`
+ * carried by more than one bridge drops every bridge carrying it (fail
+ * closed: the gap then fails as before).
+ */
+function bridgeSuccessors(bridges: readonly ChainBridge[]): Map<string, string> {
+  const countOf = (values: string[]): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const v of values) m.set(v, (m.get(v) ?? 0) + 1);
+    return m;
+  };
+  const inCount = countOf(bridges.map((b) => b.linkIn));
+  const outCount = countOf(bridges.map((b) => b.linkOut));
+  const bridgeOut = new Map<string, string>();
+  for (const b of bridges) {
+    if (inCount.get(b.linkIn) === 1 && outCount.get(b.linkOut) === 1) {
+      bridgeOut.set(b.linkIn, b.linkOut);
+    }
+  }
+  return bridgeOut;
+}
+
+const BRIDGE_CYCLE = Symbol('bridge-cycle');
+const BRIDGE_CYCLE_REASON = 'chain cycle: a sealed-purge bridge leads back to a link already walked';
+
+/**
+ * AV-2754 — from `link`, the first link value some row declares as its
+ * `prevRowHash` (`declared`), following bridges only where no row does.
+ * null at a dead end; BRIDGE_CYCLE when a link value already in `walked`
+ * comes round again (`walked` grows in place).
+ */
+function nextDeclaredLink(
+  link: string,
+  bridgeOut: ReadonlyMap<string, string>,
+  declared: { has(link: string): boolean },
+  walked: Set<string>,
+): string | null | typeof BRIDGE_CYCLE {
+  let at: string | undefined = link;
+  while (at !== undefined) {
+    if (walked.has(at)) return BRIDGE_CYCLE;
+    walked.add(at);
+    if (declared.has(at)) return at;
+    at = bridgeOut.get(at);
+  }
+  return null;
+}
+
+/**
+ * AV-2755 — `verify-set`'s boundary between two date-adjacent bundles, under
+ * `verifyChain`'s bridge rules. `tailLink` is the left bundle's
+ * `chainTailLinkHash`, `headAnchor` the right bundle's `chainHeadAnchor`,
+ * `bridges` both bundles' `chainBridges` (a seal exported by both counts
+ * once, by id). Continuous when the tail link is the head anchor or reaches
+ * it through bridges. A bridge out of the head anchor (beside the right
+ * bundle's head row) is a fork and a bridge back to a walked link is a
+ * cycle; both carry a reason. Only the two endpoint links are visible here;
+ * each bundle's own `verifyChain` holds its bridges against its row links.
+ */
+export function verifyChainBoundary(
+  tailLink: string,
+  headAnchor: string,
+  bridges: readonly ChainBridge[],
+): { ok: boolean; reason?: string } {
+  const unique = new Map(bridges.map((b) => [JSON.stringify([b.sealId, b.linkIn, b.linkOut]), b]));
+  const bridgeOut = bridgeSuccessors([...unique.values()]);
+  if (bridgeOut.has(headAnchor)) {
+    return {
+      ok: false,
+      reason: "chain fork: the right bundle's leading row and a sealed-purge bridge both succeed the same link",
+    };
+  }
+  const next = nextDeclaredLink(tailLink, bridgeOut, new Set([headAnchor]), new Set());
+  if (next === BRIDGE_CYCLE) return { ok: false, reason: BRIDGE_CYCLE_REASON };
+  return { ok: next !== null };
 }
 
 function verifyRootSignatures(
@@ -6167,7 +6229,9 @@ function verifySealedPurgeAuthenticity(
 }
 
 /** AV-2754 — a signed purge-boundary link pair: link(P) → the survivor's `prevRowHash`. */
-interface ChainBridge {
+export interface ChainBridge {
+  /** AV-2755 — the seal's `id`, so one seal exported by two bundles counts once in `verify-set`. */
+  sealId: string;
   linkIn: string;
   linkOut: string;
 }
@@ -6213,7 +6277,7 @@ function verifySealLinkAuthenticity(
       cutoverMs,
     );
     if (authentic === true) {
-      bridges.push({ linkIn: p.chainLinkIn, linkOut: p.chainLinkOut });
+      bridges.push({ sealId: p.id, linkIn: p.chainLinkIn, linkOut: p.chainLinkOut });
     }
   }
   return bridges;

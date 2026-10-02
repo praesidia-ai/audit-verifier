@@ -27,7 +27,15 @@ import * as fs from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { verifyBundle, type VerifyReport, type ComponentResult, type VerifyOptions } from './verify.js';
+import {
+  verifyBundle,
+  verifyBundleAndBridges,
+  verifyChainBoundary,
+  type ChainBridge,
+  type VerifyReport,
+  type ComponentResult,
+  type VerifyOptions,
+} from './verify.js';
 import { MAX_ZIP_ARCHIVE_BYTES } from './zip.js';
 import { isAuditPackage, verifyAuditPackage, type PackageIntegrity } from './package.js';
 import { GENESIS_PREV_ROW_HASH } from './crypto.js';
@@ -83,7 +91,9 @@ USAGE
   pair asserts BOTH the date range is exactly contiguous (no gap, no
   overlap) AND the left bundle's newest-row hash-chain link equals the
   right bundle's declared head anchor (an adjacent-but-forged boundary is
-  caught, not just a date gap). Every discontinuity is a NAMED finding —
+  caught, not just a date gap) or reaches it through sealed-purge bridges
+  whose seal and link signatures both verify (AV-2755). Every
+  discontinuity is a NAMED finding —
   never silence. Does not change the single-bundle command above in any
   way.
 
@@ -784,7 +794,7 @@ interface VerifySetReport {
  * so it is trivially testable and never re-parses a bundle.
  */
 function buildVerifySetReport(
-  entries: ReadonlyArray<{ path: string; report: VerifyReport }>,
+  entries: ReadonlyArray<{ path: string; report: VerifyReport; chainBridges: readonly ChainBridge[] }>,
 ): VerifySetReport {
   const sorted = [...entries].sort(
     (a, b) => Date.parse(a.report.bundle.from) - Date.parse(b.report.bundle.from),
@@ -855,17 +865,26 @@ function buildVerifySetReport(
     // Dates are exactly adjacent — AUDIT-01 also requires binding the
     // CRYPTOGRAPHIC boundary, not just the date match, so a forged
     // replacement bundle with a convenient `from` cannot pass as
-    // continuous.
+    // continuous. AV-2755: a sealed purge on the boundary is crossed only
+    // through the two bundles' doubly-signed bridges, by verifyChain's rules.
     if (left.report.bundle.rowsSeen > 0 && right.report.bundle.rowsSeen > 0) {
-      if (left.report.bundle.chainTailLinkHash !== right.report.bundle.chainHeadAnchor) {
+      const tail = left.report.bundle.chainTailLinkHash;
+      const head = right.report.bundle.chainHeadAnchor;
+      const boundary =
+        typeof tail === 'string' && typeof head === 'string'
+          ? verifyChainBoundary(tail, head, [...left.chainBridges, ...right.chainBridges])
+          : { ok: false };
+      if (!boundary.ok) {
         findings.push({
           kind: 'boundary_chain_mismatch',
           leftIndex: i,
           rightIndex: i + 1,
           reason:
-            `${left.path}'s newest-row hash-chain link does not equal ${right.path}'s ` +
-            'declared chain-head anchor — the boundary is date-adjacent but not ' +
-            'cryptographically continuous (adjacent-but-forged boundary)',
+            boundary.reason !== undefined
+              ? `${left.path} -> ${right.path} boundary: ${boundary.reason}`
+              : `${left.path}'s newest-row hash-chain link does not equal ${right.path}'s ` +
+                'declared chain-head anchor — the boundary is date-adjacent but not ' +
+                'cryptographically continuous (adjacent-but-forged boundary)',
         });
       }
     }
@@ -999,7 +1018,7 @@ async function mainVerifySet(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const entries: Array<{ path: string; report: VerifyReport }> = [];
+  const entries: Array<{ path: string; report: VerifyReport; chainBridges: ChainBridge[] }> = [];
   for (const bundlePath of args.bundlePaths) {
     let buffer: Buffer;
     try {
@@ -1011,8 +1030,8 @@ async function mainVerifySet(argv: string[]): Promise<number> {
       return 2;
     }
     try {
-      const report = await verifyBundle(buffer, options);
-      entries.push({ path: bundlePath, report });
+      const { report, chainBridges } = await verifyBundleAndBridges(buffer, options);
+      entries.push({ path: bundlePath, report, chainBridges });
     } catch (err) {
       process.stderr.write(
         `error: bundle format error in ${bundlePath}: ${(err as Error).message}\n`,

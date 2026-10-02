@@ -51,6 +51,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   not this specific export.
 
 ### Added
+- **`verify-set` bridges a sealed purge that falls on a bundle boundary** (AV-2755).
+  The boundary between two date-adjacent bundles is now crossed by the AV-2754 rule:
+  the left bundle's tail link must equal the right bundle's head anchor, or reach it
+  through bridges from seals in either bundle whose seal and link signatures both
+  verify (a seal exported in both bundles counts once; two seals sharing a
+  `chainLinkIn` or `chainLinkOut` bridge nothing). A bridge beside the right bundle's
+  head row (fork) or back to a walked link (cycle) is a `boundary_chain_mismatch`
+  finding with that reason. No new status, finding kind or exit code; sets without
+  link-bearing seals verify exactly as before.
 - **A doubly-signed sealed purge bridges the hash-chain gap** (AV-2754, be BE-2979).
   A `sealed-purges.ndjson.gz` entry may now carry the purged run's boundary links
   (`chainLinkIn`, `chainLinkOut`) signed under the new purpose `retention-seal-link`

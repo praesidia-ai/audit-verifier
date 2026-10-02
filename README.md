@@ -208,7 +208,13 @@ It sorts the given bundles by their manifest `from`, then asserts:
 - every adjacent pair's boundary is cryptographically continuous — the
   left bundle's newest-row hash-chain link must equal the right bundle's
   declared chain-head anchor, so a date-adjacent but forged/replaced
-  bundle is still caught, not just a date gap.
+  bundle is still caught, not just a date gap. A sealed retention purge
+  that falls exactly on the boundary is crossed by the same rule as inside
+  one bundle (invariants 3 and 12): only through seals, from either bundle,
+  whose own signature AND link signature both verify. A seal exported in
+  both bundles counts once. A bridge beside the right bundle's head row is
+  a fork, and a bridge leading back to a link already walked is a cycle;
+  both are a `boundary_chain_mismatch` finding naming that reason.
 
 A bundle that is itself invalid is reported as such and never downgraded
 to "just a gap". Exit codes let a script tell the three outcomes apart:
