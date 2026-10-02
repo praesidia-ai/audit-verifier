@@ -4736,9 +4736,11 @@ function nextDeclaredLink(
  * Continuous when the tail link is the head anchor or reaches it through
  * bridges. A bridge back to a walked link is a cycle. A bridge out of the
  * head anchor (beside the right bundle's head row) is a fork, unless it lands
- * on one of `rightRowLinks`, the right bundle's own row links (AV-2775): that
- * is a purge of rows the right bundle still holds, its seal exported after
- * the right bundle with a bundle on the left. Fork and cycle carry a reason.
+ * on one of `linksAhead`, row links of the right bundle (AV-2775) or of a
+ * later bundle of the set (AV-2780): that is a purge of rows the right bundle
+ * and the ones after it still hold, its seal exported after them with a
+ * bundle on the left. The caller checks every boundary up to the bundle the
+ * link is in. Fork and cycle carry a reason.
  * Each bundle's own `verifyChain` holds its bridges against its row links, so
  * a right bundle that carries a bridge out of its own head row is invalid.
  *
@@ -4752,19 +4754,19 @@ function nextDeclaredLink(
  * later purge, and `deletedAt` is unsigned, so nothing tells that apart from
  * a contradiction. The index would cost about 170 bytes per row (about 41 MiB
  * at the 250k-row limit), held for every bundle in the set. Pinned by the
- * AV-2757 tests. `rightRowLinks` is no such index: it holds only the
- * `linkOut`s of bridges out of the head anchor that are row links.
+ * AV-2757 tests. `linksAhead` is no such index: it holds only the
+ * `linkOut`s of bridges out of a head anchor that are row links.
  */
 export function verifyChainBoundary(
   tailLink: string,
   headAnchor: string,
   bridges: readonly ChainBridge[],
-  rightRowLinks: ReadonlySet<string> = new Set(),
+  linksAhead: ReadonlySet<string> = new Set(),
 ): { ok: boolean; reason?: string } {
   const unique = new Map(bridges.map((b) => [JSON.stringify([b.sealId, b.linkIn, b.linkOut]), b]));
   const bridgeOut = bridgeSuccessors([...unique.values()]);
   const outOfHead = bridgeOut.get(headAnchor);
-  if (outOfHead !== undefined && !rightRowLinks.has(outOfHead)) {
+  if (outOfHead !== undefined && !linksAhead.has(outOfHead)) {
     return {
       ok: false,
       reason: "chain fork: the right bundle's leading row and a sealed-purge bridge both succeed the same link",

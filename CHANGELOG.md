@@ -284,9 +284,20 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   bundle. To learn that, `verify-set` reads a bundle a bridge leaves the head of a second
   time, requires the same SHA-256 (else exit 2), and keeps only the links it asked for:
   what it holds grows with the bridges in the set, never with the rows. A bridge to any
-  other link (a left row, an unknown link, a row of a later bundle) is still a fork. The
+  other link (a left row, an unknown link) is still a fork; for a row of a later bundle,
+  see AV-2780. The
   comments on `verifyChainBoundary` and the genesis check now state be's seal export rule
   (period overlaps the window, or `deletedAt` falls in it) and the dedupe key.
+- **`verify-set` no longer reads a purged run split across pre-purge archives as a chain
+  fork** (AV-2780). The AV-2775 rule asked only the right bundle, so a bridge out of its
+  head anchor whose `linkOut` is a row of a later archive (the purged run went on past the
+  right bundle) was still a fork (exit 4). Such a bridge is now no fork when it lands on a
+  row of the right bundle or of any later bundle in the set. `verify-set` asks each later
+  bundle with rows, in `from` order, for the links not yet found, so each bundle is read a
+  second time at most once, as before. Every boundary up to the bundle that holds the link
+  is still checked, so rows erased in between remain a `boundary_chain_mismatch`. A run
+  that ends past the newest bundle of the set is still a fork (README, "Known limit
+  (AV-2780)"): add the bundle that holds its end.
 - **An invalid bundle gives `verify-set` no row links, and the read-twice guard is
   tested** (AV-2782). `verifyBundleAndBridges` (internal, not exported) returned the
   asked-for row links of a bundle whose chain, signatures or proofs failed. It now returns
@@ -368,8 +379,15 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   (exit 4) to `continuous` (exit 0). It applies only where a verified bridge leaves the
   right bundle's head anchor (or the genesis link) and lands on one of that bundle's own
   rows. Single-bundle `verify`, per-bundle statuses, exit codes and finding kinds are
-  unchanged, and every other fork stays a fork. A purged run that two pre-purge archives
-  split between them still reads as a fork (README, "Known limit (AV-2775)").
+  unchanged, and every other fork stays a fork. AV-2780 extends it to a run that
+  pre-purge archives split between them.
+- AV-2780 is a **scoped strictness relaxation at set level**, from `discontinuous`
+  (exit 4) to `continuous` (exit 0). It applies only where a verified bridge leaves a
+  bundle's head anchor (or the genesis link) and lands on a row of a LATER valid bundle,
+  and every boundary in between verifies. No set that passed before fails now: the rule
+  only adds cases that are no fork. Single-bundle `verify`, per-bundle statuses, exit
+  codes and finding kinds are unchanged. A run that ends past the newest bundle of the
+  set still reads as a fork.
 - AV-2759 is a **scoped strictness relaxation at set level**, from `bundle_incomplete`
   (exit 3) to `continuous` (exit 0). It applies only to a `verify-set` whose
   zero-evidence empty bundles (manifest v1-v4) are each spanned by a verified chain

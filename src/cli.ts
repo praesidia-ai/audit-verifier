@@ -797,7 +797,8 @@ interface VerifySetReport {
 /**
  * One verified bundle of a set: its report, the sealed-purge bridges its
  * chain check may follow, and which of the links verify-set asked about are
- * its row links (AV-2775; empty unless a bridge leaves its head anchor).
+ * its row links (AV-2775; empty unless a bridge leaves its head anchor or,
+ * not yet found, an earlier bundle's: AV-2780).
  */
 interface VerifySetEntry {
   path: string;
@@ -806,16 +807,27 @@ interface VerifySetEntry {
   rowLinks: ReadonlySet<string>;
 }
 
+/** verify-set's bundle order: by manifest `from`. */
+const byFrom = (a: VerifySetEntry, b: VerifySetEntry): number =>
+  Date.parse(a.report.bundle.from) - Date.parse(b.report.bundle.from);
+
 /**
  * Sorts the given bundles' reports by manifest `from` and cross-checks
  * every adjacent pair. Pure function over already-computed `VerifyReport`s
  * so it is trivially testable and never re-parses a bundle.
  */
 function buildVerifySetReport(entries: ReadonlyArray<VerifySetEntry>): VerifySetReport {
-  const sorted = [...entries].sort(
-    (a, b) => Date.parse(a.report.bundle.from) - Date.parse(b.report.bundle.from),
-  );
+  const sorted = [...entries].sort(byFrom);
   const orgId = sorted[0]!.report.bundle.orgId;
+  // AV-2780 — `ahead[k]`: the asked-for row links of bundle k and every later
+  // one. A purged run may go on past the bundle whose head its bridge leaves,
+  // into later pre-purge archives; every boundary up to the one holding the
+  // bridge's `linkOut` is checked below, so the rows reach that link or one
+  // of those boundaries is a finding.
+  const ahead: ReadonlySet<string>[] = [];
+  for (let k = sorted.length - 1; k >= 0; k--) {
+    ahead[k] = new Set([...sorted[k]!.rowLinks, ...(ahead[k + 1] ?? [])]);
+  }
   const findings: ContinuityFinding[] = [];
 
   const bundleInvalid = sorted.some((e) => e.report.status === 'invalid');
@@ -836,11 +848,11 @@ function buildVerifySetReport(entries: ReadonlyArray<VerifySetEntry>): VerifySet
   // history before the set, so its head is checked like a boundary by
   // `verifyChainBoundary`: reached through doubly-signed bridges (a purge
   // of the oldest hours) is genesis-rooted, a bridge out of a genesis head
-  // is a fork unless it lands on one of this bundle's own row links
-  // (AV-2775). Only bridges of the bundles up to this one count: be also
-  // exports a seal with every bundle whose window holds its `deletedAt`, so
-  // a later export of an old purge could otherwise fork a pre-purge
-  // archive's genesis row.
+  // is a fork unless it lands on a row link of this bundle (AV-2775) or of
+  // a later one (AV-2780). Only bridges of the bundles up to this one
+  // count: be also exports a seal with every bundle whose window holds its
+  // `deletedAt`, so a later export of an old purge could otherwise fork a
+  // pre-purge archive's genesis row.
   const firstWithRows = sorted.findIndex((e) => e.report.bundle.rowsSeen > 0);
   const first = sorted[firstWithRows]?.report;
   if (first !== undefined && first.status !== 'invalid') {
@@ -851,7 +863,7 @@ function buildVerifySetReport(entries: ReadonlyArray<VerifySetEntry>): VerifySet
             GENESIS_PREV_ROW_HASH,
             head,
             sorted.slice(0, firstWithRows + 1).flatMap((e) => e.chainBridges),
-            sorted[firstWithRows]!.rowLinks,
+            ahead[firstWithRows],
           )
         : { ok: false };
     if (!genesis.ok) {
@@ -933,7 +945,7 @@ function buildVerifySetReport(entries: ReadonlyArray<VerifySetEntry>): VerifySet
       const head = right.report.bundle.chainHeadAnchor;
       const boundary =
         typeof tail === 'string' && typeof head === 'string'
-          ? verifyChainBoundary(tail, head, sorted.slice(stitchFrom, i + 2).flatMap((e) => e.chainBridges), right.rowLinks)
+          ? verifyChainBoundary(tail, head, sorted.slice(stitchFrom, i + 2).flatMap((e) => e.chainBridges), ahead[i + 1])
           : { ok: false };
       if (!boundary.ok) {
         const empties = sorted.slice(stitchFrom + 1, i + 1).map((e) => e.path);
@@ -1129,21 +1141,26 @@ async function mainVerifySet(argv: string[]): Promise<number> {
     digests.push(seen.sha);
   }
   // A bridge out of a bundle's head anchor is no fork when it lands on that
-  // bundle's own row links (`verifyChainBoundary`). The bridges come from
-  // every bundle, so only a bundle some bridge leaves the head of is looked
-  // at again, and only the links asked for are kept: what verify-set holds
-  // grows with the bridges in the set, never with the rows.
+  // bundle's row links or a later bundle's (`verifyChainBoundary`, AV-2780).
+  // The bridges come from every bundle, so only a bundle some bridge leaves
+  // the head of is looked at again, then each later bundle with rows, in
+  // `from` order, while a link asked for is still not found. Only the links
+  // asked for are kept: what verify-set holds grows with the bridges in the
+  // set, never with the rows. Each bundle is looked at again at most once.
   const outsOf = new Map<string, Set<string>>();
   for (const b of entries.flatMap((e) => e.chainBridges)) {
     outsOf.set(b.linkIn, (outsOf.get(b.linkIn) ?? new Set<string>()).add(b.linkOut));
   }
-  for (const [i, entry] of entries.entries()) {
+  const pending = new Set<string>();
+  for (const i of [...entries.keys()].sort((a, b) => byFrom(entries[a]!, entries[b]!))) {
+    const entry = entries[i]!;
     const head = entry.report.bundle.chainHeadAnchor;
-    const query = head === undefined ? undefined : outsOf.get(head);
-    if (query === undefined) continue;
-    const seen = await look(entry.path, query, digests[i]);
+    for (const link of (head === undefined ? undefined : outsOf.get(head)) ?? []) pending.add(link);
+    if (pending.size === 0 || entry.report.bundle.rowsSeen === 0) continue;
+    const seen = await look(entry.path, new Set(pending), digests[i]);
     if (seen === null) return 2;
     entry.rowLinks = seen.rowLinks;
+    for (const link of seen.rowLinks) pending.delete(link);
   }
 
   // A gap/overlap/boundary comparison across two different orgs is

@@ -4905,6 +4905,25 @@ describe('verifyBundle', () => {
         ])).toEqual(CONTINUOUS);
       });
 
+      it('M5 (AV-2780): a purged run that two pre-purge archives split between them', () => {
+        // One row per hour; the seal bridges link(1) to link(3): row 2 is in the right archive [2, 3), row 3 in the next one.
+        const hourOf = [0, 1, 2, 3, 4, 5];
+        expect(verifySetOf([
+          build({ hourOf, purgedHours: [2, 3], seals: ({ link }) => [{ hour: 2, deletedHour: 1, chainLinkOut: link(3) }], range: [0, 2] }),
+          build({ hourOf, ...ARCHIVE, range: [2, 3] }),
+          build({ hourOf, ...ARCHIVE, range: [3, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('M6 (AV-2780): the genesis mirror, the oldest run split between two pre-purge archives', () => {
+        const hourOf = [0, 1, 2, 3, 4, 5];
+        expect(verifySetOf([
+          build({ hourOf, purgedHours: [0, 1], seals: ({ link }) => [{ hour: 0, deletedHour: -1, chainLinkOut: link(1) }], range: [-1, 0] }),
+          build({ hourOf, ...ARCHIVE, range: [0, 1] }),
+          build({ hourOf, ...ARCHIVE, range: [1, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
       it('B1 (memory bound): a bundle returns only the asked-for links that are its row links, and none unasked', async () => {
         let link!: (i: number) => string;
         const zip = build({ purgedHours: [], seals: (c) => { link = c.link; return []; }, range: [2, 5] });
@@ -5000,13 +5019,25 @@ describe('verifyBundle', () => {
         expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 2 });
       });
 
-      it('F2 (documented limit): a purged run that ends in a LATER bundle than the right one stays a fork', () => {
-        // One row per hour; the seal bridges link(1) to link(3), past the right archive [2, 3) into the next one.
+      it('F2 (AV-2780): a run a later archive ends does not hide rows erased before that archive', () => {
+        // The seal bridges link(1) to link(4); hour 3 was erased with no seal, so the archive [4, 5) does not chain to [2, 3).
+        const o = { version: 7 as const, hourOf: [0, 1, 2, 3, 4, 5] };
+        const r = verifySetOf([
+          build({ ...o, purgedHours: [2, 3, 4], seals: ({ link }) => [{ hour: 2, deletedHour: 1, chainLinkOut: link(4) }], range: [0, 2] }),
+          build({ ...o, ...ARCHIVE, range: [2, 3] }),
+          build({ ...o, ...ARCHIVE, erasedHours: [3], range: [3, 4] }),
+          build({ ...o, ...ARCHIVE, range: [4, 5] }),
+        ]);
+        expectBoundaryBreak(r, /across empty bundle\(s\) \S*bundle-2\.zip\) — the boundary is date-adjacent but not/);
+        expect(r.findings[0]).toMatchObject({ leftIndex: 1, rightIndex: 3 });
+      });
+
+      it('F4 (documented limit): a purged run that ends past the newest bundle of the set stays a fork', () => {
+        // The seal bridges link(1) to link(3); no bundle of the set holds row 3.
         const hourOf = [0, 1, 2, 3, 4, 5];
         const r = verifySetOf([
           build({ hourOf, purgedHours: [2, 3], seals: ({ link }) => [{ hour: 2, deletedHour: 1, chainLinkOut: link(3) }], range: [0, 2] }),
           build({ hourOf, ...ARCHIVE, range: [2, 3] }),
-          build({ hourOf, ...ARCHIVE, range: [3, 5] }),
         ]);
         expectBoundaryBreak(r, /chain fork/);
         expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 1 });
