@@ -4752,8 +4752,10 @@ function nextDeclaredLink(
  * exports a seal with every bundle whose window its purged period overlaps or
  * holds its `deletedAt`, so a pre-purge archive meets the seal of its own
  * later purge, and `deletedAt` is unsigned, so nothing tells that apart from
- * a contradiction. The index would cost about 170 bytes per row (about 41 MiB
- * at the 250k-row limit), held for every bundle in the set. Pinned by the
+ * a contradiction. The index, a Set of every row's link, would cost about
+ * 85-98 bytes per row (20-23 MiB at the 250k-row limit), held for every
+ * bundle in the set. Re-measure with
+ * `node --expose-gc scripts/measure-row-link-set.mjs [rows]`. Pinned by the
  * AV-2757 tests. `linksAhead` is no such index: it holds only the
  * `linkOut`s of bridges out of a head anchor that are row links.
  */

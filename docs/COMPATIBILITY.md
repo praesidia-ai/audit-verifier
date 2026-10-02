@@ -24,8 +24,8 @@ against the quoted code, and checks the current row against `package.json` and
 `src/verify.ts`. If a line number drifts, the test goes red.
 
 - **Bundle manifest 1–7.** The ceiling is `src/verify.ts:1330` `const MAX_SUPPORTED_MANIFEST_VERSION = 7;`.
-  The version gate at `src/verify.ts:5937` `manifest.version < 1 ||` rejects version 0. Anything
-  newer than 7 throws a bundle-format error, `src/verify.ts:5943` `upgrade the verifier before trusting this bundle`,
+  The version gate at `src/verify.ts:5939` `manifest.version < 1 ||` rejects version 0. Anything
+  newer than 7 throws a bundle-format error, `src/verify.ts:5945` `upgrade the verifier before trusting this bundle`,
   so the bundle does not verify.
 - **Audit package.** The format has no version field. A zip counts as an audit package when it has
   `src/package.ts:18` `export const PACKAGE_BUNDLE_ENTRY = 'evidence/audit-bundle.zip';`
