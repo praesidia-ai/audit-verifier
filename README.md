@@ -232,7 +232,11 @@ It sorts the given bundles by their manifest `from`, then asserts:
   `bundle_incomplete` (AV-2759). It keeps its own `incomplete` status in
   `bundles[]`. Nothing proves a trailing empty bundle, or a set without
   rows, quiet, and an empty bundle with a component left `incomplete`
-  still counts.
+  still counts. Known limit (AV-2764): rows deleted together with their
+  roots before export, under a trailing empty bundle, break no link the
+  set can see. From manifest v5 that bundle is `valid` on its own and the
+  set is `continuous` (exit 0), exactly as for a quiet window. See
+  `docs/OPERATIONS.md` for the conditions and what an auditor can do.
 
 Known limit (AV-2757): the boundary check sees the two end links of each
 boundary, not the rows inside the bundles. A seal from one bundle whose
@@ -979,6 +983,15 @@ fields in the same change.
   fails closed exactly as before — this closes the false-positive ONLY
   when the producer actually ships the matching evidence, it does not
   weaken the check for bundles that don't.
+- **That rows at the end of the history were not deleted, together with
+  their Merkle roots, before the export.** A deleted suffix breaks no
+  hash-chain link, and a deleted root leaves nothing to compare with the
+  rows. Checkpoints (11) catch it only when the bundle holds one signed
+  while the rows existed and a later one showing the drop. When the
+  deletion empties the bundle's whole window, it is a validly signed
+  `rowCount` 0 bundle, `valid` from manifest v5 (AV-2764). `verify-set`
+  reports it only once a later bundle, whose rows chain back across that
+  window, joins the set (`docs/OPERATIONS.md`).
 - **That Rekor anchoring exists at all when `--no-rekor` is used.** That flag
   permits roots without Rekor evidence but no longer bypasses S3 or other
   provider receipts that are present. Read the `rekor` component and the

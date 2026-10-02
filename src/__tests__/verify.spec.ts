@@ -4797,6 +4797,48 @@ describe('verifyBundle', () => {
         ])).toEqual(CONTINUOUS);
       });
     });
+
+    /**
+     * AV-2764 — documented limit (README "Cross-bundle continuity",
+     * docs/OPERATIONS.md). Rows signed in the window of the newest bundle of
+     * a set, then deleted with their Merkle root before export, leave a
+     * validly signed rowCount 0 bundle. From manifest v5 its signed zero
+     * action-event and grade counts make it `valid` on its own (AV-0008), and
+     * no later bundle chains across it, so offline it verifies exactly like a
+     * window in which nothing was logged. A later export whose rows chain back
+     * across the window names the deletion. These tests pin both verdicts.
+     */
+    describe('AV-2764 — rows deleted under a trailing empty v5+ bundle are undetectable offline (documented limit)', () => {
+      /** Rows in hours 3 and 4 (row-4, row-5) deleted with their roots, no seal; row-6 (hour 5) chains to row-5. */
+      const ERASED = { version: 7 as const, hourOf: [0, 1, 2, 2, 3, 4, 5], erasedHours: [3, 4], purgedHours: [], seals: () => [] };
+      /** Nothing logged in hours 3 and 4; row-4 (hour 5) chains to row-3. */
+      const QUIET_TAIL = { version: 7 as const, hourOf: [0, 1, 2, 2, 5], purgedHours: [], seals: () => [] };
+      const setOf = (hours: number[], o: Omit<Parameters<typeof build>[0], 'range'>): SetResult =>
+        verifySetOf(hours.slice(1).map((to, i) => build({ ...o, range: [hours[i]!, to] })));
+
+      it('L1: the trailing empty bundle verifies valid and the set continuous, the same verdicts as a quiet window', async () => {
+        const erasedTail = await verify(build({ ...ERASED, range: [3, 5] }));
+        const quietTail = await verify(build({ ...QUIET_TAIL, range: [3, 5] }));
+        expect(erasedTail, JSON.stringify(erasedTail.proofs)).toMatchObject({ ok: true, status: 'valid', bundle: { rowsSeen: 0 } });
+        expect(erasedTail.proofs).toEqual(quietTail.proofs);
+        expect(quietTail.status).toBe('valid');
+        expect(setOf([0, 3, 5], ERASED)).toEqual(CONTINUOUS);
+        expect(setOf([0, 3, 5], QUIET_TAIL)).toEqual(CONTINUOUS);
+        // Manifest v1-v4: the same deletion leaves the empty bundle `incomplete`, so the set is exit 3, not exit 0.
+        expect(setOf([0, 3, 5], { ...ERASED, version: 1 })).toEqual({ code: 3, status: 'bundle_incomplete', findings: [] });
+      });
+
+      it('L2: once a later bundle chains across the window, the deleted rows are a boundary_chain_mismatch', () => {
+        const r = setOf([0, 3, 5, 6], ERASED);
+        expectBoundaryBreak(
+          r,
+          /bundle-0\.zip's newest-row hash-chain link does not equal \S*bundle-2\.zip's declared chain-head anchor \(across empty bundle\(s\) \S*bundle-1\.zip\)/,
+        );
+        expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 2 });
+        // Control: the quiet window with the same later export stays continuous.
+        expect(setOf([0, 3, 5, 6], QUIET_TAIL)).toEqual(CONTINUOUS);
+      });
+    });
   });
 
   /**

@@ -48,7 +48,7 @@ npm run test:trust-anchor-policy     # node --test scripts/trust-anchor-policy.s
 `prepack` (`package.json:39` `"prepack": "npm run build && npm run typecheck:spec && npm run check:release-trust-anchor"`)
 runs build + `typecheck:spec` + `check:release-trust-anchor` automatically before packaging — a
 release with a missing/mismatched/non-P-256 operator-approved fingerprint cannot be packed
-(`README.md:1075` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`).
+(`README.md:1088` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`).
 
 ## Contract-drift gate
 
@@ -63,16 +63,16 @@ Not yet published — `npm view @praesidia/audit-verifier` → `404` (re-confirm
 `.claude/tickets/CLOSE/TRIAGE-rest.md`'s `MKT-0002` row). `npm publish --provenance` (MIL-0002 F4)
 is configured so that once published, `npm view @praesidia/audit-verifier provenance` will show a
 SLSA attestation binding the tarball to the exact GitHub Actions run/commit that built it
-(`README.md:1084` `(MIL-0002 F4) means`).
+(`README.md:1097` `(MIL-0002 F4) means`).
 
 ## Failure modes — what to check first
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `README.md:375` `## Verdict shape`, `src/verify.ts` |
+| Verify reports `INCOMPLETE` | Bundle missing an expected component (e.g. no chain-continuity fields, no Rekor receipt when one was expected) | `README.md:379` `## Verdict shape`, `src/verify.ts` |
 | `verify-set` fails closed | One or more bundles in the set lack chain fields — by design (SCAN2-004) | `src/cli.ts:1058` `async function mainVerifySet(`; `f13793e` pins this behavior |
 | Rekor check fails | Embedded/pinned key mismatch, or a genuinely tampered receipt — never a network issue, since this check is fully offline | `src/rekor.ts:648` `export function verifyRekorReceipt(` |
-| `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `README.md:1075` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve` |
+| `prepack` fails at release time | Operator-approved fingerprint missing/mismatched/wrong curve | `scripts/assert-release-trust-anchor.mjs`; `README.md:1088` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve` |
 | Bundle rejected before full read | Archive/entry size exceeds `MAX_ZIP_*_BYTES` caps | `src/zip.ts:71-73` `export const MAX_ZIP_` |
 
 ## `verify-set` limit: rows deleted from the end of the history
@@ -88,10 +88,35 @@ or a period whose root was removed with them) leave nothing that the verifier ch
 one in which nothing was logged, and `verify-set` reports no finding for it. This limit predates
 AV-2756.
 
+Exact verdicts (AV-2764). Take rows that were signed in the window of the newest bundle of a set,
+then deleted from the database together with their Merkle roots before the export, with no
+retention seal. The export of that window is a validly signed bundle with `rowCount` 0:
+
+- **Manifest v5 or later:** the bundle is `valid` on its own (exit 0), because its signed zero
+  action-event and evidence-grade counts verify (AV-0008). `verify-set` reports `continuous`
+  (exit 0). Both reports are the same as for a window in which nothing was logged.
+- **Manifest v1-v4:** the bundle is `incomplete` on its own, and the set is `bundle_incomplete`
+  (exit 3). Exit 3 says that the window is unproven. It does not say that rows were deleted.
+
+Offline, the deletion is caught only in one of these cases:
+
+- A later bundle in the set has rows. Its chain head must link back across the window
+  (`boundary_chain_mismatch`; see below).
+- A Merkle root that committed to the rows is still in the bundle, and its whole period lies in
+  the window (`rootCoverage`).
+- Two integrity checkpoints in the bundle (manifest v4 or later) record the drop. One was signed
+  while the rows existed, and a later one claims a lower `cumulativeRowCount`
+  (`integrityCheckpoints`). `be` signs a checkpoint once an hour, so no such pair exists if the
+  rows were deleted before the next checkpoint. Deleting those checkpoints as well also leaves no
+  pair, because the signed `integrityCheckpointCount` counts the checkpoints left at export. A bundle with no rows
+  has no rows to compare a checkpoint's `chainHeadHash` with, so that hash is not checked.
+
 What an operator can do:
 
 - **Treat the end of the set as unconfirmed.** A set that ends in an empty bundle proves nothing
-  about rows after its newest bundle with rows.
+  about rows after its newest bundle with rows. That holds even when the set reports
+  `continuous`. In the `--json` report, check whether the last entries of `bundles[]` have
+  `rowsSeen: 0`.
 - **Verify again with a later export.** Once the next window holds rows, export it from the
   set's last `to`, add it to the set and run `verify-set` again. Its chain head must link back,
   across the empty bundles, to the last row before them. Rows deleted under the empty bundles

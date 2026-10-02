@@ -26,12 +26,12 @@ exactly that line, or when an anchor has no quote.
   `src/rekor.ts:648` `export function verifyRekorReceipt(`, which checks the SET signature, the
   signed checkpoint and the inclusion proof, with no network call.
 - `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
-  compiled-in trust anchor (`README.md:1027` `The platform public key this build trusts is compiled into`).
+  compiled-in trust anchor (`README.md:1040` `The platform public key this build trusts is compiled into`).
 - `src/http-receipt.ts` — `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION`,
   `src/http-receipt.ts:32` `export function httpTargetKeyFingerprint(`,
   `src/http-receipt.ts:37` `export function httpRequestCommitment(`,
   `src/http-receipt.ts:41` `export function verifyHttpReceipt(` — verifies independently-pinned
-  HTTP target receipts (`README.md:1410` `### Independently pinned HTTP target receipts`).
+  HTTP target receipts (`README.md:1423` `### Independently pinned HTTP target receipts`).
 - `src/aibom.ts` — verifyAibomAttestation: be's attested AIBOM envelope
   (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001).
 - `src/proofs.ts` — AV-0010: PROOF_COMPONENTS / deriveProofs / formatProofLines map components to
@@ -42,7 +42,7 @@ exactly that line, or when an anchor has no quote.
 
 `src/cli.ts:1129` `async function main(` reads the CLI flags and the bundle file, and calls
 `src/verify.ts:1465` `export async function verifyBundle(`. That function is the load-bearing
-piece described in the README's "What it verifies" section (`README.md:501` `## What it verifies`):
+piece described in the README's "What it verifies" section (`README.md:505` `## What it verifies`):
 per-row signature checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless
 `--no-rekor`) Rekor receipt verification via `src/rekor.ts:648` `export function verifyRekorReceipt(`.
 `src/cli.ts:1058` `async function mainVerifySet(` is the newer cross-bundle continuity entrypoint
@@ -116,7 +116,7 @@ trust-anchor-policy.selftest.mjs   # self-test for the policy script
 ```
 
 `prepack` rejects a missing operator-approval value, a mismatch, a non-canonical key, or any EC
-curve other than P-256 (`README.md:1075` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
+curve other than P-256 (`README.md:1088` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
 self-asserted fingerprint from being changed together and silently treated as approved.
 
 See also `docs/design/platform-key-hierarchy.md` and `docs/trust-anchor-verification.md` for the

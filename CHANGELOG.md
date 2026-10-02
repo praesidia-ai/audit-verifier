@@ -325,6 +325,12 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   stitch or the genesis check. Per-bundle statuses, single-bundle `verify` and every
   other set verdict are unchanged. It narrows the `verify-set` half of the AV-0008 note
   below.
+- AV-2764 changes no verdict. It documents a known limit, now pinned by tests. Rows
+  deleted together with their roots before export, under a trailing empty bundle, are
+  not detectable offline. From manifest v5 that bundle is `valid` and the set is
+  `continuous` (exit 0), as for a quiet window. A later bundle whose rows chain back
+  across the window reports the deletion (README "Cross-bundle continuity",
+  `docs/OPERATIONS.md`).
 - AV-2750 tightens verification only for a build whose embedded DER and fingerprint
   disagree, which `check:trust-anchor-ci` and `prepack` already refuse to build. No bundle
   changes verdict under a consistent pin, `--platform-key` or `--trust-anchor`.
