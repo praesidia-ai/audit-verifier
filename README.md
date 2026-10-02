@@ -202,7 +202,11 @@ It sorts the given bundles by their manifest `from`, then asserts:
 
 - the earliest bundle's chain head is a true genesis anchor (not an opaque
   range start) — otherwise either an earlier bundle is missing from the
-  set, or the chain has been tampered with;
+  set, or the chain has been tampered with. A sealed purge of the oldest
+  hours is crossed by the boundary rule below (AV-2758): the head may be
+  reached from the genesis anchor through seals, exported by that bundle
+  or an empty bundle before it, whose own signature AND link signature
+  both verify; a bridge out of a genesis head is a fork;
 - every adjacent pair's date range is exactly contiguous — a gap or an
   overlap is reported as a named finding, never silently accepted;
 - every adjacent pair's boundary is cryptographically continuous — the

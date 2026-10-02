@@ -4152,7 +4152,7 @@ describe('verifyBundle', () => {
           chainSeqCeiling: rows.length, chainSeqSnapshotAt: at(5 * HOUR + 30), integrityCheckpointCount: 0,
           actionEventCount: 0, captureScopeDigest: sha256(Buffer.from('scope')).toString('hex'),
           evidenceGradeSummary: { A: 0, B: 0, C: 0, D: 0, enforcementMode: 'observe' },
-          evidencePrivacy: { modes: [{ mode: 'FULL', effectiveFrom: at(0) }], schemaVersion: 1 },
+          evidencePrivacy: { modes: [{ mode: 'FULL', effectiveFrom: at(fromHour * HOUR) }], schemaVersion: 1 },
           signatureFormat: 2, signatureFormatCutoverAt: o.cutover ?? at(0),
         });
       }
@@ -4552,20 +4552,98 @@ describe('verifyBundle', () => {
         }]);
         // A quiet window before the history starts adds no finding.
         expect(setOf([-1, 0, 3, 5], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
-        // Hour 0 purged under a seal: the same verdict whether or not an empty bundle holds the purged
-        // window. The genesis check does not follow bridges, linked or not.
-        for (const links of [false, true]) {
-          for (const [hours, firstWithRows] of [[[0, 1, 5], 1], [[0, 3, 5], 0]] as const) {
-            const r = setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0, links }] });
-            expect(r, `links ${links}, windows ${hours.join(',')}`).toMatchObject({ code: 4, status: 'discontinuous' });
-            expect(r.findings.map((f) => [f.kind, f.rightIndex])).toEqual([['chain_head_not_genesis', firstWithRows]]);
-          }
+        // Hour 0 purged under a legacy seal (no links): the same verdict whether or not an empty bundle
+        // holds the purged window. A doubly-signed linked seal bridges the genesis check (AV-2758).
+        for (const [hours, firstWithRows] of [[[0, 1, 5], 1], [[0, 3, 5], 0]] as const) {
+          const r = setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0, links: false }] });
+          expect(r, `windows ${hours.join(',')}`).toMatchObject({ code: 4, status: 'discontinuous' });
+          expect(r.findings.map((f) => [f.kind, f.rightIndex])).toEqual([['chain_head_not_genesis', firstWithRows]]);
         }
       });
 
       it('E7: trailing empty bundles add no finding', () => {
         expect(setOf([0, 3, 5, 6], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
         expect(setOf([0, 3, 4, 5], { purgedHours: [4], seals: () => [{ hour: 4 }] })).toEqual(CONTINUOUS);
+      });
+    });
+
+    /**
+     * AV-2758 — the genesis check (AUDIT-03) follows sealed-purge bridges by
+     * verifyChain's rules: the earliest bundle with rows is genesis-rooted
+     * when its head is GENESIS_PREV_ROW_HASH or is reached from it through
+     * seals, exported by that bundle or an empty bundle before it, whose
+     * seal and link signatures both verify. A purge of the oldest hours is
+     * then not a missing head.
+     */
+    describe('AV-2758 — the genesis check follows doubly-signed sealed-purge bridges', () => {
+      const setOf = (hours: number[], o: Omit<Parameters<typeof build>[0], 'range'>): SetResult =>
+        verifySetOf(hours.slice(1).map((to, i) => build({ ...o, range: [hours[i]!, to] })));
+      /** Windows, and the earliest bundle with rows: the seal is exported by it, or by an empty bundle before it. */
+      const PLACEMENTS = [[[0, 3, 5], 0], [[0, 1, 5], 1]] as const;
+      const x = Buffer.alloc(32, 0x66).toString('base64');
+      function expectNotGenesis(r: SetResult, firstWithRows: number, reason: RegExp): void {
+        expect(r).toMatchObject({ code: 4, status: 'discontinuous' });
+        expect(r.findings).toHaveLength(1);
+        expect(r.findings[0]).toMatchObject({ kind: 'chain_head_not_genesis', rightIndex: firstWithRows });
+        expect(r.findings[0]!.reason).toMatch(reason);
+      }
+
+      it('G1: the oldest hour purged under a doubly-signed seal is genesis-rooted, wherever the seal is exported', () => {
+        for (const [hours] of PLACEMENTS) {
+          expect(setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0 }] }), `windows ${hours.join(',')}`)
+            .toEqual(CONTINUOUS);
+          // Committed in the last bundle's window: exported there too, counted once.
+          expect(setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0, deletedHour: 4 }] }), `windows ${hours.join(',')}`)
+            .toEqual(CONTINUOUS);
+        }
+        // Format-2 signatures (manifest v7).
+        expect(setOf([0, 3, 5], { version: 7, purgedHours: [0], seals: () => [{ hour: 0 }] })).toEqual(CONTINUOUS);
+      });
+
+      it('G2: the two oldest hours purged under adjacent seals, one per empty leading bundle or both in the first', () => {
+        const two = { purgedHours: [0, 1], seals: () => [{ hour: 0 }, { hour: 1 }] };
+        expect(setOf([0, 1, 2, 5], two)).toEqual(CONTINUOUS);
+        expect(setOf([0, 3, 5], two)).toEqual(CONTINUOUS);
+      });
+
+      it('C1: a legacy seal, a bad link signature, a seal for another org or a chainLinkIn off genesis leaves the head non-genesis', () => {
+        const controls: Array<[string, SealOpts]> = [
+          ['legacy seal, no links', { hour: 0, links: false }],
+          ['bad link signature', { hour: 0, tamperLink: true }],
+          ['link envelope for another org', { hour: 0, linkEnvelopeOrg: '00000000-0000-0000-0000-000000000002' }],
+          ['chainLinkIn is not the genesis link', { hour: 0, chainLinkIn: x }],
+        ];
+        for (const [hours, firstWithRows] of PLACEMENTS) {
+          for (const [label, seal] of controls) {
+            const r = setOf([...hours], { purgedHours: [0], seals: () => [seal] });
+            expect(r, `${label}, windows ${hours.join(',')}`).toMatchObject({ code: 4 });
+            expectNotGenesis(r, firstWithRows, /is not genesis-rooted — its chain head is an opaque anchor/);
+          }
+        }
+      });
+
+      it('C2: a seal whose own signature is bad explains nothing: the bundle holding the purged root is invalid', () => {
+        for (const [hours] of PLACEMENTS) {
+          expect(setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0, tamperSeal: true }] }), `windows ${hours.join(',')}`)
+            .toMatchObject({ code: 1, status: 'bundle_invalid' });
+        }
+      });
+
+      it('C3: only bundles up to the earliest bundle with rows count, so a later export of an old purge is no fork', () => {
+        // A pre-purge archive still holds the genesis row; the later export carries the seal of hour 0's purge.
+        expect(verifySetOf([
+          build({ purgedHours: [], seals: () => [], range: [0, 3] }),
+          build({ purgedHours: [0], seals: () => [{ hour: 0, deletedHour: 4 }], range: [3, 5] }),
+        ])).toEqual(CONTINUOUS);
+      });
+
+      it('C4: a bridge out of the genesis link beside a genesis head is a fork', () => {
+        // Nothing purged: row-0 declares genesis; the empty leading bundle's verified seal also bridges genesis away.
+        const r = verifySetOf([
+          build({ purgedHours: [], seals: () => [{ hour: 0, deletedHour: -1, chainLinkOut: x }], range: [-1, 0] }),
+          build({ purgedHours: [], seals: () => [], range: [0, 5] }),
+        ]);
+        expectNotGenesis(r, 1, /is not genesis-rooted — chain fork/);
       });
     });
 

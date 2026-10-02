@@ -20,9 +20,8 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   the AV-2755 boundary rule, through the bridges of every bundle in between, and the
   genesis check (AUDIT-03) applies to the earliest bundle with rows. Stricter: such a
   set is now `discontinuous` (exit 4). That includes an empty leading bundle holding a
-  sealed purge of the oldest hours, which the genesis check does not bridge (the verdict
-  the same purge already gets inside the first bundle). No new status, finding kind or
-  exit code. A boundary finding across empty bundles names them (`(across empty
+  sealed purge of the oldest hours whose seal bridges no verified link (AV-2758 below).
+  No new status, finding kind or exit code. A boundary finding across empty bundles names them (`(across empty
   bundle(s) …)`) and its `leftIndex`/`rightIndex` are the bundles with rows either side;
   after leading empty bundles the genesis finding reads `earliest bundle with rows in
   this set (…, after empty bundle(s) …)`. Sets without empty bundles verify as before.
@@ -255,6 +254,21 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   No new status, exit code or export.
 
 ### Fixed
+- **`verify-set`'s genesis check follows doubly-signed sealed-purge bridges** (AV-2758).
+  The earliest bundle with rows had to start at `GENESIS_PREV_ROW_HASH`, so every set
+  whose oldest hours were legitimately seal-purged read `chain_head_not_genesis`
+  (exit 4). The genesis link is now the tail of the history before the set and the head
+  is checked by the AV-2755 boundary rule: it is genesis-rooted when reached from the
+  genesis link through seals, exported by that bundle or an empty bundle before it,
+  whose seal and link signatures both verify. A legacy seal, a bad link or seal
+  signature, a `chainLinkIn` that is not the genesis link or a link envelope for
+  another organization still fails. Stricter in one case: a verified bridge out of a
+  genesis head is a fork. No new status, finding kind or exit code. New reason texts in
+  `chain_head_not_genesis`: `… its chain head is an opaque anchor, neither
+  GENESIS_PREV_ROW_HASH nor reached from it through sealed-purge bridges whose seal and
+  link signatures both verify. …`, and `… is not genesis-rooted — chain fork: …` /
+  `— chain cycle: …`. Only link-bearing seals (this release) change a verdict, so
+  existing bundles and sets verify as before.
 - **`praesidia-verify verify <bundle.zip>` now works** (AV-0006). It is the command
   every `be` audit package's `verification.txt` and the ui proof page tell the auditor
   to run, but the CLI only knew `<bundle.zip>`, `verify-set` and `aibom`, so it exited 2

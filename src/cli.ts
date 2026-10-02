@@ -87,7 +87,8 @@ USAGE
   SCAN2-004 — \`verify-set\` checks that TWO OR MORE bundles for the same
   org form one continuous history: it sorts them by manifest \`from\`,
   requires the earliest bundle's chain head to be a true genesis anchor
-  (not an opaque range start — closes AUDIT-03), and for every adjacent
+  (not an opaque range start — closes AUDIT-03) or reached from it
+  through doubly-signed seal bridges (AV-2758), and for every adjacent
   pair asserts BOTH the date range is exactly contiguous (no gap, no
   overlap) AND the left bundle's newest-row hash-chain link equals the
   right bundle's declared head anchor (an adjacent-but-forged boundary is
@@ -819,11 +820,22 @@ function buildVerifySetReport(
   // can and must. AV-2756: an empty bundle (zero rows) has nothing to
   // anchor and is looked through, so this applies to the earliest bundle
   // WITH rows; skipped only when there is none or it is itself invalid
-  // (already counted above).
+  // (already counted above). AV-2758: the genesis link is the tail of the
+  // history before the set, so its head is checked like a boundary by
+  // `verifyChainBoundary`: reached through doubly-signed bridges (a purge
+  // of the oldest hours) is genesis-rooted, a bridge out of a genesis head
+  // is a fork. Only bridges of the bundles up to this one count: be exports
+  // a seal with every bundle its purged period overlaps, and a later export
+  // of an old purge would otherwise fork a pre-purge archive's genesis row.
   const firstWithRows = sorted.findIndex((e) => e.report.bundle.rowsSeen > 0);
   const first = sorted[firstWithRows]?.report;
   if (first !== undefined && first.status !== 'invalid') {
-    if (first.bundle.chainHeadAnchor !== GENESIS_PREV_ROW_HASH) {
+    const head = first.bundle.chainHeadAnchor;
+    const genesis =
+      typeof head === 'string'
+        ? verifyChainBoundary(GENESIS_PREV_ROW_HASH, head, sorted.slice(0, firstWithRows + 1).flatMap((e) => e.chainBridges))
+        : { ok: false };
+    if (!genesis.ok) {
       const leading = sorted.slice(0, firstWithRows).map((e) => e.path);
       findings.push({
         kind: 'chain_head_not_genesis',
@@ -833,8 +845,10 @@ function buildVerifySetReport(
             ? `earliest bundle with rows in this set (${sorted[firstWithRows]!.path}, after empty bundle(s) ${leading.join(', ')})`
             : `earliest bundle in this set (${sorted[0]!.path})`) +
           ' is not genesis-rooted — ' +
-          'its chain head is an opaque anchor, not GENESIS_PREV_ROW_HASH. Either an ' +
-          'earlier bundle is missing from this set, or the chain has been tampered with.',
+          (genesis.reason ??
+            'its chain head is an opaque anchor, neither GENESIS_PREV_ROW_HASH nor reached from it through ' +
+              'sealed-purge bridges whose seal and link signatures both verify. Either an earlier bundle is ' +
+              'missing from this set, or the chain has been tampered with.'),
       });
     }
   }
