@@ -4963,12 +4963,15 @@ describe('verifyBundle', () => {
         }
       });
 
-      it('R7 (AV-2782): a right archive whose bytes change between verify-set\'s two reads is exit 2', () => {
+      /**
+       * Runs the built CLI's verify-set over `zips` (bundle-<i>.zip) with a
+       * local racer: the 2nd open of bundle-<swap>.zip opens `swapTo` instead.
+       */
+      function raceVerifySet(zips: Buffer[], swap: number, swapTo: Buffer): { status: number | null; stdout: string; stderr: string; swapped: string } {
         const cliPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
         expect(fs.existsSync(cliPath), 'npm run build must run before npm test').toBe(true);
         const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-2782-'));
         try {
-          // A local racer: the 2nd open of SWAP_FROM opens SWAP_TO instead.
           const preload = path.join(tmp, 'swap.mjs');
           fs.writeFileSync(preload, [
             "import fs from 'node:fs';",
@@ -4984,29 +4987,55 @@ describe('verifyBundle', () => {
             '};',
             'syncBuiltinESMExports();',
           ].join('\n'));
-          const right = build({ ...ARCHIVE, range: [2, 5] });
-          const [left, rightPath, same, other] = ['bundle-0', 'bundle-1', 'same', 'other'].map((n) => path.join(tmp, `${n}.zip`));
-          fs.writeFileSync(left!, build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }));
-          fs.writeFileSync(rightPath!, right);
-          fs.writeFileSync(same!, right);
-          fs.writeFileSync(other!, cut(right, 'row-5'));
-          const run = (swapTo: string) => spawnSync(
+          const paths = zips.map((zip, i) => {
+            const p = path.join(tmp, `bundle-${i}.zip`);
+            fs.writeFileSync(p, zip);
+            return p;
+          });
+          const to = path.join(tmp, 'swap-to.zip');
+          fs.writeFileSync(to, swapTo);
+          const r = spawnSync(
             process.execPath,
-            ['--import', pathToFileURL(preload).href, cliPath, 'verify-set', left!, rightPath!, '--no-rekor', '--allow-legacy-unattested', '--json'],
-            { encoding: 'utf8', env: { ...process.env, SWAP_FROM: rightPath, SWAP_TO: swapTo } },
+            ['--import', pathToFileURL(preload).href, cliPath, 'verify-set', ...paths, '--no-rekor', '--allow-legacy-unattested', '--json'],
+            { encoding: 'utf8', env: { ...process.env, SWAP_FROM: paths[swap], SWAP_TO: to } },
           );
-          // The M1 set: a bridge leaves the right archive's head anchor, so verify-set reads it twice.
-          const control = run(same!);
-          expect(control.stderr).toContain('SWAPPED');
-          expect(control.status).toBe(0);
-          const swapped = run(other!);
-          expect(swapped.stderr).toContain('SWAPPED');
-          expect(swapped.stderr).toContain(`error: cannot read bundle ${rightPath}: it changed while verify-set was reading it`);
-          expect(swapped.status).toBe(2);
-          expect(swapped.stdout).toBe('');
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr, swapped: paths[swap]! };
         } finally {
           fs.rmSync(tmp, { recursive: true, force: true });
         }
+      }
+
+      it('R7 (AV-2782): a right archive whose bytes change between verify-set\'s two reads is exit 2', () => {
+        const right = build({ ...ARCHIVE, range: [2, 5] });
+        const set = [build({ purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }), right];
+        // The M1 set: a bridge leaves the right archive's head anchor, so verify-set reads it twice.
+        const control = raceVerifySet(set, 1, right);
+        expect(control.stderr).toContain('SWAPPED');
+        expect(control.status).toBe(0);
+        const swapped = raceVerifySet(set, 1, cut(right, 'row-5'));
+        expect(swapped.stderr).toContain('SWAPPED');
+        expect(swapped.stderr).toContain(`error: cannot read bundle ${swapped.swapped}: it changed while verify-set was reading it`);
+        expect(swapped.status).toBe(2);
+        expect(swapped.stdout).toBe('');
+      });
+
+      it('R7b (AV-2780): a later archive whose bytes change between verify-set\'s two reads is exit 2', () => {
+        // The M5 set: link(3) is not in the right archive [2, 3), so verify-set reads the archive [3, 5) twice too.
+        const hourOf = [0, 1, 2, 3, 4, 5];
+        const set = [
+          build({ hourOf, purgedHours: [2, 3], seals: ({ link }) => [{ hour: 2, deletedHour: 1, chainLinkOut: link(3) }], range: [0, 2] }),
+          build({ hourOf, ...ARCHIVE, range: [2, 3] }),
+          build({ hourOf, ...ARCHIVE, range: [3, 5] }),
+        ];
+        const control = raceVerifySet(set, 2, set[2]!);
+        expect(control.stderr).toContain('SWAPPED');
+        expect(control.status).toBe(0);
+        // Another valid archive from the same hour that also holds row 3: only the read-twice guard tells them apart.
+        const swapped = raceVerifySet(set, 2, build({ hourOf, ...ARCHIVE, range: [3, 6] }));
+        expect(swapped.stderr).toContain('SWAPPED');
+        expect(swapped.stderr).toContain(`error: cannot read bundle ${swapped.swapped}: it changed while verify-set was reading it`);
+        expect(swapped.status).toBe(2);
+        expect(swapped.stdout).toBe('');
       });
 
       it('F1: a bridge out of the right head anchor back to a LEFT row link is still a fork', () => {
@@ -5041,6 +5070,22 @@ describe('verifyBundle', () => {
         ]);
         expectBoundaryBreak(r, /chain fork/);
         expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 1 });
+      });
+
+      it('F5 (AV-2780): a bridge back to a left row link that another bridge had verify-set find is still a fork', () => {
+        // Hour 4 is quiet. The left export's seal bridges link(1) to link(2), so verify-set finds link(2) in the archive
+        // [2, 4); the empty bundle [4, 5) exports a seal bridging link(3), the head anchor of the archive [5, 7), back to it.
+        const hourOf = [0, 1, 2, 3, 5, 6];
+        const r = verifySetOf([
+          build({ hourOf, purgedHours: [2], seals: () => [{ hour: 2, deletedHour: 1 }], range: [0, 2] }),
+          build({ hourOf, ...ARCHIVE, range: [2, 4] }),
+          build({ hourOf, purgedHours: [], seals: ({ link }) => [
+            { id: 'seal-back', hour: 3, deletedHour: 4, chainLinkIn: link(3), chainLinkOut: link(2) },
+          ], range: [4, 5] }),
+          build({ hourOf, ...ARCHIVE, range: [5, 7] }),
+        ]);
+        expectBoundaryBreak(r, /across empty bundle\(s\) \S*bundle-2\.zip\) boundary: chain fork/);
+        expect(r.findings[0]).toMatchObject({ leftIndex: 1, rightIndex: 3 });
       });
 
       it('F3: a right bundle that carries the bridge out of its own head row is bundle_invalid', () => {

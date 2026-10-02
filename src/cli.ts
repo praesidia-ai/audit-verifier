@@ -1142,11 +1142,11 @@ async function mainVerifySet(argv: string[]): Promise<number> {
   }
   // A bridge out of a bundle's head anchor is no fork when it lands on that
   // bundle's row links or a later bundle's (`verifyChainBoundary`, AV-2780).
-  // The bridges come from every bundle, so only a bundle some bridge leaves
-  // the head of is looked at again, then each later bundle with rows, in
-  // `from` order, while a link asked for is still not found. Only the links
-  // asked for are kept: what verify-set holds grows with the bridges in the
-  // set, never with the rows. Each bundle is looked at again at most once.
+  // So a bundle some bridge leaves the head of is looked at again, then each
+  // later bundle with rows, in `from` order, while an asked-for link is not
+  // found; each at most once. Only the asked-for links are kept: what
+  // verify-set holds grows with the links found times the bundles (`ahead`
+  // copies them per bundle), never with the rows.
   const outsOf = new Map<string, Set<string>>();
   for (const b of entries.flatMap((e) => e.chainBridges)) {
     outsOf.set(b.linkIn, (outsOf.get(b.linkIn) ?? new Set<string>()).add(b.linkOut));

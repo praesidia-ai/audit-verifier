@@ -283,11 +283,11 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   bridge out of the head anchor is now a fork only when it lands on no row of the right
   bundle. To learn that, `verify-set` reads a bundle a bridge leaves the head of a second
   time, requires the same SHA-256 (else exit 2), and keeps only the links it asked for:
-  what it holds grows with the bridges in the set, never with the rows. A bridge to any
-  other link (a left row, an unknown link) is still a fork; for a row of a later bundle,
-  see AV-2780. The
-  comments on `verifyChainBoundary` and the genesis check now state be's seal export rule
-  (period overlaps the window, or `deletedAt` falls in it) and the dedupe key.
+  what it holds grows with the links it finds times the bundles in the set (AV-2780), never
+  with the rows. A bridge to any other link (a left row, an unknown link) is still a fork;
+  for a row of a later bundle, see AV-2780. The comments on `verifyChainBoundary` and the
+  genesis check now state be's seal export rule (period overlaps the window, or
+  `deletedAt` falls in it) and the dedupe key.
 - **`verify-set` no longer reads a purged run split across pre-purge archives as a chain
   fork** (AV-2780). The AV-2775 rule asked only the right bundle, so a bridge out of its
   head anchor whose `linkOut` is a row of a later archive (the purged run went on past the
