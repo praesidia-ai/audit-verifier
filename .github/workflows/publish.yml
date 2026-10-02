@@ -154,15 +154,21 @@ jobs:
         # published tarball corresponds to this exact CI run/commit, not
         # just trust an npm-token holder's say-so. Requires the `id-token`
         # permission above; npm's publish tooling handles the OIDC exchange.
-        # The build job already proved RELEASE_TAG == v<package.json version>.
+        # AV-2776 — publish the one .tgz npm pack wrote into release/, under
+        # the name npm gave it (the build job proved RELEASE_TAG ==
+        # v<package.json version> before packing); none or several fails.
+        # Not `npm pack --json`: prepack's output shares its stdout.
         working-directory: release
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          TARBALL="praesidia-audit-verifier-${RELEASE_TAG#v}.tgz"
-          test -f "$TARBALL"
-          npm publish "./${TARBALL}" --access public --provenance
+          shopt -s nullglob
+          TARBALLS=(*.tgz)
+          if [ "${#TARBALLS[@]}" -ne 1 ]; then
+            echo "release/ must hold exactly one .tgz, found ${#TARBALLS[@]}: ${TARBALLS[*]}" >&2
+            exit 1
+          fi
+          npm publish "./${TARBALLS[0]}" --access public --provenance
 
   # AV-0015 — the only job with `contents: write`. Runs after npm publish
   # succeeds, uploads exactly the files SHA256SUMS covers (after re-checking

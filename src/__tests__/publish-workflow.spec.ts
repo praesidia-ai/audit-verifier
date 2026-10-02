@@ -10,7 +10,9 @@
  * keep the 2-space job layout they have today.
  */
 import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -119,5 +121,67 @@ describe('publish workflow — no dependency code where a publish credential liv
       }
     }
     expect(unpinned).toEqual([]);
+  });
+});
+
+/** The `run: |` script of step `step` in job `jobId` of publish.yml, dedented. */
+function runScript(jobId: string, step: string): string {
+  const lines = fs.readFileSync(path.join(workflowsDir, 'publish.yml'), 'utf8').split('\n');
+  const jobAt = lines.findIndex((l) => l === `  ${jobId}:`);
+  const stepAt = lines.findIndex((l, i) => i > jobAt && l.trim() === `- name: ${step}`);
+  const runAt = lines.findIndex((l, i) => i > stepAt && /^\s+run: \|\s*$/.test(l));
+  if (jobAt < 0 || stepAt < 0 || runAt < 0) throw new Error(`publish.yml: no run: | in ${jobId} / ${step}`);
+  const indent = lines[runAt].search(/\S/);
+  const end = lines.findIndex((l, i) => i > runAt && l.trim() !== '' && l.search(/\S/) <= indent);
+  const body = lines.slice(runAt + 1, end < 0 ? undefined : end);
+  return body.map((l) => l.slice(indent + 2)).join('\n');
+}
+
+describe('publish job — publishes the tarball npm pack wrote, never a hand-built name (AV-2776)', () => {
+  const script = runScript('publish', 'Publish to npm');
+
+  /** Runs the step as Actions does (`bash -e`, in release/) with a stub `npm` that records its argv. */
+  function publishStep(files: string[]): { status: number | null; npmArgs: string[] | null; stderr: string } {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'av-2776-'));
+    try {
+      const release = path.join(dir, 'release');
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(release);
+      fs.mkdirSync(bin);
+      for (const f of files) fs.writeFileSync(path.join(release, f), 'x');
+      const argsFile = path.join(dir, 'npm-args');
+      fs.writeFileSync(path.join(bin, 'npm'), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\n`, { mode: 0o755 });
+      const r = spawnSync('bash', ['-e', '-c', script], {
+        cwd: release,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, RELEASE_TAG: 'v9.9.9' },
+      });
+      const npmArgs = fs.existsSync(argsFile) ? fs.readFileSync(argsFile, 'utf8').trim().split('\n') : null;
+      return { status: r.status, npmArgs, stderr: r.stderr };
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const assets = ['SHA256SUMS', 'README.md', 'audit-package.valid.zip', 'sample-platform-key.pem'];
+
+  it('publishes the one .tgz in release/, whatever npm named it', () => {
+    // A renamed package: the old step rebuilt `praesidia-audit-verifier-<tag>.tgz` and failed here.
+    const r = publishStep(['acme-renamed-verifier-9.9.9.tgz', ...assets]);
+    expect(r.stderr).toBe('');
+    expect(r.status).toBe(0);
+    expect(r.npmArgs).toEqual(['publish', './acme-renamed-verifier-9.9.9.tgz', '--access', 'public', '--provenance']);
+  });
+
+  it('fails closed, without publishing, when release/ holds no .tgz', () => {
+    const r = publishStep(assets);
+    expect(r.status).not.toBe(0);
+    expect(r.npmArgs).toBeNull();
+  });
+
+  it('fails closed, without publishing, when release/ holds more than one .tgz', () => {
+    const r = publishStep(['praesidia-audit-verifier-9.9.9.tgz', 'praesidia-audit-verifier-9.9.8.tgz', ...assets]);
+    expect(r.status).not.toBe(0);
+    expect(r.npmArgs).toBeNull();
   });
 });
