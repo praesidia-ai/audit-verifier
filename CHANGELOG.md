@@ -206,7 +206,7 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   anchor-request row, its Merkle inclusion proof and signed root (pinned tenant keys), and the
   root's Rekor receipt against a pinned log key. `AibomVerifyReport` gains `anchorStatus`
   (`verified_rekor` | `unverified`), `anchoredAt` (the log's signed `integratedTime`) and
-  `anchorReason`, with verdicts and reasons equal to `be`'s. `AibomVerifyOptions` gains
+  `anchorReason`; a Rekor reason can differ from `be`'s (AV-2778). `AibomVerifyOptions` gains
   `rekorPublicKeysPem`, which defaults to the pinned Sigstore key. The four `anchor*` labels leave
   `AIBOM_UNAUTHENTICATED_FIELDS`: each must now agree with the proof. The `aibom` human output
   prints `anchor: verified_rekor at <time>` or `anchor: UNVERIFIED (<reason>)` instead of the

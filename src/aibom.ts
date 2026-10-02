@@ -23,7 +23,7 @@
  * AV-0005 — for a bundle that verifies, the anchor (be BE-1255
  * `anchorProof`, procedure A2-A10) is checked offline against the caller's
  * pins: tenant fingerprints for the row and root keys, pinned Rekor log keys
- * for the receipt. Verdicts and reasons equal be's own offline verifier.
+ * for the receipt. Rekor reasons can differ from be's: see {@link verifyAnchorProof}.
  */
 import {
   canonicalJson, decodeBase64Strict, merkleRootEnvelope, merkleVerify, sha256, verifySignature,
@@ -197,10 +197,20 @@ interface AnchorContext {
 }
 
 /**
- * AV-0005 — be BE-1255 `AIBOM_ANCHOR_VERIFICATION_PROCEDURE` A2-A10, a
- * line-for-line port of be's `verifyAnchorProof`. Never throws: a malformed
- * proof is `anchor_proof_malformed`. No `anchorProof` keeps the pre-BE-1255
- * verdict. Trust comes only from `options`, never from keys the proof ships.
+ * AV-0005 — be BE-1255 `AIBOM_ANCHOR_VERIFICATION_PROCEDURE` A2-A10, a port
+ * of be's `verifyAnchorProof`. Never throws: a malformed proof is
+ * `anchor_proof_malformed`. No `anchorProof` keeps the pre-BE-1255 verdict.
+ * Trust comes only from `options`, never from keys the proof ships.
+ *
+ * AV-2778 — A8's per-receipt check is not ported. Each receipt goes through
+ * this package's `verifyRekorReceipt`, not be's `verifyFullRekorReceipt`
+ * (`be/src/audit/services/anchor-status.service.ts`), so a failed receipt's
+ * reason can differ from be's. be checks the log's inclusion proof before its
+ * checkpoint; `verifyRekorReceipt` checks the checkpoint first. A receipt
+ * whose `inclusionProof.rootHash` was replaced is `inclusion_root_mismatch`
+ * in be and `checkpoint_root_mismatch` here. Each side also has reasons the
+ * other never returns: `set_logid_unpinned` here, `inclusion_log_index_mismatch`
+ * in be.
  */
 function verifyAnchorProof(proof: unknown, env: AnchorContext, options: AibomVerifyOptions): AibomAnchor {
   if (proof == null) return unanchored(AIBOM_NOT_ANCHORED);

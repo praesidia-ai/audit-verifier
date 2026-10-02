@@ -147,6 +147,14 @@ describe('AV-0005 aibom anchor — editing any anchor field yields unverified wi
   });
 });
 
+describe('AV-2778 aibom anchor — a Rekor reason that is not be’s', () => {
+  it('a receipt whose inclusionProof.rootHash was replaced is checkpoint_root_mismatch (be: inclusion_root_mismatch)', () => {
+    // be checks the log's inclusion proof before its checkpoint; this package checks the checkpoint first.
+    const bytes = edited('anchored-rekor', (e) => editReceipt(e, (r) => (r.inclusionProof.rootHash = 'f'.repeat(64))));
+    expect(verdict(bytes)).toEqual(unverified('checkpoint_root_mismatch'));
+  });
+});
+
 describe('AV-0005 aibom anchor — older envelopes and invalid bundles', () => {
   it('an envelope without anchorProof (pre-BE-1255 export, BE-0738 labels only) verifies exactly as before', () => {
     const bytes = edited('anchored-rekor', (e) => delete e.anchorProof);
