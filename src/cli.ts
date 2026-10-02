@@ -92,8 +92,9 @@ USAGE
   overlap) AND the left bundle's newest-row hash-chain link equals the
   right bundle's declared head anchor (an adjacent-but-forged boundary is
   caught, not just a date gap) or reaches it through sealed-purge bridges
-  whose seal and link signatures both verify (AV-2755). Every
-  discontinuity is a NAMED finding —
+  whose seal and link signatures both verify (AV-2755). An empty bundle
+  (no rows) is looked through: the chain checks run from the previous
+  bundle with rows (AV-2756). Every discontinuity is a NAMED finding —
   never silence. Does not change the single-bundle command above in any
   way.
 
@@ -757,7 +758,10 @@ async function resolveTargetPublicKeys(
 
 interface ContinuityFinding {
   kind: 'date_gap' | 'date_overlap' | 'boundary_chain_mismatch' | 'chain_head_not_genesis';
-  /** Index into the SORTED bundle list this finding concerns (or the pair either side of it). */
+  /**
+   * Index into the SORTED bundle list this finding concerns (or the pair either side of it;
+   * AV-2756: for a boundary across empty bundles, the bundles with rows either side of them).
+   */
   leftIndex?: number;
   rightIndex?: number;
   reason: string;
@@ -812,30 +816,47 @@ function buildVerifySetReport(
   // been tampered with; single-bundle verification cannot tell those
   // apart from a legitimate ranged export (BUGHUNT-SDK-02) and must keep
   // accepting it — but `verify-set`, which claims to see the whole set,
-  // can and must. Skipped only when the earliest bundle has zero rows
-  // (nothing to anchor) or is itself invalid (already counted above).
-  const first = sorted[0]!.report;
-  if (first.status !== 'invalid' && first.bundle.rowsSeen > 0) {
+  // can and must. AV-2756: an empty bundle (zero rows) has nothing to
+  // anchor and is looked through, so this applies to the earliest bundle
+  // WITH rows; skipped only when there is none or it is itself invalid
+  // (already counted above).
+  const firstWithRows = sorted.findIndex((e) => e.report.bundle.rowsSeen > 0);
+  const first = sorted[firstWithRows]?.report;
+  if (first !== undefined && first.status !== 'invalid') {
     if (first.bundle.chainHeadAnchor !== GENESIS_PREV_ROW_HASH) {
+      const leading = sorted.slice(0, firstWithRows).map((e) => e.path);
       findings.push({
         kind: 'chain_head_not_genesis',
-        rightIndex: 0,
+        rightIndex: firstWithRows,
         reason:
-          `earliest bundle in this set (${sorted[0]!.path}) is not genesis-rooted — ` +
+          (leading.length > 0
+            ? `earliest bundle with rows in this set (${sorted[firstWithRows]!.path}, after empty bundle(s) ${leading.join(', ')})`
+            : `earliest bundle in this set (${sorted[0]!.path})`) +
+          ' is not genesis-rooted — ' +
           'its chain head is an opaque anchor, not GENESIS_PREV_ROW_HASH. Either an ' +
           'earlier bundle is missing from this set, or the chain has been tampered with.',
       });
     }
   }
 
+  // AV-2756 — the newest bundle with rows at or before the current pair,
+  // while every pair since it is valid and date-adjacent. An empty bundle
+  // has no chain link, so a bundle with rows is stitched to this one across
+  // any empty bundles between them: rows deleted under an empty bundle are
+  // a boundary finding, never silence.
+  let stitchFrom: number | undefined;
   for (let i = 0; i + 1 < sorted.length; i++) {
     const left = sorted[i]!;
     const right = sorted[i + 1]!;
+    if (left.report.bundle.rowsSeen > 0) stitchFrom = i;
     // Each bundle's own validity is already reflected in `bundleInvalid`
     // above; a broken bundle has no trustworthy `to`/chain endpoint to
     // stitch against, so skip pairing it into a continuity finding here
     // rather than reporting a confusing secondary symptom.
-    if (left.report.status === 'invalid' || right.report.status === 'invalid') continue;
+    if (left.report.status === 'invalid' || right.report.status === 'invalid') {
+      stitchFrom = undefined;
+      continue;
+    }
 
     const leftToMs = Date.parse(left.report.bundle.to);
     const rightFromMs = Date.parse(right.report.bundle.from);
@@ -848,6 +869,7 @@ function buildVerifySetReport(
           `${left.path} [${left.report.bundle.from}, ${left.report.bundle.to}) overlaps ` +
           `${right.path} [${right.report.bundle.from}, ${right.report.bundle.to})`,
       });
+      stitchFrom = undefined;
       continue; // an overlapping pair has no well-defined boundary to chain-link check
     }
     if (rightFromMs > leftToMs) {
@@ -860,37 +882,40 @@ function buildVerifySetReport(
           `${left.path} ends at ${left.report.bundle.to}, ${right.path} does not start ` +
           `until ${right.report.bundle.from}`,
       });
+      stitchFrom = undefined;
       continue;
     }
     // Dates are exactly adjacent — AUDIT-01 also requires binding the
     // CRYPTOGRAPHIC boundary, not just the date match, so a forged
     // replacement bundle with a convenient `from` cannot pass as
     // continuous. AV-2755: a sealed purge on the boundary is crossed only
-    // through the two bundles' doubly-signed bridges, by verifyChain's rules.
-    if (left.report.bundle.rowsSeen > 0 && right.report.bundle.rowsSeen > 0) {
-      const tail = left.report.bundle.chainTailLinkHash;
+    // through doubly-signed bridges, by verifyChain's rules — here those of
+    // every bundle from `stitchFrom` to `right` (a sealed purge may have
+    // emptied the bundles between).
+    if (stitchFrom !== undefined && right.report.bundle.rowsSeen > 0) {
+      const from = sorted[stitchFrom]!;
+      const tail = from.report.bundle.chainTailLinkHash;
       const head = right.report.bundle.chainHeadAnchor;
       const boundary =
         typeof tail === 'string' && typeof head === 'string'
-          ? verifyChainBoundary(tail, head, [...left.chainBridges, ...right.chainBridges])
+          ? verifyChainBoundary(tail, head, sorted.slice(stitchFrom, i + 2).flatMap((e) => e.chainBridges))
           : { ok: false };
       if (!boundary.ok) {
+        const empties = sorted.slice(stitchFrom + 1, i + 1).map((e) => e.path);
+        const across = empties.length > 0 ? ` (across empty bundle(s) ${empties.join(', ')})` : '';
         findings.push({
           kind: 'boundary_chain_mismatch',
-          leftIndex: i,
+          leftIndex: stitchFrom,
           rightIndex: i + 1,
           reason:
             boundary.reason !== undefined
-              ? `${left.path} -> ${right.path} boundary: ${boundary.reason}`
-              : `${left.path}'s newest-row hash-chain link does not equal ${right.path}'s ` +
-                'declared chain-head anchor — the boundary is date-adjacent but not ' +
+              ? `${from.path} -> ${right.path}${across} boundary: ${boundary.reason}`
+              : `${from.path}'s newest-row hash-chain link does not equal ${right.path}'s ` +
+                `declared chain-head anchor${across} — the boundary is date-adjacent but not ` +
                 'cryptographically continuous (adjacent-but-forged boundary)',
         });
       }
     }
-    // Both/either side genuinely empty (a quiet window, zero rows): there
-    // is no chain link to assert; the date-adjacency check above is the
-    // full assertion available and it already passed for this pair.
   }
 
   const status: VerifySetReport['status'] = bundleInvalid

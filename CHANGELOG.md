@@ -11,6 +11,21 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 ## [0.11.0] — Unreleased
 
 ### Security
+- **`verify-set` checks the hash chain across empty bundles** (AV-2756). A bundle with
+  zero rows has no chain link of its own, and it switched the chain checks off around
+  it: rows deleted under an empty middle bundle went unreported (the set read
+  `continuous`, or `bundle_incomplete` for a zero-root window), and so did rows deleted
+  from the head of the history under an empty leading bundle. An empty bundle is now
+  looked through: each bundle with rows is stitched to the previous bundle with rows by
+  the AV-2755 boundary rule, through the bridges of every bundle in between, and the
+  genesis check (AUDIT-03) applies to the earliest bundle with rows. Stricter: such a
+  set is now `discontinuous` (exit 4). That includes an empty leading bundle holding a
+  sealed purge of the oldest hours, which the genesis check does not bridge (the verdict
+  the same purge already gets inside the first bundle). No new status, finding kind or
+  exit code. A boundary finding across empty bundles names them (`(across empty
+  bundle(s) …)`) and its `leftIndex`/`rightIndex` are the bundles with rows either side;
+  after leading empty bundles the genesis finding reads `earliest bundle with rows in
+  this set (…, after empty bundle(s) …)`. Sets without empty bundles verify as before.
 - **The embedded platform-key pin is checked, not trusted** (AV-2750, audit F02).
   With no key flag, the attestation's declared fingerprint was compared against the
   pinned `PLATFORM_PUBLIC_KEY_FINGERPRINT` constant, never recomputed from the pinned

@@ -4020,7 +4020,9 @@ describe('verifyBundle', () => {
      * chain. v7 signs every slot in format 2 with the cutover at `cutover`.
      * `range` [from, to) hours cuts one bundle of a set: rows, roots and
      * proofs of those hours, and the seals be exports for that range (period
-     * overlaps it, or `deletedAt` falls inside it).
+     * overlaps it, or `deletedAt` falls inside it). `hourOf` replaces HOUR_OF
+     * (an hour with no row has no root: a quiet window). `erasedHours` are
+     * deleted outright, rows AND root, with no seal: no bundle shows they existed.
      */
     function build(o: {
       version?: 1 | 7;
@@ -4032,8 +4034,12 @@ describe('verifyBundle', () => {
       key2Status?: 'ACTIVE' | 'REVOKED';
       post?: (seals: Record<string, unknown>[]) => void;
       range?: [number, number];
+      hourOf?: readonly number[];
+      erasedHours?: number[];
     }): Buffer {
       const [fromHour, toHour] = o.range ?? [0, 5];
+      const hourOf = o.hourOf ?? HOUR_OF;
+      const gone = [...o.purgedHours, ...(o.erasedHours ?? [])];
       const inRange = (h: number): boolean => h >= fromHour && h < toHour;
       const v7 = o.version === 7;
       const fmt: Fmt = v7 ? 2 : undefined;
@@ -4061,18 +4067,19 @@ describe('verifyBundle', () => {
         return sha256(leaf).toString('base64');
       };
       let prev = GENESIS_PREV_ROW_HASH;
-      HOUR_OF.forEach((hour, i) => {
+      hourOf.forEach((hour, i) => {
         prevs.push(prev);
         prev = addRow(`row-${i}`, hour, i + 1, prev);
         links.push(prev);
       });
-      if (o.forkAfter !== undefined) addRow('row-fork', HOUR_OF[o.forkAfter]!, 30, links[o.forkAfter]!);
+      if (o.forkAfter !== undefined) addRow('row-fork', hourOf[o.forkAfter]!, 30, links[o.forkAfter]!);
 
       const roots: Record<string, unknown>[] = [];
       const outOfRangeRoots: Record<string, unknown>[] = [];
       const proofs: unknown[] = [];
-      for (let h = 0; h <= HOUR_OF[HOUR_OF.length - 1]!; h++) {
-        const idx = HOUR_OF.flatMap((hh, i) => (hh === h ? [i] : []));
+      for (let h = 0; h <= hourOf[hourOf.length - 1]!; h++) {
+        const idx = hourOf.flatMap((hh, i) => (hh === h ? [i] : []));
+        if (idx.length === 0 || o.erasedHours?.includes(h)) continue;
         const ls = idx.map((i) => new Uint8Array(leaves[i]!));
         const rootHash = Buffer.from(merkleBuild(ls).root).toString('base64');
         const env = { rootHash, periodStart: at(h * HOUR), periodEnd: at((h + 1) * HOUR), rowCount: idx.length };
@@ -4081,18 +4088,18 @@ describe('verifyBundle', () => {
           keyVersion: 1, signedAt: at((h + 1) * HOUR + 5), anchoredAt: null, anchorReceipt: null,
           ...(v7 ? { signatureAlgorithm: 'Ed25519' } : {}), ...fmtField(fmt),
         });
-        if (o.purgedHours.includes(h) || !inRange(h)) continue;
+        if (gone.includes(h) || !inRange(h)) continue;
         idx.forEach((rowIdx, j) => {
           const p = merkleProof(ls, j);
           proofs.push({ rowId: `row-${rowIdx}`, index: p.index, proof: p.siblings.map((s) => b64(s)), rootHash });
         });
       }
-      const present = rows.filter((r) => inRange(rowHour.get(r.id)!) && (r.id === 'row-fork' || !o.purgedHours.includes(rowHour.get(r.id)!)));
+      const present = rows.filter((r) => inRange(rowHour.get(r.id)!) && (r.id === 'row-fork' || !gone.includes(rowHour.get(r.id)!)));
       const rootOfHour = (h: number) => [...roots, ...outOfRangeRoots].find((r) => r.id === `root-h${h}`)!;
 
       const sealOpts = o.seals({ link: (i) => links[i]!, prev: (i) => prevs[i]! });
       const seals = sealOpts.filter((s) => inRange(s.hour) || inRange(s.deletedHour ?? 5)).map((s) => {
-        const idx = HOUR_OF.flatMap((hh, i) => (hh === s.hour ? [i] : []));
+        const idx = hourOf.flatMap((hh, i) => (hh === s.hour ? [i] : []));
         const env = {
           organizationId: ORG, periodStart: at(s.hour * HOUR), periodEnd: at((s.hour + 1) * HOUR),
           rowCount: String(idx.length), rootHash: rootOfHour(s.hour).rootHash as string, rekorReceipt: null,
@@ -4370,6 +4377,38 @@ describe('verifyBundle', () => {
       }), 2);
     });
 
+    type SetFinding = { kind: string; reason: string; leftIndex?: number; rightIndex?: number };
+    type SetResult = { code: number | null; status: string; findings: SetFinding[] };
+    /** The built CLI's `verify-set --json` over `zips`, written as bundle-<i>.zip in that order. */
+    function verifySetOf(zips: Buffer[]): SetResult {
+      const cliPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
+      expect(fs.existsSync(cliPath), 'npm run build must run before npm test').toBe(true);
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-verify-set-'));
+      try {
+        const files = zips.map((zip, i) => {
+          fs.writeFileSync(path.join(tmp, `bundle-${i}.zip`), zip);
+          return path.join(tmp, `bundle-${i}.zip`);
+        });
+        const r = spawnSync(
+          process.execPath,
+          [cliPath, 'verify-set', ...files, '--no-rekor', '--allow-legacy-unattested', '--json'],
+          { encoding: 'utf8' },
+        );
+        const out = JSON.parse(r.stdout) as Omit<SetResult, 'code'>;
+        return { code: r.status, status: out.status, findings: out.findings };
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+    const CONTINUOUS: SetResult = { code: 0, status: 'continuous', findings: [] };
+    /** Every bundle valid, one boundary not stitched: exit 4, one boundary finding. */
+    function expectBoundaryBreak(r: SetResult, reason: RegExp = /adjacent-but-forged boundary/): void {
+      expect(r).toMatchObject({ code: 4, status: 'discontinuous' });
+      expect(r.findings).toHaveLength(1);
+      expect(r.findings[0]!.kind).toBe('boundary_chain_mismatch');
+      expect(r.findings[0]!.reason).toMatch(reason);
+    }
+
     /**
      * AV-2755 — `verify-set` stitches two adjacent bundles with the same
      * bridges, so a sealed purge on the boundary is not a forged boundary.
@@ -4378,36 +4417,10 @@ describe('verifyBundle', () => {
      * split 2 in the right bundle only. Driven through the built CLI.
      */
     describe('AV-2755 — verify-set bridges a sealed-purge gap that falls on a bundle boundary', () => {
-      type SetResult = { code: number | null; status: string; findings: Array<{ kind: string; reason: string }> };
       function verifySet(split: number, o: Omit<Parameters<typeof build>[0], 'range'>): SetResult {
-        const cliPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../dist/cli.js');
-        expect(fs.existsSync(cliPath), 'npm run build must run before npm test').toBe(true);
-        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-2755-'));
-        try {
-          const files = [build({ ...o, range: [0, split] }), build({ ...o, range: [split, 5] })].map((zip, i) => {
-            fs.writeFileSync(path.join(tmp, `bundle-${i}.zip`), zip);
-            return path.join(tmp, `bundle-${i}.zip`);
-          });
-          const r = spawnSync(
-            process.execPath,
-            [cliPath, 'verify-set', ...files, '--no-rekor', '--allow-legacy-unattested', '--json'],
-            { encoding: 'utf8' },
-          );
-          const out = JSON.parse(r.stdout) as Omit<SetResult, 'code'>;
-          return { code: r.status, status: out.status, findings: out.findings };
-        } finally {
-          fs.rmSync(tmp, { recursive: true, force: true });
-        }
+        return verifySetOf([build({ ...o, range: [0, split] }), build({ ...o, range: [split, 5] })]);
       }
-      const CONTINUOUS: SetResult = { code: 0, status: 'continuous', findings: [] };
       const x = Buffer.alloc(32, 0x77).toString('base64');
-      /** Both bundles valid, the boundary not stitched: exit 4, one boundary finding. */
-      function expectBoundaryBreak(r: SetResult, reason: RegExp = /adjacent-but-forged boundary/): void {
-        expect(r).toMatchObject({ code: 4, status: 'discontinuous' });
-        expect(r.findings).toHaveLength(1);
-        expect(r.findings[0]!.kind).toBe('boundary_chain_mismatch');
-        expect(r.findings[0]!.reason).toMatch(reason);
-      }
 
       it('B1: a doubly-signed seal on the boundary stitches the set, exported with either bundle', () => {
         for (const split of [3, 2]) {
@@ -4471,6 +4484,88 @@ describe('verifyBundle', () => {
           purgedHours: [2],
           seals: ({ link }) => [{ hour: 2 }, { id: 'seal-dup', hour: 3, chainLinkIn: link(1), chainLinkOut: link(3) }],
         }));
+      });
+    });
+
+    /**
+     * AV-2756 — an empty bundle (no rows) has no chain link of its own, and
+     * it used to switch the chain checks off around it: rows deleted across
+     * an empty bundle, or under a leading one, went unreported. It is now
+     * transparent: each bundle with rows is stitched to the previous bundle
+     * with rows through the bridges of every bundle in between, and the
+     * genesis check applies to the earliest bundle with rows. A zero-row,
+     * zero-root bundle is itself `incomplete` (README), so a set holding a
+     * quiet window is `bundle_incomplete` (exit 3) when nothing else is wrong.
+     */
+    describe('AV-2756 — verify-set checks chain continuity across empty bundles', () => {
+      /** One bundle per window [hours[i], hours[i + 1]), written as bundle-<i>.zip. */
+      const setOf = (hours: number[], o: Omit<Parameters<typeof build>[0], 'range'>): SetResult =>
+        verifySetOf(hours.slice(1).map((to, i) => build({ ...o, range: [hours[i]!, to] })));
+      const QUIET: SetResult = { code: 3, status: 'bundle_incomplete', findings: [] };
+      const ACROSS_1 = /bundle-0\.zip's newest-row hash-chain link does not equal \S*bundle-2\.zip's declared chain-head anchor \(across empty bundle\(s\) \S*bundle-1\.zip\)/;
+
+      it('E1: rows deleted without a seal under an empty middle bundle break the boundary between its neighbours', () => {
+        // Hour 2 erased (rows and root): bundle-1 [2, 3) is empty, bundle-2 starts at row-4.
+        const r = setOf([0, 2, 3, 5], { purgedHours: [], erasedHours: [2], seals: () => [] });
+        expectBoundaryBreak(r, ACROSS_1);
+        expect(r.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 2 });
+      });
+
+      it('E2: a purge under an empty middle bundle whose seal binds no verified link breaks the boundary', () => {
+        for (const seal of [{ hour: 2, links: false }, { hour: 2, tamperLink: true }]) {
+          expectBoundaryBreak(setOf([0, 2, 3, 5], { purgedHours: [2], seals: () => [seal] }), ACROSS_1);
+        }
+      });
+
+      it('E3: with no gap, an empty middle bundle adds no finding', () => {
+        // Hour 2 is a quiet window: nothing was ever written in it.
+        expect(setOf([0, 2, 3, 6], { hourOf: [0, 1, 3, 3, 4, 5], purgedHours: [], seals: () => [] })).toEqual(QUIET);
+      });
+
+      it('E4: a doubly-signed sealed purge that empties the middle bundle bridges its neighbours', () => {
+        const sealed = { purgedHours: [2], seals: () => [{ hour: 2 }] };
+        expect(setOf([0, 2, 3, 5], sealed)).toEqual(CONTINUOUS);
+        // Committed in bundle-2's window: exported by bundle-1 and bundle-2, counted once.
+        expect(setOf([0, 2, 3, 5], { ...sealed, seals: () => [{ hour: 2, deletedHour: 3 }] })).toEqual(CONTINUOUS);
+        // A bad 6-field signature explains nothing: the empty bundle's root fails it outright.
+        expect(setOf([0, 2, 3, 5], { ...sealed, seals: () => [{ hour: 2, tamperSeal: true }] }))
+          .toMatchObject({ code: 1, status: 'bundle_invalid' });
+      });
+
+      it('E5: several consecutive empty bundles behave as one', () => {
+        const erased = setOf([0, 2, 3, 4, 5], { purgedHours: [], erasedHours: [2, 3], seals: () => [] });
+        expectBoundaryBreak(erased, /\(across empty bundle\(s\) \S*bundle-1\.zip, \S*bundle-2\.zip\)/);
+        expect(erased.findings[0]).toMatchObject({ leftIndex: 0, rightIndex: 3 });
+        expect(setOf([0, 2, 3, 4, 7], { hourOf: [0, 1, 4, 4, 5, 6], purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        // One bridge exported by each empty bundle: link(1) -> link(3) -> link(4).
+        expect(setOf([0, 2, 3, 4, 5], { purgedHours: [2, 3], seals: () => [{ hour: 2 }, { hour: 3 }] })).toEqual(CONTINUOUS);
+      });
+
+      it('E6: the genesis check applies to the earliest bundle with rows, after leading empty bundles', () => {
+        // Hours 0-1 erased under an empty leading bundle: the history's head is gone.
+        const erased = setOf([0, 2, 5], { purgedHours: [], erasedHours: [0, 1], seals: () => [] });
+        expect(erased).toMatchObject({ code: 4, status: 'discontinuous' });
+        expect(erased.findings).toEqual([{
+          kind: 'chain_head_not_genesis',
+          rightIndex: 1,
+          reason: expect.stringMatching(/^earliest bundle with rows in this set \(\S*bundle-1\.zip, after empty bundle\(s\) \S*bundle-0\.zip\) is not genesis-rooted/),
+        }]);
+        // A quiet window before the history starts adds no finding.
+        expect(setOf([-1, 0, 3, 5], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        // Hour 0 purged under a seal: the same verdict whether or not an empty bundle holds the purged
+        // window. The genesis check does not follow bridges, linked or not.
+        for (const links of [false, true]) {
+          for (const [hours, firstWithRows] of [[[0, 1, 5], 1], [[0, 3, 5], 0]] as const) {
+            const r = setOf([...hours], { purgedHours: [0], seals: () => [{ hour: 0, links }] });
+            expect(r, `links ${links}, windows ${hours.join(',')}`).toMatchObject({ code: 4, status: 'discontinuous' });
+            expect(r.findings.map((f) => [f.kind, f.rightIndex])).toEqual([['chain_head_not_genesis', firstWithRows]]);
+          }
+        }
+      });
+
+      it('E7: trailing empty bundles add no finding', () => {
+        expect(setOf([0, 3, 5, 6], { purgedHours: [], seals: () => [] })).toEqual(QUIET);
+        expect(setOf([0, 3, 4, 5], { purgedHours: [4], seals: () => [{ hour: 4 }] })).toEqual(CONTINUOUS);
       });
     });
   });

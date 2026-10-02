@@ -214,7 +214,13 @@ It sorts the given bundles by their manifest `from`, then asserts:
   whose own signature AND link signature both verify. A seal exported in
   both bundles counts once. A bridge beside the right bundle's head row is
   a fork, and a bridge leading back to a link already walked is a cycle;
-  both are a `boundary_chain_mismatch` finding naming that reason.
+  both are a `boundary_chain_mismatch` finding naming that reason;
+- an empty bundle (no rows) has no chain link of its own and is looked
+  through (AV-2756): each bundle with rows is stitched to the previous
+  bundle with rows by the rule above, through the seals of every bundle in
+  between, and the genesis check applies to the earliest bundle with rows.
+  Rows deleted under an empty bundle are a `boundary_chain_mismatch` (or
+  `chain_head_not_genesis`) finding naming the empty bundles, never silence.
 
 A bundle that is itself invalid is reported as such and never downgraded
 to "just a gap". Exit codes let a script tell the three outcomes apart:
