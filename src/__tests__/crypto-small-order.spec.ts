@@ -59,10 +59,25 @@ const add = ([x1, y1]: Pt, [x2, y2]: Pt): Pt => {
   const t = (((((D * x1) % P) * x2) % P) * y1 % P) * y2 % P;
   return [mod((x1 * y2 + x2 * y1) * inv(1n + t)), mod((y1 * y2 + x1 * x2) * inv(1n - t))];
 };
-const mul = (k: bigint, pt: Pt): Pt => {
-  let r: Pt = [0n, 1n];
-  for (; k > 0n; k >>= 1n, pt = add(pt, pt)) if (k & 1n) r = add(r, pt);
-  return r;
+/**
+ * [k]P in extended coordinates (x = X/Z, y = Y/Z, xy = T/Z), RFC 8032 §5.1.4 addition
+ * (complete, so it also doubles), one inversion at the end. AV-2790: double-and-add over the
+ * affine `add` paid two Fermat inversions per step, ~250-380 ms per [L]P, and deriveTorsion's
+ * random draws stacked that past the 5 s test timeout; this costs ~1.5 ms per [L]P.
+ */
+type Ext = readonly [bigint, bigint, bigint, bigint];
+const D2 = mod(2n * D);
+const addExt = ([X1, Y1, Z1, T1]: Ext, [X2, Y2, Z2, T2]: Ext): Ext => {
+  const A = mod((Y1 - X1) * (Y2 - X2)), B = mod((Y1 + X1) * (Y2 + X2));
+  const C = (((T1 * D2) % P) * T2) % P, ZZ = (2n * Z1 * Z2) % P;
+  const E = B - A, F = ZZ - C, G = ZZ + C, H = B + A;
+  return [mod(E * F), mod(G * H), mod(F * G), mod(E * H)];
+};
+const mul = (k: bigint, [x, y]: Pt): Pt => {
+  let r: Ext = [0n, 1n, 1n, 0n];
+  for (let q: Ext = [x, y, 1n, mod(x * y)]; k > 0n; k >>= 1n, q = addExt(q, q)) if (k & 1n) r = addExt(r, q);
+  const zInv = inv(r[2]);
+  return [mod(r[0] * zInv), mod(r[1] * zInv)];
 };
 /** Recover x from y (RFC 8032 §5.1.3 steps 2-3); null if y is not on the curve. */
 const xFromY = (y: bigint): bigint | null => {
