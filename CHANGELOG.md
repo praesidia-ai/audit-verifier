@@ -270,6 +270,16 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   No new status, exit code or export.
 
 ### Fixed
+- **`scripts/contract-drift.mjs` sees fields `be` emits only under a condition** (AV-2793).
+  `be` emits `signatureFormat` only on a format-2 artefact, through a
+  `...(x.signatureFormat === 2 ? { signatureFormat: 2 } : {})` spread. It adds the v7
+  manifest fields only in a `{ ...manifestSansSignature, version: 7, … }` extension. The
+  check saw neither, so [B]/[C]/[D] went red against `be` even though both sides agree on
+  the bytes. The check also missed any `be`-only field behind such a condition. Every
+  branch of a spread, and every extension of `manifestSansSignature`, now counts as
+  emitted, so a conditional field is checked like any other one. The check is stricter
+  than before. CI tooling only; no verdict changes and nothing in the published package
+  changes.
 - **README "What it verifies" step 6 states the AV-2771 Rekor body rule** (AV-2773). It
   still said the `hashedrekord` body must contain the root hash itself. It now says what
   the verifier checks: `data.hash` is the SHA-256 of the bytes the root signature covers,

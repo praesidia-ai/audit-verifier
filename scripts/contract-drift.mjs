@@ -62,6 +62,12 @@
  *      (`verify.ts`). Optionality-aware like [E] (see below) — NOT a plain
  *      A-D-style symmetric diff.
  *
+ * Producer fields emitted only under a condition count as emitted (AV-2793):
+ * every object-literal branch of a depth-1 `...( … )` spread (be's
+ * `...(x.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`), and,
+ * for B/D, every literal that extends `manifestSansSignature` by spread (the
+ * format-2 v7 manifest). A conditional field is checked like any other one.
+ *
  * A-D and F fail on a field present on only one side, in EITHER direction —
  * a be-only field is unrecognized by every offline consumer (both
  * `signableActionEvent` and `signableRow` are TYPED reconstructions, unsafe
@@ -131,7 +137,7 @@
  * affect the exit code.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -151,7 +157,7 @@ function stripComments(source) {
  * type, or the manifest builder's `keyVersions: Object.keys(...).map((v) =>
  * ({...}))`) do not leak their inner field names into the outer set.
  */
-function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowShorthand = true } = {}) {
+export function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowShorthand = true } = {}) {
   const keys = new Set();
   const propertyPattern = assignment
     ? /^([A-Za-z_]\w*)\s*=(?!=)/
@@ -182,6 +188,8 @@ function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowSh
       const match = propertyPattern.exec(rest);
       if (match) {
         keys.add(match[1]);
+      } else if (/^\.\.\.\s*\(/.test(rest)) {
+        for (const key of spreadLiteralKeys(source, source.indexOf('(', index))) keys.add(key);
       } else if (allowShorthand) {
         const shorthandMatch = shorthandPattern.exec(rest);
         if (shorthandMatch) keys.add(shorthandMatch[1]);
@@ -190,6 +198,81 @@ function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowSh
     atLineStart = ch === '\n' || ch === ';' || (atLineStart && (ch === ' ' || ch === '\t'));
   }
   return keys;
+}
+
+/** Index of the bracket closing the `(`/`[`/`{` at `openIndex`, or -1. */
+function closingIndex(text, openIndex) {
+  let depth = 0;
+  for (let index = openIndex; index < text.length; index++) {
+    if ('([{'.includes(text[index])) depth++;
+    else if (')]}'.includes(text[index]) && --depth === 0) return index;
+  }
+  return -1;
+}
+
+/**
+ * AV-2793 — keys of the object literal whose `{` is at `openBraceIndex`, split
+ * on its top-level commas instead of line starts (the literals a conditional
+ * spread or a manifest extension carries are often written inline), recursing
+ * into `...( … )` spreads.
+ */
+function literalKeys(text, openBraceIndex) {
+  const keys = new Set();
+  const close = closingIndex(text, openBraceIndex);
+  let depth = 0;
+  let start = openBraceIndex + 1;
+  for (let index = start; index <= close; index++) {
+    const ch = text[index];
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) depth--;
+    if (depth >= 0 && !(ch === ',' && depth === 0)) continue;
+    const entry = text.slice(start, index).trim();
+    const key = /^([A-Za-z_]\w*)\s*(?:[?!]?\s*:|$)/.exec(entry);
+    if (key) keys.add(key[1]);
+    else if (/^\.\.\.\s*\(/.test(entry)) {
+      for (const k of spreadLiteralKeys(entry, entry.indexOf('('))) keys.add(k);
+    }
+    start = index + 1;
+  }
+  return keys;
+}
+
+/**
+ * AV-2793 — keys a `...( … )` spread whose `(` is at `openParenIndex` can
+ * contribute: those of every object-literal branch, e.g. be's
+ * `...(row.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`.
+ * Every branch counts — a field emitted under ANY condition is one the other
+ * side must know, so a conditional field is checked, never skipped. A spread
+ * of a plain value (`...(manifestUnsigned as T)`) has no literal branch and
+ * contributes nothing here.
+ */
+function spreadLiteralKeys(text, openParenIndex) {
+  const keys = new Set();
+  const close = closingIndex(text, openParenIndex);
+  for (let index = openParenIndex + 1; index < close; index++) {
+    if (text[index] !== '{') continue;
+    for (const key of literalKeys(text, index)) keys.add(key);
+    index = closingIndex(text, index);
+  }
+  return keys;
+}
+
+/**
+ * AV-2793 — be's manifest fields at the NEWEST version: `manifestSansSignature`
+ * plus every object literal that extends it by spread. Since BE-1957 / AV-0018
+ * the version depends on the org's signature format: format 1 keeps the v6
+ * manifest byte-for-byte, format 2 builds `{ ...manifestSansSignature,
+ * version: 7, signatureFormat, signatureFormatCutoverAt }` and signs that. The
+ * v7 fields exist only in that extension. Null when `manifestSansSignature` is
+ * not found.
+ */
+export function newestManifestFields(source) {
+  const fields = keysAfterAnchor(source, /const manifestSansSignature\s*=\s*{/);
+  if (!fields) return null;
+  for (const m of source.matchAll(/{\s*\.\.\.manifestSansSignature\s*,/g)) {
+    for (const key of literalKeys(source, m.index)) fields.add(key);
+  }
+  return fields;
 }
 
 /**
@@ -375,10 +458,7 @@ function main() {
   }
 
   // ── B. Manifest SIGNED PREIMAGE (signature-critical) ───────────────────
-  const manifestSansSignatureFields = keysAfterAnchor(
-    bundleExporterSrc,
-    /const manifestSansSignature\s*=\s*{/,
-  );
+  const manifestSansSignatureFields = newestManifestFields(bundleExporterSrc);
   // SEC-2026-09-12 (MCPSDK-01) — the reconstruction moved OUT of
   // `verifyManifest` into `manifestSignableBytes()` so the platform
   // attestation's `manifestDigest` is computed over the identical preimage.
@@ -404,17 +484,16 @@ function main() {
       const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace);
       const gatedSignableFields = extractDottedAssignments(manifestSignableFn, 'signable');
       const verifierSignableFields = new Set([...baseSignableFields, ...gatedSignableFields]);
-      // be always builds the LATEST manifest version unconditionally (see
-      // bundle-exporter.service.ts's own comment: "the manifest is always
-      // version 5 going forward — there is no code path left that emits a
-      // v3/v4 manifest"), so its signed preimage is
-      // `manifestSansSignature` fields plus `signatureAlgorithm` (added at
-      // sign time, canonicalJson({...manifestSansSignature,
-      // signatureAlgorithm})) — the newest-version union the verifier's
+      // be's newest manifest is `manifestSansSignature` (v6) or, for a
+      // format-2 org, its v7 extension `{ ...manifestSansSignature, version:
+      // 7, signatureFormat, signatureFormatCutoverAt }` (AV-2793, see
+      // `newestManifestFields`). It signs canonicalJson({...that,
+      // signatureAlgorithm}), so the signed preimage is the newest-version
+      // union plus `signatureAlgorithm` — the union the verifier's
       // version-gated `signable` object also converges to.
       const beSignableFields = new Set([...manifestSansSignatureFields, 'signatureAlgorithm']);
       for (const failure of diffSets(
-        "be's manifest signed preimage (manifestSansSignature + signatureAlgorithm)",
+        "be's manifest signed preimage (manifestSansSignature + its spread extensions + signatureAlgorithm)",
         beSignableFields,
         "verify.ts's manifestSignableBytes() `signable` reconstruction (newest version)",
         verifierSignableFields,
@@ -474,7 +553,7 @@ function main() {
       ...manifestExtraFields,
     ]);
     for (const failure of diffSets(
-      "be's manifest builder (manifestSansSignature + manifest wire literal)",
+      "be's manifest builder (manifestSansSignature + its spread extensions + manifest wire literal)",
       producerManifestFields,
       'BundleManifest (verify.ts)',
       bundleManifestFields,
@@ -745,4 +824,8 @@ function main() {
   return 0;
 }
 
-process.exit(main());
+// Run as a CLI only when invoked directly; the spec imports the helpers.
+// realpath both sides so a symlinked checkout cannot skip the gate silently.
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exit(main());
+}
