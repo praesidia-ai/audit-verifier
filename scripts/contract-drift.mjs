@@ -19,7 +19,7 @@
  *
  * Technique, reused from `gateway/scripts/contract-drift.py`
  * ------------------------------------------------------------
- * Dependency-free regex/brace-depth scraping of TS source — no TS parser
+ * Dependency-free regex/bracket-depth scraping of TS source — no TS parser
  * dependency needed in CI. `verify.ts` is itself TS, so the same shallow
  * "class/interface/object-literal body, depth-1 `key:` extraction" technique
  * that script uses for `export class *Dto` bodies applies directly to TS
@@ -63,10 +63,12 @@
  *      A-D-style symmetric diff.
  *
  * Producer fields emitted only under a condition count as emitted (AV-2793):
- * every object-literal branch of a depth-1 `...( … )` spread (be's
+ * every object-literal branch of a depth-1 spread (be's
  * `...(x.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`), and,
- * for B/D, every literal that extends `manifestSansSignature` by spread (the
- * format-2 v7 manifest). A conditional field is checked like any other one.
+ * for B/D, every literal branch of the `manifestUnsigned` assignment be signs
+ * (the format-2 v7 manifest; AV-2794). A conditional field is checked like any
+ * other one. A spread of anything else (`...helper(x)`, `...base`) hides the
+ * fields it adds from this scraper, so it is reported as a warning (AV-2794).
  *
  * A-D and F fail on a field present on only one side, in EITHER direction —
  * a be-only field is unrecognized by every offline consumer (both
@@ -133,8 +135,8 @@
  *   node scripts/contract-drift.mjs <path-to-be-core-checkout>
  *
  * Exits non-zero, listing every offending field, when A-D, F, G or H
- * disagree or when [E] finds a hard failure. Warnings (safe [E] drift) print but do not
- * affect the exit code.
+ * disagree or when [E] finds a hard failure. Warnings (safe [E] drift, and spreads this
+ * scraper cannot see into) print but do not affect the exit code.
  */
 
 import { readFileSync, realpathSync } from 'node:fs';
@@ -148,59 +150,12 @@ function stripComments(source) {
 }
 
 /**
- * Depth-1 `key:` / `key?:` / `key =` extraction inside a balanced `{...}`
- * block, starting at `openBraceIndex` (which must point at the opening
- * `{`). Mirrors `gateway/scripts/contract-drift.py`'s `dto_properties`:
- * only captures identifiers at brace-depth 1 relative to the block's own
- * opening brace, so nested object types / nested object literals (e.g.
- * `BundleManifest.evidenceGradeSummary`'s inline `{A,B,C,D,enforcementMode}`
- * type, or the manifest builder's `keyVersions: Object.keys(...).map((v) =>
- * ({...}))`) do not leak their inner field names into the outer set.
+ * AV-2794 — the one balanced-bracket walk in this script: the index of the
+ * bracket closing the `(`/`[`/`{` at `openIndex`, or -1. It counts all three
+ * kinds, so a `,` or a line start inside a nested call or array is never taken
+ * for one of the enclosing block's. Like the rest of this scraper it does not
+ * know about string literals: a bracket inside one miscounts.
  */
-export function extractDepth1Keys(source, openBraceIndex, { assignment = false, allowShorthand = true } = {}) {
-  const keys = new Set();
-  const propertyPattern = assignment
-    ? /^([A-Za-z_]\w*)\s*=(?!=)/
-    : /^([A-Za-z_]\w*)\s*[?!]?\s*:/;
-  // ES6 shorthand object-literal properties (`orgId,` instead of
-  // `orgId: orgId,`) carry no colon at all — only relevant for object
-  // literals (be's producer code uses this liberally), never for TS
-  // `interface` bodies, which always declare `name: Type`.
-  const shorthandPattern = /^([A-Za-z_]\w*)\s*,/;
-  let depth = 0;
-  let index = openBraceIndex;
-  let atLineStart = true;
-  for (; index < source.length; index++) {
-    const ch = source[index];
-    if (ch === '{') {
-      depth++;
-      atLineStart = false;
-      continue;
-    }
-    if (ch === '}') {
-      depth--;
-      if (depth === 0) break;
-      atLineStart = false;
-      continue;
-    }
-    if (depth === 1 && atLineStart) {
-      const rest = source.slice(index);
-      const match = propertyPattern.exec(rest);
-      if (match) {
-        keys.add(match[1]);
-      } else if (/^\.\.\.\s*\(/.test(rest)) {
-        for (const key of spreadLiteralKeys(source, source.indexOf('(', index))) keys.add(key);
-      } else if (allowShorthand) {
-        const shorthandMatch = shorthandPattern.exec(rest);
-        if (shorthandMatch) keys.add(shorthandMatch[1]);
-      }
-    }
-    atLineStart = ch === '\n' || ch === ';' || (atLineStart && (ch === ' ' || ch === '\t'));
-  }
-  return keys;
-}
-
-/** Index of the bracket closing the `(`/`[`/`{` at `openIndex`, or -1. */
 function closingIndex(text, openIndex) {
   let depth = 0;
   for (let index = openIndex; index < text.length; index++) {
@@ -211,66 +166,173 @@ function closingIndex(text, openIndex) {
 }
 
 /**
- * AV-2793 — keys of the object literal whose `{` is at `openBraceIndex`, split
- * on its top-level commas instead of line starts (the literals a conditional
- * spread or a manifest extension carries are often written inline), recursing
- * into `...( … )` spreads.
+ * Calls `visit(index)` for each character from `start` that is outside every
+ * bracket opened at or after `start` (a nested block is skipped whole with
+ * {@link closingIndex}; only its opener is visited). Returns the index where
+ * `visit` returned true, else of the first unmatched closer (the end of the
+ * enclosing block), else `text.length`.
  */
-function literalKeys(text, openBraceIndex) {
+function scanTopLevel(text, start, visit) {
+  for (let index = start; index < text.length; index++) {
+    if (')]}'.includes(text[index]) || visit(index)) return index;
+    if ('([{'.includes(text[index])) {
+      index = closingIndex(text, index);
+      if (index === -1) break;
+    }
+  }
+  return text.length;
+}
+
+/** Index of the first character of each line (or `;`-separated member)
+ * directly inside the block opened at `openIndex`. */
+function depth1LineStarts(source, openIndex) {
+  const starts = [];
+  let atLineStart = false;
+  scanTopLevel(source, openIndex + 1, (index) => {
+    const ch = source[index];
+    if (atLineStart && !' \t\n;'.includes(ch)) starts.push(index);
+    atLineStart = ch === '\n' || ch === ';' || (atLineStart && (ch === ' ' || ch === '\t'));
+    return false;
+  });
+  return starts;
+}
+
+/**
+ * Depth-1 `key:` / `key?:` / `key =` extraction inside a balanced `{...}`
+ * block, starting at `openBraceIndex` (which must point at the opening
+ * `{`). Mirrors `gateway/scripts/contract-drift.py`'s `dto_properties`:
+ * only captures identifiers at depth 1 relative to the block's own
+ * opening brace, so nested object types / nested object literals (e.g.
+ * `BundleManifest.evidenceGradeSummary`'s inline `{A,B,C,D,enforcementMode}`
+ * type, or the manifest builder's `keyVersions: Object.keys(...).map((v) =>
+ * ({...}))`) do not leak their inner field names into the outer set.
+ * A depth-1 `...operand` spread adds what {@link spreadKeys} finds; a spread
+ * this scraper cannot see into goes to `onOpaqueSpread` (AV-2794).
+ */
+export function extractDepth1Keys(
+  source,
+  openBraceIndex,
+  { assignment = false, allowShorthand = true, onOpaqueSpread } = {},
+) {
   const keys = new Set();
+  const propertyPattern = assignment
+    ? /^([A-Za-z_]\w*)\s*=(?!=)/
+    : /^([A-Za-z_]\w*)\s*[?!]?\s*:/;
+  // ES6 shorthand object-literal properties (`orgId,` instead of
+  // `orgId: orgId,`) carry no colon at all — only relevant for object
+  // literals (be's producer code uses this liberally), never for TS
+  // `interface` bodies, which always declare `name: Type`.
+  const shorthandPattern = /^([A-Za-z_]\w*)\s*,/;
+  for (const index of depth1LineStarts(source, openBraceIndex)) {
+    const rest = source.slice(index);
+    const match = propertyPattern.exec(rest);
+    if (match) {
+      keys.add(match[1]);
+    } else if (rest.startsWith('...')) {
+      const end = scanTopLevel(source, index, (i) => source[i] === ',');
+      spreadKeys(source.slice(index + 3, end), keys, onOpaqueSpread);
+    } else if (allowShorthand) {
+      const shorthandMatch = shorthandPattern.exec(rest);
+      if (shorthandMatch) keys.add(shorthandMatch[1]);
+    }
+  }
+  return keys;
+}
+
+/**
+ * AV-2793 — adds to `keys` the keys of the object literal whose `{` is at
+ * `openBraceIndex`, split on its top-level commas instead of line starts (the
+ * literals a conditional spread or a manifest branch carries are often written
+ * inline), recursing into spreads.
+ */
+function literalKeys(text, openBraceIndex, keys, onOpaqueSpread) {
   const close = closingIndex(text, openBraceIndex);
-  let depth = 0;
-  let start = openBraceIndex + 1;
-  for (let index = start; index <= close; index++) {
-    const ch = text[index];
-    if ('([{'.includes(ch)) depth++;
-    else if (')]}'.includes(ch)) depth--;
-    if (depth >= 0 && !(ch === ',' && depth === 0)) continue;
-    const entry = text.slice(start, index).trim();
+  for (let start = openBraceIndex + 1; close !== -1 && start < close; ) {
+    const end = scanTopLevel(text, start, (i) => text[i] === ',');
+    const entry = text.slice(start, end).trim();
     const key = /^([A-Za-z_]\w*)\s*(?:[?!]?\s*:|$)/.exec(entry);
     if (key) keys.add(key[1]);
-    else if (/^\.\.\.\s*\(/.test(entry)) {
-      for (const k of spreadLiteralKeys(entry, entry.indexOf('('))) keys.add(k);
-    }
-    start = index + 1;
+    else if (entry.startsWith('...')) spreadKeys(entry.slice(3), keys, onOpaqueSpread);
+    start = end + 1;
   }
-  return keys;
 }
 
 /**
- * AV-2793 — keys a `...( … )` spread whose `(` is at `openParenIndex` can
- * contribute: those of every object-literal branch, e.g. be's
- * `...(row.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`.
- * Every branch counts — a field emitted under ANY condition is one the other
- * side must know, so a conditional field is checked, never skipped. A spread
- * of a plain value (`...(manifestUnsigned as T)`) has no literal branch and
- * contributes nothing here.
+ * AV-2793 / AV-2794 — adds to `keys` what spreading `operand` contributes.
+ * Every object literal in it counts, so every branch of be's
+ * `...(row.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`
+ * does: a field emitted under ANY condition is one the other side must know,
+ * so it is checked, never skipped. A value branch that is not a literal
+ * (`...helper(x)`, `...base`, `...(cond ? helper(x) : {})`,
+ * `...(manifestUnsigned as T)`) adds fields this scraper cannot see; it goes to
+ * `onOpaqueSpread` instead of contributing nothing silently.
  */
-function spreadLiteralKeys(text, openParenIndex) {
-  const keys = new Set();
-  const close = closingIndex(text, openParenIndex);
-  for (let index = openParenIndex + 1; index < close; index++) {
-    if (text[index] !== '{') continue;
-    for (const key of literalKeys(text, index)) keys.add(key);
-    index = closingIndex(text, index);
+function spreadKeys(operand, keys, onOpaqueSpread) {
+  for (let index = operand.indexOf('{'); index !== -1; index = operand.indexOf('{', index + 1)) {
+    literalKeys(operand, index, keys, onOpaqueSpread);
+    index = closingIndex(operand, index);
+    if (index === -1) break;
   }
-  return keys;
+  for (const branch of opaqueBranches(operand)) onOpaqueSpread?.(branch);
+}
+
+const TRAILING_CAST = /\s+(?:as|satisfies)\s+[^()[\]{}]*$/;
+
+/**
+ * AV-2794 — the value branches of `expression` that are neither an object
+ * literal nor `null`/`undefined`: the expression itself or, for a
+ * `c ? x : y` chain, each arm, recursively. Parentheses and a trailing
+ * `as T` are looked through.
+ */
+function opaqueBranches(expression) {
+  let text = expression.trim().replace(TRAILING_CAST, '');
+  while (text.startsWith('(') && closingIndex(text, 0) === text.length - 1) {
+    text = text.slice(1, -1).trim().replace(TRAILING_CAST, '');
+  }
+  if (/^(?:null|undefined)$/.test(text)) return [];
+  if (text.startsWith('{') && closingIndex(text, 0) === text.length - 1) return [];
+  const isTernaryOperator = (i) =>
+    text[i] === ':' || (text[i] === '?' && !'?.'.includes(text[i + 1]) && text[i - 1] !== '?');
+  const arms = [];
+  let end = -1;
+  do {
+    const start = end + 1;
+    end = scanTopLevel(text, start, isTernaryOperator);
+    // A segment followed by `?` is a condition, not a value.
+    if (text[end] !== '?') arms.push(text.slice(start, end));
+  } while (end < text.length);
+  return arms.length === 1 ? [text] : arms.flatMap(opaqueBranches);
 }
 
 /**
- * AV-2793 — be's manifest fields at the NEWEST version: `manifestSansSignature`
- * plus every object literal that extends it by spread. Since BE-1957 / AV-0018
- * the version depends on the org's signature format: format 1 keeps the v6
- * manifest byte-for-byte, format 2 builds `{ ...manifestSansSignature,
- * version: 7, signatureFormat, signatureFormatCutoverAt }` and signs that. The
- * v7 fields exist only in that extension. Null when `manifestSansSignature` is
- * not found.
+ * AV-2793 / AV-2794 — be's manifest fields at the NEWEST version, anchored on
+ * the value be signs. Since BE-1957 / AV-0018 be signs
+ * `{ ...manifestUnsigned, signatureAlgorithm }` after
+ * `manifestUnsigned = signatureFormat === 2 ? { ...manifestSansSignature,
+ * version: 7, signatureFormat, signatureFormatCutoverAt } :
+ * manifestSansSignature`: format 1 keeps the v6 manifest byte-for-byte,
+ * format 2 signs v7. The newest fields are `manifestSansSignature`'s plus
+ * those of every literal branch of that assignment (what spreading
+ * `manifestUnsigned` contributes). Before BE-1957 (be 6b380bc9^) there is no
+ * `manifestUnsigned` and be signs `manifestSansSignature` itself. Other
+ * literals that spread `manifestSansSignature` — the wire `manifest`, which
+ * adds `signature`/`signatureKeyVersion`, and the `canonicalJson` argument —
+ * add nothing here. A non-literal branch or spread other than
+ * `manifestSansSignature` goes to `onOpaqueSpread`. Null when
+ * `manifestSansSignature` is not found.
  */
-export function newestManifestFields(source) {
-  const fields = keysAfterAnchor(source, /const manifestSansSignature\s*=\s*{/);
+export function newestManifestFields(source, onOpaqueSpread) {
+  const report = (expression) => {
+    if (expression !== 'manifestSansSignature') onOpaqueSpread?.(expression);
+  };
+  const fields = keysAfterAnchor(source, /const manifestSansSignature\s*=\s*{/, {
+    onOpaqueSpread: report,
+  });
   if (!fields) return null;
-  for (const m of source.matchAll(/{\s*\.\.\.manifestSansSignature\s*,/g)) {
-    for (const key of literalKeys(source, m.index)) fields.add(key);
+  for (const m of source.matchAll(/\bmanifestUnsigned\s*=(?![=>])/g)) {
+    const start = m.index + m[0].length;
+    const end = scanTopLevel(source, start, (i) => source[i] === ';');
+    spreadKeys(source.slice(start, end), fields, report);
   }
   return fields;
 }
@@ -282,40 +344,23 @@ export function newestManifestFields(source) {
  * declared `name?: Type` (forward-compat-safe if `be` doesn't emit it) from
  * one declared `name: Type` (its absence breaks `verifyPlatformAttestation`'s
  * structural `malformed` check). Only used for TS `interface` bodies, which
- * never use ES6 object-literal shorthand, so there is no shorthand branch
+ * never use ES6 object-literal shorthand or spreads, so neither is handled
  * here (unlike {@link extractDepth1Keys}).
  */
 function extractDepth1PropertiesWithOptionality(source, openBraceIndex) {
   const props = new Map();
   const propertyPattern = /^([A-Za-z_]\w*)\s*(\?)?\s*:/;
-  let depth = 0;
-  let index = openBraceIndex;
-  let atLineStart = true;
-  for (; index < source.length; index++) {
-    const ch = source[index];
-    if (ch === '{') {
-      depth++;
-      atLineStart = false;
-      continue;
-    }
-    if (ch === '}') {
-      depth--;
-      if (depth === 0) break;
-      atLineStart = false;
-      continue;
-    }
-    if (depth === 1 && atLineStart) {
-      const match = propertyPattern.exec(source.slice(index));
-      if (match) props.set(match[1], { optional: match[2] === '?' });
-    }
-    atLineStart = ch === '\n' || ch === ';' || (atLineStart && (ch === ' ' || ch === '\t'));
+  for (const index of depth1LineStarts(source, openBraceIndex)) {
+    const match = propertyPattern.exec(source.slice(index));
+    if (match) props.set(match[1], { optional: match[2] === '?' });
   }
   return props;
 }
 
 /** Finds `anchorRegex`, then the first `{` at/after the match end, and
- * returns the depth-1 keys of that balanced block — or, with
- * `{ entries: true }`, the `Map<name, {optional}>` form (see
+ * returns the depth-1 keys of that balanced block (`opts` as for
+ * {@link extractDepth1Keys}) — or, with `{ entries: true }`, the
+ * `Map<name, {optional}>` form (see
  * {@link extractDepth1PropertiesWithOptionality}, used by check [E]). */
 function keysAfterAnchor(source, anchorRegex, opts) {
   const match = anchorRegex.exec(source);
@@ -328,22 +373,15 @@ function keysAfterAnchor(source, anchorRegex, opts) {
   return extractDepth1Keys(source, openBrace, opts);
 }
 
-/** Balanced-brace substring of the function whose declaration matches
+/** Balanced-bracket substring of the function whose declaration matches
  * `signatureRegex`, from its opening `{` to the matching `}` (inclusive). */
 function extractFunctionBody(source, signatureRegex) {
   const match = signatureRegex.exec(source);
   if (!match) return null;
   const openBrace = source.indexOf('{', match.index);
   if (openBrace === -1) return null;
-  let depth = 0;
-  for (let index = openBrace; index < source.length; index++) {
-    if (source[index] === '{') depth++;
-    else if (source[index] === '}') {
-      depth--;
-      if (depth === 0) return source.slice(openBrace, index + 1);
-    }
-  }
-  return null;
+  const close = closingIndex(source, openBrace);
+  return close === -1 ? null : source.slice(openBrace, close + 1);
 }
 
 /** `identifier.field = ` assignments anywhere in `body`, e.g. the
@@ -428,6 +466,17 @@ function main() {
 
   const failures = [];
   const warnings = [];
+  // AV-2794 — a spread this scraper cannot see into hides the fields it adds:
+  // warn, naming it, instead of dropping it silently. `known` lists spreads the
+  // check accounts for itself. A warning, not a failure: it marks a blind spot
+  // of this scraper, not drift.
+  const warnOpaque = (check, where, known = []) => (expression) => {
+    if (known.includes(expression)) return;
+    warnings.push(
+      `[${check}] ${where} spreads \`${expression}\`, whose fields this check cannot see — ` +
+        'write them as an object literal or teach scripts/contract-drift.mjs that shape',
+    );
+  };
 
   // ── A. Action-event SIGNED PREIMAGE (signature-critical) ──────────────
   const signableRowFields = keysAfterAnchor(
@@ -446,7 +495,9 @@ function main() {
     failures.push('[A] signableActionEvent() not found in verify.ts (renamed or moved?)');
   } else {
     const returnBrace = signableActionEventFn.indexOf('{', signableActionEventFn.indexOf('return'));
-    const verifierFields = extractDepth1Keys(signableActionEventFn, returnBrace);
+    const verifierFields = extractDepth1Keys(signableActionEventFn, returnBrace, {
+      onOpaqueSpread: warnOpaque('A', "verify.ts's signableActionEvent()"),
+    });
     for (const failure of diffSets(
       "be's SignableProtectedActionEventRow (the SIGNED fields)",
       signableRowFields,
@@ -458,7 +509,10 @@ function main() {
   }
 
   // ── B. Manifest SIGNED PREIMAGE (signature-critical) ───────────────────
-  const manifestSansSignatureFields = newestManifestFields(bundleExporterSrc);
+  const manifestSansSignatureFields = newestManifestFields(
+    bundleExporterSrc,
+    warnOpaque('B', "be's newest manifest (manifestSansSignature / manifestUnsigned)"),
+  );
   // SEC-2026-09-12 (MCPSDK-01) — the reconstruction moved OUT of
   // `verifyManifest` into `manifestSignableBytes()` so the platform
   // attestation's `manifestDigest` is computed over the identical preimage.
@@ -481,19 +535,22 @@ function main() {
       failures.push("[B] manifestSignableBytes()'s `signable` reconstruction object not found");
     } else {
       const openBrace = manifestSignableFn.indexOf('{', signableDeclMatch.index + signableDeclMatch[0].length - 1);
-      const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace);
+      const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace, {
+        onOpaqueSpread: warnOpaque('B', "verify.ts's manifestSignableBytes() `signable`"),
+      });
       const gatedSignableFields = extractDottedAssignments(manifestSignableFn, 'signable');
       const verifierSignableFields = new Set([...baseSignableFields, ...gatedSignableFields]);
       // be's newest manifest is `manifestSansSignature` (v6) or, for a
-      // format-2 org, its v7 extension `{ ...manifestSansSignature, version:
-      // 7, signatureFormat, signatureFormatCutoverAt }` (AV-2793, see
+      // format-2 org, the v7 branch of `manifestUnsigned`, `{
+      // ...manifestSansSignature, version: 7, signatureFormat,
+      // signatureFormatCutoverAt }` (AV-2793/AV-2794, see
       // `newestManifestFields`). It signs canonicalJson({...that,
       // signatureAlgorithm}), so the signed preimage is the newest-version
       // union plus `signatureAlgorithm` — the union the verifier's
       // version-gated `signable` object also converges to.
       const beSignableFields = new Set([...manifestSansSignatureFields, 'signatureAlgorithm']);
       for (const failure of diffSets(
-        "be's manifest signed preimage (manifestSansSignature + its spread extensions + signatureAlgorithm)",
+        "be's manifest signed preimage (manifestSansSignature + manifestUnsigned's literal branches + signatureAlgorithm)",
         beSignableFields,
         "verify.ts's manifestSignableBytes() `signable` reconstruction (newest version)",
         verifierSignableFields,
@@ -521,7 +578,9 @@ function main() {
       '{',
       serializeActionEventFn.indexOf('return'),
     );
-    const producerFields = extractDepth1Keys(serializeActionEventFn, returnBrace);
+    const producerFields = extractDepth1Keys(serializeActionEventFn, returnBrace, {
+      onOpaqueSpread: warnOpaque('C', "be's serializeActionEvent()"),
+    });
     for (const failure of diffSets(
       "be's serializeActionEvent() wire output",
       producerFields,
@@ -546,14 +605,21 @@ function main() {
         '{',
         manifestLiteralMatch.index + manifestLiteralMatch[0].length - 1,
       );
-      manifestExtraFields = extractDepth1Keys(bundleExporterSrc, openBrace);
+      // `...manifestUnsigned` / `...manifestSansSignature` are the newest
+      // manifest fields already counted above.
+      manifestExtraFields = extractDepth1Keys(bundleExporterSrc, openBrace, {
+        onOpaqueSpread: warnOpaque('D', "be's `manifest` wire literal", [
+          'manifestUnsigned',
+          'manifestSansSignature',
+        ]),
+      });
     }
     const producerManifestFields = new Set([
       ...manifestSansSignatureFields,
       ...manifestExtraFields,
     ]);
     for (const failure of diffSets(
-      "be's manifest builder (manifestSansSignature + its spread extensions + manifest wire literal)",
+      "be's manifest builder (newest manifest fields + manifest wire literal)",
       producerManifestFields,
       'BundleManifest (verify.ts)',
       bundleManifestFields,
@@ -563,7 +629,9 @@ function main() {
   }
 
   // ── E. Platform-attestation envelope (forward-compat-aware, MIL-0003) ──
-  const attestationFields = keysAfterAnchor(platformAttestationSrc, /\bconst attestation\s*=\s*{/);
+  const attestationFields = keysAfterAnchor(platformAttestationSrc, /\bconst attestation\s*=\s*{/, {
+    onOpaqueSpread: warnOpaque('E', "be's attestBundle() `attestation` literal"),
+  });
   const attestationBodyEntries = keysAfterAnchor(
     verifyTsSrc,
     /\binterface PlatformAttestationBody\b[^{]*{/,
@@ -642,7 +710,9 @@ function main() {
         '{',
         signableDeclMatch.index + signableDeclMatch[0].length - 1,
       );
-      const baseSignableRowFields = extractDepth1Keys(signableRowFn, openBrace);
+      const baseSignableRowFields = extractDepth1Keys(signableRowFn, openBrace, {
+        onOpaqueSpread: warnOpaque('F', "verify.ts's signableRow() `signable`"),
+      });
       const gatedSignableRowFields = extractDottedAssignments(signableRowFn, 'signable');
       const verifierRowFields = new Set([
         ...baseSignableRowFields,
@@ -694,7 +764,9 @@ function main() {
         '{',
         wireDeclMatch.index + wireDeclMatch[0].length - 1,
       );
-      const baseWireFields = extractDepth1Keys(serializeRowFn, openBrace);
+      const baseWireFields = extractDepth1Keys(serializeRowFn, openBrace, {
+        onOpaqueSpread: warnOpaque('G', "be's serializeRow() `wire`"),
+      });
       const gatedWireFields = extractDottedAssignments(serializeRowFn, 'wire');
       const producerRowFields = new Set([...baseWireFields, ...gatedWireFields]);
       const requiredBundleRowFields = new Set(
@@ -825,7 +897,16 @@ function main() {
 }
 
 // Run as a CLI only when invoked directly; the spec imports the helpers.
-// realpath both sides so a symlinked checkout cannot skip the gate silently.
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// realpath both sides so a symlinked checkout cannot skip the gate silently,
+// even when node keeps the symlink path (`--preserve-symlinks-main`). An
+// argv[1] that is not a file (`node -e '…' arg`) is not this script.
+function invokedDirectly() {
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+if (process.argv[1] && invokedDirectly()) {
   process.exit(main());
 }

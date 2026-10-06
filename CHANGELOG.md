@@ -268,6 +268,20 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   later root, a stub with fields beyond `rowId`/`status`, a stub for an absent row,
   a duplicate, any other status, and any row-signature or chain failure in the tail.
   No new status, exit code or export.
+- **`scripts/contract-drift.mjs` takes the signed manifest from `manifestUnsigned` and names
+  spreads it cannot read** (AV-2794). [B]/[D] counted every `{ ...manifestSansSignature, … }`
+  literal in `be`'s exporter as part of the newest manifest. Before BE-1957 the wire `manifest`
+  literal was one of them, so `signature` and `signatureKeyVersion` counted as signed and [B]
+  went falsely red. The newest fields are now `manifestSansSignature`'s plus those of each
+  literal branch of the `manifestUnsigned` assignment `be` signs, or `manifestSansSignature`'s
+  alone when there is no such assignment (before BE-1957). A spread whose fields the script
+  cannot read (`...helper(x)`, `...base`, `...(cond ? helper(x) : {})`) used to add nothing
+  without a word. It now prints a `::warning::` that names it, and the exit code does not
+  change. The script walks brackets in one place, so the arguments of a multi-line call inside
+  a literal no longer count as keys. The CLI guard no longer throws on import when `argv[1]`
+  is not a file. A run through a symlink with `--preserve-symlinks-main` used to exit 0
+  without checking anything; it now runs the check. Output against `be` HEAD is unchanged.
+  CI tooling only; nothing in the published package changes.
 
 ### Fixed
 - **`scripts/contract-drift.mjs` sees fields `be` emits only under a condition** (AV-2793).
