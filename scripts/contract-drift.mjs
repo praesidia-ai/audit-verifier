@@ -305,6 +305,13 @@ function opaqueBranches(expression) {
 }
 
 /**
+ * AV-2794 — be's bindings that hold the newest manifest: spreading one adds
+ * only fields {@link newestManifestFields} already counts, so no check warns
+ * about it.
+ */
+const NEWEST_MANIFEST_BINDINGS = ['manifestSansSignature', 'manifestUnsigned'];
+
+/**
  * AV-2793 / AV-2794 — be's manifest fields at the NEWEST version, anchored on
  * the value be signs. Since BE-1957 / AV-0018 be signs
  * `{ ...manifestUnsigned, signatureAlgorithm }` after
@@ -317,13 +324,13 @@ function opaqueBranches(expression) {
  * `manifestUnsigned` and be signs `manifestSansSignature` itself. Other
  * literals that spread `manifestSansSignature` — the wire `manifest`, which
  * adds `signature`/`signatureKeyVersion`, and the `canonicalJson` argument —
- * add nothing here. A non-literal branch or spread other than
- * `manifestSansSignature` goes to `onOpaqueSpread`. Null when
+ * add nothing here. A non-literal branch or spread other than one of
+ * {@link NEWEST_MANIFEST_BINDINGS} goes to `onOpaqueSpread`. Null when
  * `manifestSansSignature` is not found.
  */
 export function newestManifestFields(source, onOpaqueSpread) {
   const report = (expression) => {
-    if (expression !== 'manifestSansSignature') onOpaqueSpread?.(expression);
+    if (!NEWEST_MANIFEST_BINDINGS.includes(expression)) onOpaqueSpread?.(expression);
   };
   const fields = keysAfterAnchor(source, /const manifestSansSignature\s*=\s*{/, {
     onOpaqueSpread: report,
@@ -509,7 +516,7 @@ function main() {
   }
 
   // ── B. Manifest SIGNED PREIMAGE (signature-critical) ───────────────────
-  const manifestSansSignatureFields = newestManifestFields(
+  const beNewestManifestFields = newestManifestFields(
     bundleExporterSrc,
     warnOpaque('B', "be's newest manifest (manifestSansSignature / manifestUnsigned)"),
   );
@@ -521,7 +528,7 @@ function main() {
     verifyTsSrc,
     /function manifestSignableBytes\([^)]*\)[^{]*{/,
   );
-  if (!manifestSansSignatureFields) {
+  if (!beNewestManifestFields) {
     failures.push(
       '[B] manifestSansSignature literal not found in bundle-exporter.service.ts (renamed or moved?)',
     );
@@ -548,7 +555,7 @@ function main() {
       // signatureAlgorithm}), so the signed preimage is the newest-version
       // union plus `signatureAlgorithm` — the union the verifier's
       // version-gated `signable` object also converges to.
-      const beSignableFields = new Set([...manifestSansSignatureFields, 'signatureAlgorithm']);
+      const beSignableFields = new Set([...beNewestManifestFields, 'signatureAlgorithm']);
       for (const failure of diffSets(
         "be's manifest signed preimage (manifestSansSignature + manifestUnsigned's literal branches + signatureAlgorithm)",
         beSignableFields,
@@ -593,7 +600,7 @@ function main() {
 
   // ── D. Manifest WIRE shape ──────────────────────────────────────────────
   const bundleManifestFields = keysAfterAnchor(verifyTsSrc, /\binterface BundleManifest\b[^{]*{/);
-  if (!manifestSansSignatureFields) {
+  if (!beNewestManifestFields) {
     // Already reported in check B.
   } else if (!bundleManifestFields) {
     failures.push('[D] BundleManifest interface not found in verify.ts (renamed or moved?)');
@@ -605,17 +612,14 @@ function main() {
         '{',
         manifestLiteralMatch.index + manifestLiteralMatch[0].length - 1,
       );
-      // `...manifestUnsigned` / `...manifestSansSignature` are the newest
-      // manifest fields already counted above.
+      // Spreading `manifestUnsigned` / `manifestSansSignature` adds the newest
+      // manifest fields, already counted above.
       manifestExtraFields = extractDepth1Keys(bundleExporterSrc, openBrace, {
-        onOpaqueSpread: warnOpaque('D', "be's `manifest` wire literal", [
-          'manifestUnsigned',
-          'manifestSansSignature',
-        ]),
+        onOpaqueSpread: warnOpaque('D', "be's `manifest` wire literal", NEWEST_MANIFEST_BINDINGS),
       });
     }
     const producerManifestFields = new Set([
-      ...manifestSansSignatureFields,
+      ...beNewestManifestFields,
       ...manifestExtraFields,
     ]);
     for (const failure of diffSets(
