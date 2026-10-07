@@ -145,22 +145,107 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function stripComments(source) {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+/** Source without its `//` and `/* *\/` comments. AV-2794: a `//` or `/*`
+ * inside a string, template or regex literal is kept (see {@link literalEnd}). */
+export function stripComments(source) {
+  let out = '';
+  let from = 0;
+  for (let index = 0; index < source.length; index++) {
+    const end = literalEnd(source, index);
+    if (end === index) continue;
+    if (source[index] === '/' && '/*'.includes(source[index + 1])) {
+      out += source.slice(from, index);
+      from = end + 1;
+    }
+    index = end;
+  }
+  return out + source.slice(from);
+}
+
+const REGEX_AFTER_KEYWORD = new Set([
+  'return', 'typeof', 'instanceof', 'in', 'of', 'case', 'void', 'delete', 'throw', 'new',
+  'else', 'do', 'yield', 'await',
+]);
+
+/** Whether a `/` at `index` can start a regex literal: where a value can start
+ * (after an operator, an opening bracket, a keyword such as `return`, or at the
+ * start). After an identifier, a number or a closing bracket it divides. */
+function regexMayStart(text, index) {
+  let i = index - 1;
+  while (i >= 0 && /\s/.test(text[i])) i--;
+  if (i < 0) return true;
+  if (!/[\w$]/.test(text[i])) return !')]}'.includes(text[i]);
+  let start = i;
+  while (start > 0 && /[\w$]/.test(text[start - 1])) start--;
+  return REGEX_AFTER_KEYWORD.has(text.slice(start, i + 1));
+}
+
+/**
+ * AV-2794 — if a string, template literal, regex literal or comment starts at
+ * `index`, the index of its last character; otherwise `index`. A `'`/`"`
+ * string that reaches a newline unterminated ends there, and a `/` that does
+ * not close on its own line is no regex, so a stray quote or slash costs one
+ * line at most. A template's `\${ … }` is skipped with {@link closingIndex}.
+ */
+function literalEnd(text, index) {
+  const ch = text[index];
+  if (ch === "'" || ch === '"') {
+    for (let i = index + 1; i < text.length; i++) {
+      if (text[i] === '\\') i++;
+      else if (text[i] === ch) return i;
+      else if (text[i] === '\n') return i - 1;
+    }
+    return text.length - 1;
+  }
+  if (ch === '`') {
+    for (let i = index + 1; i < text.length; i++) {
+      if (text[i] === '\\') i++;
+      else if (text[i] === '`') return i;
+      else if (text[i] === '$' && text[i + 1] === '{') {
+        i = closingIndex(text, i + 1);
+        if (i === -1) break;
+      }
+    }
+    return text.length - 1;
+  }
+  if (ch !== '/') return index;
+  if (text[index + 1] === '/') {
+    const newline = text.indexOf('\n', index);
+    return (newline === -1 ? text.length : newline) - 1;
+  }
+  if (text[index + 1] === '*') {
+    const close = text.indexOf('*/', index + 2);
+    return close === -1 ? text.length - 1 : close + 1;
+  }
+  if (!regexMayStart(text, index)) return index;
+  let inClass = false;
+  for (let i = index + 1; i < text.length && text[i] !== '\n'; i++) {
+    if (text[i] === '\\') i++;
+    else if (text[i] === '[') inClass = true;
+    else if (text[i] === ']') inClass = false;
+    else if (text[i] === '/' && !inClass) return i;
+  }
+  return index;
 }
 
 /**
  * AV-2794 — the one balanced-bracket walk in this script: the index of the
  * bracket closing the `(`/`[`/`{` at `openIndex`, or -1. It counts all three
  * kinds, so a `,` or a line start inside a nested call or array is never taken
- * for one of the enclosing block's. Like the rest of this scraper it does not
- * know about string literals: a bracket inside one miscounts.
+ * for one of the enclosing block's, and it skips strings, templates, regex
+ * literals and comments ({@link literalEnd}), so a bracket inside one does not
+ * count. Depth-1 members are found at line starts ({@link depth1LineStarts}):
+ * this scraper assumes be's Prettier layout, one member per line, and does not
+ * see a key or spread that does not start a line.
  */
 function closingIndex(text, openIndex) {
   let depth = 0;
   for (let index = openIndex; index < text.length; index++) {
-    if ('([{'.includes(text[index])) depth++;
-    else if (')]}'.includes(text[index]) && --depth === 0) return index;
+    const ch = text[index];
+    if ('([{'.includes(ch)) depth++;
+    else if (')]}'.includes(ch)) {
+      if (--depth === 0) return index;
+    } else index = literalEnd(text, index);
   }
   return -1;
 }
@@ -168,7 +253,8 @@ function closingIndex(text, openIndex) {
 /**
  * Calls `visit(index)` for each character from `start` that is outside every
  * bracket opened at or after `start` (a nested block is skipped whole with
- * {@link closingIndex}; only its opener is visited). Returns the index where
+ * {@link closingIndex}, and a string, template, regex literal or comment with
+ * {@link literalEnd}; only its first character is visited). Returns the index where
  * `visit` returned true, else of the first unmatched closer (the end of the
  * enclosing block), else `text.length`.
  */
@@ -178,7 +264,7 @@ function scanTopLevel(text, start, visit) {
     if ('([{'.includes(text[index])) {
       index = closingIndex(text, index);
       if (index === -1) break;
-    }
+    } else index = literalEnd(text, index);
   }
   return text.length;
 }
@@ -258,50 +344,65 @@ function literalKeys(text, openBraceIndex, keys, onOpaqueSpread) {
 }
 
 /**
- * AV-2793 / AV-2794 — adds to `keys` what spreading `operand` contributes.
- * Every object literal in it counts, so every branch of be's
- * `...(row.signatureFormat === 2 ? { signatureFormat: 2 as const } : {})`
- * does: a field emitted under ANY condition is one the other side must know,
- * so it is checked, never skipped. A value branch that is not a literal
- * (`...helper(x)`, `...base`, `...(cond ? helper(x) : {})`,
+ * AV-2793 / AV-2794 — adds to `keys` what spreading `operand` contributes: the
+ * keys of each object literal it can evaluate to ({@link valueBranches}). So
+ * every branch of be's `...(row.signatureFormat === 2 ? { signatureFormat: 2
+ * as const } : {})` counts: a field emitted under ANY condition is one the
+ * other side must know, so it is checked, never skipped. A literal that is
+ * only a call argument or part of a condition (`...withDefaults(row, {
+ * retries: 3 })`) is no value of the spread and adds nothing. A value that is
+ * not a literal, `null` or `undefined` (`...helper(x)`, `...base`,
  * `...(manifestUnsigned as T)`) adds fields this scraper cannot see; it goes to
  * `onOpaqueSpread` instead of contributing nothing silently.
  */
 function spreadKeys(operand, keys, onOpaqueSpread) {
-  for (let index = operand.indexOf('{'); index !== -1; index = operand.indexOf('{', index + 1)) {
-    literalKeys(operand, index, keys, onOpaqueSpread);
-    index = closingIndex(operand, index);
-    if (index === -1) break;
+  for (const branch of valueBranches(operand)) {
+    if (branch.startsWith('{') && closingIndex(branch, 0) === branch.length - 1) {
+      literalKeys(branch, 0, keys, onOpaqueSpread);
+    } else if (!/^(?:null|undefined)$/.test(branch)) {
+      onOpaqueSpread?.(branch);
+    }
   }
-  for (const branch of opaqueBranches(operand)) onOpaqueSpread?.(branch);
 }
 
 const TRAILING_CAST = /\s+(?:as|satisfies)\s+[^()[\]{}]*$/;
 
+/** The top-level parts of `text` between the operators `operatorLength(index)`
+ * finds (it returns the length of the operator at `index`, else 0), each with
+ * the operator that follows it (`''` for the last part). */
+function splitTopLevel(text, operatorLength) {
+  const parts = [];
+  for (let start = 0; ; ) {
+    let length = 0;
+    const end = scanTopLevel(text, start, (index) => (length = operatorLength(index)) > 0);
+    parts.push({ text: text.slice(start, end), operator: text.slice(end, end + length) });
+    if (length === 0) return parts;
+    start = end + length;
+  }
+}
+
 /**
- * AV-2794 — the value branches of `expression` that are neither an object
- * literal nor `null`/`undefined`: the expression itself or, for a
- * `c ? x : y` chain, each arm, recursively. Parentheses and a trailing
- * `as T` are looked through.
+ * AV-2794 — the values `expression` can evaluate to, recursively: each arm of
+ * `c ? x : y` (never the condition), both sides of `a || b` and `a ?? b`, and
+ * only `b` of `a && b` (a falsy `a` spreads nothing). Parentheses and a
+ * trailing `as T` are looked through.
  */
-function opaqueBranches(expression) {
+function valueBranches(expression) {
   let text = expression.trim().replace(TRAILING_CAST, '');
   while (text.startsWith('(') && closingIndex(text, 0) === text.length - 1) {
     text = text.slice(1, -1).trim().replace(TRAILING_CAST, '');
   }
-  if (/^(?:null|undefined)$/.test(text)) return [];
-  if (text.startsWith('{') && closingIndex(text, 0) === text.length - 1) return [];
-  const isTernaryOperator = (i) =>
-    text[i] === ':' || (text[i] === '?' && !'?.'.includes(text[i + 1]) && text[i - 1] !== '?');
-  const arms = [];
-  let end = -1;
-  do {
-    const start = end + 1;
-    end = scanTopLevel(text, start, isTernaryOperator);
-    // A segment followed by `?` is a condition, not a value.
-    if (text[end] !== '?') arms.push(text.slice(start, end));
-  } while (end < text.length);
-  return arms.length === 1 ? [text] : arms.flatMap(opaqueBranches);
+  const ternary = splitTopLevel(text, (i) =>
+    text[i] === ':' || (text[i] === '?' && !'?.'.includes(text[i + 1]) && text[i - 1] !== '?') ? 1 : 0,
+  );
+  if (ternary.length > 1) {
+    return ternary.filter((part) => part.operator !== '?').flatMap((part) => valueBranches(part.text));
+  }
+  const either = splitTopLevel(text, (i) => (text.startsWith('||', i) || text.startsWith('??', i) ? 2 : 0));
+  if (either.length > 1) return either.flatMap((part) => valueBranches(part.text));
+  const both = splitTopLevel(text, (i) => (text.startsWith('&&', i) ? 2 : 0));
+  if (both.length > 1) return valueBranches(both.at(-1).text);
+  return [text];
 }
 
 /**
@@ -320,7 +421,8 @@ const NEWEST_MANIFEST_BINDINGS = ['manifestSansSignature', 'manifestUnsigned'];
  * manifestSansSignature`: format 1 keeps the v6 manifest byte-for-byte,
  * format 2 signs v7. The newest fields are `manifestSansSignature`'s plus
  * those of every literal branch of that assignment (what spreading
- * `manifestUnsigned` contributes). Before BE-1957 (be 6b380bc9^) there is no
+ * `manifestUnsigned` contributes), with or without a type annotation on a
+ * declaration (`let manifestUnsigned: T = …`). Before BE-1957 (be 6b380bc9^) there is no
  * `manifestUnsigned` and be signs `manifestSansSignature` itself. Other
  * literals that spread `manifestSansSignature` — the wire `manifest`, which
  * adds `signature`/`signatureKeyVersion`, and the `canonicalJson` argument —
@@ -336,7 +438,9 @@ export function newestManifestFields(source, onOpaqueSpread) {
     onOpaqueSpread: report,
   });
   if (!fields) return null;
-  for (const m of source.matchAll(/\bmanifestUnsigned\s*=(?![=>])/g)) {
+  for (const m of source.matchAll(
+    /(?:\b(?:let|const|var)\s+manifestUnsigned\s*:[^=;]*|\bmanifestUnsigned\s*)=(?![=>])/g,
+  )) {
     const start = m.index + m[0].length;
     const end = scanTopLevel(source, start, (i) => source[i] === ';');
     spreadKeys(source.slice(start, end), fields, report);
@@ -417,6 +521,122 @@ function diffSets(labelA, setA, labelB, setB) {
   return failures;
 }
 
+/**
+ * AV-2794 — a spread this scraper cannot see into hides the fields it adds:
+ * `opaqueSpreadWarner(warnings)(check, where, known)` is an `onOpaqueSpread`
+ * callback that pushes a warning naming it, unless `known` lists it (a spread
+ * the check counts itself). A warning, not a failure: it marks a blind spot of
+ * this scraper, not drift.
+ */
+function opaqueSpreadWarner(warnings) {
+  return (check, where, known = []) => (expression) => {
+    if (known.includes(expression)) return;
+    warnings.push(
+      `[${check}] ${where} spreads \`${expression}\`, whose fields this check cannot see — ` +
+        'write them as an object literal or teach scripts/contract-drift.mjs that shape',
+    );
+  };
+}
+
+/**
+ * Checks [B] and [D]: be's manifest builder (`bundleExporterSrc`) against
+ * verify.ts's `manifestSignableBytes()` and `BundleManifest` (`verifyTsSrc`),
+ * both comment-stripped. Exported so the spec runs this comparison on both
+ * producer eras (AV-2794).
+ */
+export function checkManifestContract(bundleExporterSrc, verifyTsSrc) {
+  const failures = [];
+  const warnings = [];
+  const warnOpaque = opaqueSpreadWarner(warnings);
+
+  // ── B. Manifest SIGNED PREIMAGE (signature-critical) ───────────────────
+  const beNewestManifestFields = newestManifestFields(
+    bundleExporterSrc,
+    warnOpaque('B', "be's newest manifest (manifestSansSignature / manifestUnsigned)"),
+  );
+  // SEC-2026-09-12 (MCPSDK-01) — the reconstruction moved OUT of
+  // `verifyManifest` into `manifestSignableBytes()` so the platform
+  // attestation's `manifestDigest` is computed over the identical preimage.
+  // This check follows it; the contract it guards is unchanged.
+  const manifestSignableFn = extractFunctionBody(
+    verifyTsSrc,
+    /function manifestSignableBytes\([^)]*\)[^{]*{/,
+  );
+  if (!beNewestManifestFields) {
+    failures.push(
+      '[B] manifestSansSignature literal not found in bundle-exporter.service.ts (renamed or moved?)',
+    );
+  } else if (!manifestSignableFn) {
+    failures.push('[B] manifestSignableBytes() not found in verify.ts (renamed or moved?)');
+  } else {
+    const signableDeclMatch = /const signable:\s*Record<string,\s*unknown>\s*=\s*{/.exec(
+      manifestSignableFn,
+    );
+    if (!signableDeclMatch) {
+      failures.push("[B] manifestSignableBytes()'s `signable` reconstruction object not found");
+    } else {
+      const openBrace = manifestSignableFn.indexOf('{', signableDeclMatch.index + signableDeclMatch[0].length - 1);
+      const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace, {
+        onOpaqueSpread: warnOpaque('B', "verify.ts's manifestSignableBytes() `signable`"),
+      });
+      const gatedSignableFields = extractDottedAssignments(manifestSignableFn, 'signable');
+      const verifierSignableFields = new Set([...baseSignableFields, ...gatedSignableFields]);
+      // be's newest manifest is `manifestSansSignature` (v6) or, for a
+      // format-2 org, the v7 branch of `manifestUnsigned`, `{
+      // ...manifestSansSignature, version: 7, signatureFormat,
+      // signatureFormatCutoverAt }` (AV-2793/AV-2794, see
+      // `newestManifestFields`). It signs canonicalJson({...that,
+      // signatureAlgorithm}), so the signed preimage is the newest-version
+      // union plus `signatureAlgorithm` — the union the verifier's
+      // version-gated `signable` object also converges to.
+      const beSignableFields = new Set([...beNewestManifestFields, 'signatureAlgorithm']);
+      for (const failure of diffSets(
+        "be's manifest signed preimage (manifestSansSignature + manifestUnsigned's literal branches + signatureAlgorithm)",
+        beSignableFields,
+        "verify.ts's manifestSignableBytes() `signable` reconstruction (newest version)",
+        verifierSignableFields,
+      )) {
+        failures.push(`[B] ${failure}`);
+      }
+    }
+  }
+
+  // ── D. Manifest WIRE shape ──────────────────────────────────────────────
+  const bundleManifestFields = keysAfterAnchor(verifyTsSrc, /\binterface BundleManifest\b[^{]*{/);
+  if (!beNewestManifestFields) {
+    // Already reported in check B.
+  } else if (!bundleManifestFields) {
+    failures.push('[D] BundleManifest interface not found in verify.ts (renamed or moved?)');
+  } else {
+    const manifestLiteralMatch = /const manifest\s*=\s*{/.exec(bundleExporterSrc);
+    let manifestExtraFields = new Set();
+    if (manifestLiteralMatch) {
+      const openBrace = bundleExporterSrc.indexOf(
+        '{',
+        manifestLiteralMatch.index + manifestLiteralMatch[0].length - 1,
+      );
+      // Spreading `manifestUnsigned` / `manifestSansSignature` adds the newest
+      // manifest fields, already counted above.
+      manifestExtraFields = extractDepth1Keys(bundleExporterSrc, openBrace, {
+        onOpaqueSpread: warnOpaque('D', "be's `manifest` wire literal", NEWEST_MANIFEST_BINDINGS),
+      });
+    }
+    const producerManifestFields = new Set([
+      ...beNewestManifestFields,
+      ...manifestExtraFields,
+    ]);
+    for (const failure of diffSets(
+      "be's manifest builder (newest manifest fields + manifest wire literal)",
+      producerManifestFields,
+      'BundleManifest (verify.ts)',
+      bundleManifestFields,
+    )) {
+      failures.push(`[D] ${failure}`);
+    }
+  }
+  return { failures, warnings };
+}
+
 function main() {
   const beRootArg = process.argv[2];
   if (!beRootArg) {
@@ -473,17 +693,7 @@ function main() {
 
   const failures = [];
   const warnings = [];
-  // AV-2794 — a spread this scraper cannot see into hides the fields it adds:
-  // warn, naming it, instead of dropping it silently. `known` lists spreads the
-  // check accounts for itself. A warning, not a failure: it marks a blind spot
-  // of this scraper, not drift.
-  const warnOpaque = (check, where, known = []) => (expression) => {
-    if (known.includes(expression)) return;
-    warnings.push(
-      `[${check}] ${where} spreads \`${expression}\`, whose fields this check cannot see — ` +
-        'write them as an object literal or teach scripts/contract-drift.mjs that shape',
-    );
-  };
+  const warnOpaque = opaqueSpreadWarner(warnings);
 
   // ── A. Action-event SIGNED PREIMAGE (signature-critical) ──────────────
   const signableRowFields = keysAfterAnchor(
@@ -515,57 +725,10 @@ function main() {
     }
   }
 
-  // ── B. Manifest SIGNED PREIMAGE (signature-critical) ───────────────────
-  const beNewestManifestFields = newestManifestFields(
-    bundleExporterSrc,
-    warnOpaque('B', "be's newest manifest (manifestSansSignature / manifestUnsigned)"),
-  );
-  // SEC-2026-09-12 (MCPSDK-01) — the reconstruction moved OUT of
-  // `verifyManifest` into `manifestSignableBytes()` so the platform
-  // attestation's `manifestDigest` is computed over the identical preimage.
-  // This check follows it; the contract it guards is unchanged.
-  const manifestSignableFn = extractFunctionBody(
-    verifyTsSrc,
-    /function manifestSignableBytes\([^)]*\)[^{]*{/,
-  );
-  if (!beNewestManifestFields) {
-    failures.push(
-      '[B] manifestSansSignature literal not found in bundle-exporter.service.ts (renamed or moved?)',
-    );
-  } else if (!manifestSignableFn) {
-    failures.push('[B] manifestSignableBytes() not found in verify.ts (renamed or moved?)');
-  } else {
-    const signableDeclMatch = /const signable:\s*Record<string,\s*unknown>\s*=\s*{/.exec(
-      manifestSignableFn,
-    );
-    if (!signableDeclMatch) {
-      failures.push("[B] manifestSignableBytes()'s `signable` reconstruction object not found");
-    } else {
-      const openBrace = manifestSignableFn.indexOf('{', signableDeclMatch.index + signableDeclMatch[0].length - 1);
-      const baseSignableFields = extractDepth1Keys(manifestSignableFn, openBrace, {
-        onOpaqueSpread: warnOpaque('B', "verify.ts's manifestSignableBytes() `signable`"),
-      });
-      const gatedSignableFields = extractDottedAssignments(manifestSignableFn, 'signable');
-      const verifierSignableFields = new Set([...baseSignableFields, ...gatedSignableFields]);
-      // be's newest manifest is `manifestSansSignature` (v6) or, for a
-      // format-2 org, the v7 branch of `manifestUnsigned`, `{
-      // ...manifestSansSignature, version: 7, signatureFormat,
-      // signatureFormatCutoverAt }` (AV-2793/AV-2794, see
-      // `newestManifestFields`). It signs canonicalJson({...that,
-      // signatureAlgorithm}), so the signed preimage is the newest-version
-      // union plus `signatureAlgorithm` — the union the verifier's
-      // version-gated `signable` object also converges to.
-      const beSignableFields = new Set([...beNewestManifestFields, 'signatureAlgorithm']);
-      for (const failure of diffSets(
-        "be's manifest signed preimage (manifestSansSignature + manifestUnsigned's literal branches + signatureAlgorithm)",
-        beSignableFields,
-        "verify.ts's manifestSignableBytes() `signable` reconstruction (newest version)",
-        verifierSignableFields,
-      )) {
-        failures.push(`[B] ${failure}`);
-      }
-    }
-  }
+  // ── B, D. Manifest SIGNED PREIMAGE (signature-critical) and WIRE shape ──
+  const manifestContract = checkManifestContract(bundleExporterSrc, verifyTsSrc);
+  failures.push(...manifestContract.failures);
+  warnings.push(...manifestContract.warnings);
 
   // ── C. Action-event WIRE shape ──────────────────────────────────────────
   const serializeActionEventFn = extractFunctionBody(
@@ -595,40 +758,6 @@ function main() {
       bundleActionEventFields,
     )) {
       failures.push(`[C] ${failure}`);
-    }
-  }
-
-  // ── D. Manifest WIRE shape ──────────────────────────────────────────────
-  const bundleManifestFields = keysAfterAnchor(verifyTsSrc, /\binterface BundleManifest\b[^{]*{/);
-  if (!beNewestManifestFields) {
-    // Already reported in check B.
-  } else if (!bundleManifestFields) {
-    failures.push('[D] BundleManifest interface not found in verify.ts (renamed or moved?)');
-  } else {
-    const manifestLiteralMatch = /const manifest\s*=\s*{/.exec(bundleExporterSrc);
-    let manifestExtraFields = new Set();
-    if (manifestLiteralMatch) {
-      const openBrace = bundleExporterSrc.indexOf(
-        '{',
-        manifestLiteralMatch.index + manifestLiteralMatch[0].length - 1,
-      );
-      // Spreading `manifestUnsigned` / `manifestSansSignature` adds the newest
-      // manifest fields, already counted above.
-      manifestExtraFields = extractDepth1Keys(bundleExporterSrc, openBrace, {
-        onOpaqueSpread: warnOpaque('D', "be's `manifest` wire literal", NEWEST_MANIFEST_BINDINGS),
-      });
-    }
-    const producerManifestFields = new Set([
-      ...beNewestManifestFields,
-      ...manifestExtraFields,
-    ]);
-    for (const failure of diffSets(
-      "be's manifest builder (newest manifest fields + manifest wire literal)",
-      producerManifestFields,
-      'BundleManifest (verify.ts)',
-      bundleManifestFields,
-    )) {
-      failures.push(`[D] ${failure}`);
     }
   }
 
@@ -903,13 +1032,17 @@ function main() {
 // Run as a CLI only when invoked directly; the spec imports the helpers.
 // realpath both sides so a symlinked checkout cannot skip the gate silently,
 // even when node keeps the symlink path (`--preserve-symlinks-main`). An
-// argv[1] that is not a file (`node -e '…' arg`) is not this script.
+// argv[1] that does not exist (`node -e '…' arg`) is not this script; any
+// other realpath error is thrown, so the gate never exits 0 unchecked.
 function invokedDirectly() {
+  let invoked;
   try {
-    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
-  } catch {
-    return false;
+    invoked = realpathSync(process.argv[1]);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
   }
+  return invoked === realpathSync(fileURLToPath(import.meta.url));
 }
 if (process.argv[1] && invokedDirectly()) {
   process.exit(main());

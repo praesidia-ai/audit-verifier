@@ -273,15 +273,23 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   literal in `be`'s exporter as part of the newest manifest. Before BE-1957 the wire `manifest`
   literal was one of them, so `signature` and `signatureKeyVersion` counted as signed and [B]
   went falsely red. The newest fields are now `manifestSansSignature`'s plus those of each
-  literal branch of the `manifestUnsigned` assignment `be` signs, or `manifestSansSignature`'s
-  alone when there is no such assignment (before BE-1957). A spread whose fields the script
-  cannot read (`...helper(x)`, `...base`, `...(cond ? helper(x) : {})`) used to add nothing
-  without a word. It now prints a `::warning::` that names it, and the exit code does not
-  change. The script walks brackets in one place, so the arguments of a multi-line call inside
-  a literal no longer count as keys. The CLI guard no longer throws on import when `argv[1]`
-  is not a file. A run through a symlink with `--preserve-symlinks-main` used to exit 0
-  without checking anything; it now runs the check. Output against `be` HEAD is unchanged.
-  CI tooling only; nothing in the published package changes.
+  literal branch of the `manifestUnsigned` assignment `be` signs, including a typed
+  `let manifestUnsigned: T = …` declaration, or `manifestSansSignature`'s alone when there is
+  no such assignment (before BE-1957). A spread adds only the object literals it can evaluate
+  to: the arms of `c ? x : y`, both sides of `||` and `??`, and the right side of `&&`. A
+  literal passed as a call argument (`...withDefaults(row, { retries: 3 })`) or in a condition
+  no longer counts. A spread whose fields the script cannot read (`...helper(x)`, `...base`,
+  `...(cond ? helper(x) : {})`) used to add nothing without a word. It now prints a
+  `::warning::` that names it, and the exit code does not change. The script walks brackets
+  in one place, and that walk skips strings, template literals, regex literals and comments.
+  So the arguments of a multi-line call inside a literal no longer count as keys, and a
+  bracket inside a string (`note: row.note ?? ':)'`) no longer hides the keys after it.
+  Comment stripping keeps a `//` inside a string, template or regex. The CLI guard no longer
+  throws on import when `argv[1]` does not exist. Any other error resolving `argv[1]` now
+  fails the run instead of skipping the check. A run through a symlink with
+  `--preserve-symlinks-main` used to exit 0 without checking anything; it now runs the check.
+  When [B] or [D] fail, their errors now print before [C]'s. Output against `be` HEAD is
+  unchanged. CI tooling only; nothing in the published package changes.
 
 ### Fixed
 - **`scripts/contract-drift.mjs` sees fields `be` emits only under a condition** (AV-2793).

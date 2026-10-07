@@ -26,6 +26,11 @@ type Drift = {
     opts?: { onOpaqueSpread?: OnOpaqueSpread },
   ) => Set<string>;
   newestManifestFields: (source: string, onOpaqueSpread?: OnOpaqueSpread) => Set<string> | null;
+  checkManifestContract: (
+    bundleExporterSrc: string,
+    verifyTsSrc: string,
+  ) => { failures: string[]; warnings: string[] };
+  stripComments: (source: string) => string;
 };
 let drift: Drift;
 beforeAll(async () => {
@@ -99,6 +104,55 @@ const BE_PRE_1957_MANIFEST = `
       signature: manifestSignature,
       signatureKeyVersion: manifestSignerKeyVersion,
     };`;
+
+// The verifier side of [B]/[D] for each producer era, written like verify.ts
+// (`interface BundleManifest`, `manifestSignableBytes`'s `signable` object plus
+// its version-gated `signable.x =` lines), with exactly the fields the matching
+// producer fixture emits.
+const VERIFIER_V6 = `
+interface BundleManifest {
+  version: number;
+  orgId: string;
+  generatedAt: string;
+  signatureAlgorithm: string;
+  signature: string;
+  signatureKeyVersion: number;
+}
+function manifestSignableBytes(manifest: BundleManifest): string {
+  const signable: Record<string, unknown> = {
+    version: manifest.version,
+    orgId: manifest.orgId,
+    generatedAt: manifest.generatedAt,
+    signatureAlgorithm: manifest.signatureAlgorithm,
+  };
+  return canonicalJson(signable);
+}`;
+const VERIFIER_V7 = `
+interface BundleManifest {
+  version: number;
+  orgId: string;
+  keyVersions: Array<{ keyVersion: number; status: string }>;
+  generatedAt: string;
+  signatureFormat?: 2;
+  signatureFormatCutoverAt?: string | null;
+  signatureAlgorithm: string;
+  signature: string;
+  signatureKeyVersion: number;
+}
+function manifestSignableBytes(manifest: BundleManifest): string {
+  const signable: Record<string, unknown> = {
+    version: manifest.version,
+    orgId: manifest.orgId,
+    keyVersions: manifest.keyVersions,
+    generatedAt: manifest.generatedAt,
+    signatureAlgorithm: manifest.signatureAlgorithm,
+  };
+  if (manifest.version >= 7) {
+    signable.signatureFormat = manifest.signatureFormat;
+    signable.signatureFormatCutoverAt = manifest.signatureFormatCutoverAt;
+  }
+  return canonicalJson(signable);
+}`;
 
 describe('AV-2793 contract-drift: conditional producer fields', () => {
   it('counts a field behind an inline conditional spread as emitted', () => {
@@ -243,5 +297,111 @@ describe('AV-2794 contract-drift: opaque spreads, one bracket walker, CLI guard'
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('anchors on a manifestUnsigned declaration with a type annotation', () => {
+    const src = `const manifestSansSignature = {
+      version: 6,
+      orgId,
+    };
+    let manifestUnsigned: Record<string, unknown> = { ...manifestSansSignature, extraSigned: 1 };`;
+    expect(manifestKeys(src)).toEqual(['extraSigned', 'orgId', 'version']);
+  });
+
+  it('a manifestUnsigned property is no declaration: a later `=` is not its value', () => {
+    const src = `const manifestSansSignature = {
+      version: 6,
+    };
+    log({ manifestUnsigned: true }, function () {
+      const later = { notSigned: 1 };
+    });`;
+    expect(manifestKeys(src)).toEqual(['version']);
+  });
+
+  it('a call argument is not a spread field: only literals the spread can evaluate to count', () => {
+    const src = `{
+      id: row.id,
+      ...withDefaults(row, { retries: 3 }),
+      ...(row.legacy ? legacyFields(row, { since: 1 }) : {}),
+      ...(isV2({ format: 2 }) ? { signatureFormat: 2 as const } : {}),
+    }`;
+    const opaque: string[] = [];
+    const keys = drift.extractDepth1Keys(src, 0, { onOpaqueSpread: (e) => opaque.push(e) });
+    expect([...keys].sort()).toEqual(['id', 'signatureFormat']);
+    expect(opaque).toEqual(['withDefaults(row, { retries: 3 })', 'legacyFields(row, { since: 1 })']);
+  });
+
+  it('`cond && { … }` contributes its literal and is not opaque (a falsy left side spreads nothing)', () => {
+    const src = `{
+      ...(ok && { a: 1 }),
+      ...(ok && extra(x)),
+      ...(row.b ?? { b: 1 }),
+    }`;
+    const opaque: string[] = [];
+    const keys = drift.extractDepth1Keys(src, 0, { onOpaqueSpread: (e) => opaque.push(e) });
+    expect([...keys].sort()).toEqual(['a', 'b']);
+    expect(opaque).toEqual(['extra(x)', 'row.b']);
+  });
+
+  it('a bracket, comma or quote inside a string, template, regex or comment does not end the block', () => {
+    const src = `{
+      note: row.note ?? ':)',
+      bogus: 1,
+      label: "a, {b",
+      tpl: \`(\${row.id}] \${'}'}\`,
+      re: /[(\]]\(/.test(x) ? 1 : 2,
+      cmt: 1, // ) it's
+      last: 1,
+    }`;
+    expect(returnKeys(src)).toEqual(['bogus', 'cmt', 'label', 'last', 'note', 're', 'tpl']);
+  });
+
+  it('stripComments keeps a // or /* inside a string, template or regex', () => {
+    const src = "a = 'https://x'; // c\nb = `//${y}/*`; /* d */ c = /\\/\\//g;";
+    expect(drift.stripComments(src)).toBe("a = 'https://x'; \nb = `//${y}/*`;  c = /\\/\\//g;");
+  });
+
+  it('[B]/[D] comparison path: be HEAD vs a v7 verifier and pre-BE-1957 vs a v6 verifier are both clean, no warnings', () => {
+    expect(drift.checkManifestContract(BE_HEAD_MANIFEST, VERIFIER_V7)).toEqual({ failures: [], warnings: [] });
+    expect(drift.checkManifestContract(BE_PRE_1957_MANIFEST, VERIFIER_V6)).toEqual({ failures: [], warnings: [] });
+  });
+
+  it('[B]/[D] comparison path: pre-BE-1957 vs a v7 verifier reports only the fields that producer lacks', () => {
+    const { failures } = drift.checkManifestContract(BE_PRE_1957_MANIFEST, VERIFIER_V7);
+    const named = (check: string) => failures.filter((f) => f.startsWith(check)).map((f) => f.split(':')[0]).sort();
+    expect(named('[B]')).toEqual(['[B] keyVersions', '[B] signatureFormat', '[B] signatureFormatCutoverAt']);
+    expect(named('[D]')).toEqual(['[D] keyVersions', '[D] signatureFormat', '[D] signatureFormatCutoverAt']);
+  });
+
+  it('[B]/[D] comparison path: a be-only field in an annotated manifestUnsigned literal is red in both', () => {
+    const src = BE_HEAD_MANIFEST.replace(
+      'let manifestUnsigned: Record<string, unknown> = manifestSansSignature;',
+      'let manifestUnsigned: Record<string, unknown> = { ...manifestSansSignature, extraSigned: 1 };',
+    );
+    expect(src).not.toBe(BE_HEAD_MANIFEST);
+    const { failures } = drift.checkManifestContract(src, VERIFIER_V7);
+    expect(failures.filter((f) => f.includes('extraSigned')).map((f) => f.slice(0, 3)).sort()).toEqual(['[B]', '[D]']);
+  });
+
+  it('[D] warns on a wire-literal spread it cannot see into, and only on that one', () => {
+    const src = BE_HEAD_MANIFEST.replace(
+      '      signature: manifestSignature,\n',
+      '      signature: manifestSignature,\n      ...wireExtras(orgId),\n',
+    );
+    expect(src).not.toBe(BE_HEAD_MANIFEST);
+    const { warnings } = drift.checkManifestContract(src, VERIFIER_V7);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^\[D\] .*`wireExtras\(orgId\)`/);
+  });
+
+  it('a realpath error on argv[1] other than ENOENT fails closed instead of skipping the gate', () => {
+    const r = spawnSync(
+      process.execPath,
+      ['-e', `import(${JSON.stringify(pathToFileURL(scriptPath).href)}).then(() => console.log('imported'))`, path.join(scriptPath, 'x')],
+      { encoding: 'utf8' },
+    );
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('ENOTDIR');
+    expect(r.stdout).not.toContain('imported');
   });
 });
