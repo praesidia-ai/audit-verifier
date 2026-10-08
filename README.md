@@ -1088,12 +1088,12 @@ catch.
   `RESULT: OK` for anything consequential — never take `PLATFORM_PUBLIC_KEY_FINGERPRINT`
   on the word of this package alone. Full detail on where the fingerprint lives, what the
   second channel must and must not share infrastructure with, and what to compare:
-  `docs/trust-anchor-verification.md`. **USER-OWED, pending the production key ceremony
-  (MIL-0003):** that document intentionally has no live channel URL yet — a customer-facing
-  document must never point at a channel that does not exist. Once the ceremony lands, compare
-  the published fingerprint, byte-for-byte, against `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the
-  exact tarball/commit you installed — `npm view @praesidia/audit-verifier@<version> --json |
-  jq .dist` lets you confirm the tarball hash independently of `npm install`'s own trust.
+  `docs/trust-anchor-verification.md`. **The second channel is the security contact listed in
+  `https://praesidia.ai/.well-known/security.txt`** (RFC 9116): ask it for the current production
+  platform key fingerprint; a person answers. Compare that answer, byte-for-byte, against
+  `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the exact tarball/commit you installed —
+  `npm view @praesidia/audit-verifier@<version> --json | jq .dist` lets you confirm the tarball
+  hash independently of `npm install`'s own trust.
 - **The release workflow requires a separate operator approval value.** Its protected
   `audit-verifier-production` Environment supplies the independently confirmed lowercase
   fingerprint; `prepack` rejects a missing value, a mismatch, a non-canonical key, or any EC curve
@@ -1119,13 +1119,13 @@ catch.
   `docs/design/platform-key-hierarchy.md` — including the concrete, stated limit that an
   already-installed offline CLI cannot learn of a revocation before its next upgrade, which
   no purely offline design can avoid.
-- **Until the production key ceremony lands** (the prod pin value is filled at release,
-  AV-0015), this pin is intentionally empty and every bundle verified without
-  `--trust-anchor`/`--platform-key` is `UNANCHORED` (exit 5, `platform_key_not_pinned`) — see
-  "Platform key-binding attestation" above and `src/platform-pubkey.ts`'s own docblock. That
-  verdict is correct; do not work around it with a trust anchor or key fetched from anywhere
-  other than the second channel described above, or you have reintroduced the exact trust
-  dependency this tool exists to remove.
+- **The production platform key is pinned since 0.11.0**: AWS KMS `ECC_NIST_P256` key
+  `alias/praesidia-prod-platform-attestation` (eu-central-1), SPKI DER SHA-256
+  `3f7a069ab0e30bd7c1765c8fa9f7b8f0bc164bb5363500d111f5ec0deb4a0a6d`. With no `--trust-anchor`
+  or `--platform-key`, a bundle attested by that key verifies and any other fails closed
+  (`signature: `, exit 1). Only a build with the empty placeholder pair reports `UNANCHORED`
+  (exit 5, `platform_key_not_pinned`). Never swap in a key fetched from anywhere other than the
+  second channel above: that reintroduces the trust dependency this tool exists to remove.
 - **The bundle-schema contract this verifier parses is itself gated against drift**:
   `scripts/contract-drift.mjs` (CI job `contract-drift`) diffs `be-core`'s bundle producer
   against this package's `BundleActionEvent`/`BundleManifest`/`signableActionEvent`/

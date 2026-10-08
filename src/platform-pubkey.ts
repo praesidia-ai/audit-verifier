@@ -35,24 +35,26 @@
  * Never generate or export a private PEM for this release step. Production
  * private key material stays inside KMS.
  *
- * TODO(AUDIT-2026-05-30 follow-up): replace the placeholder values
- * below with the production platform pubkey before distribution. The
- * verifier fails closed while the embedded pin is empty; operators can
- * provide a trusted key explicitly with CLI `--platform-key` or library
- * option `platformPublicKeyDerB64`.
+ * PINNED 2026-10-08 (0.11.0): production KMS key
+ * `alias/praesidia-prod-platform-attestation` (eu-central-1,
+ * ECC_NIST_P256 / SIGN_VERIFY / ECDSA_SHA_256). Operators can still supply a
+ * different trusted key explicitly with CLI `--platform-key` /
+ * `--trust-anchor` or library option `platformPublicKeyDerB64`.
  */
 
 /**
  * Base64-encoded SPKI DER of the pinned platform public key. The
  * empty-string sentinel means there is no embedded trust anchor.
  */
-export const PLATFORM_PUBLIC_KEY_DER_B64: string = '';
+export const PLATFORM_PUBLIC_KEY_DER_B64: string =
+  'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGCtK7vDZBlHyp2OPMBdNYHT5RBZlr5/ND6KeNlQwm3yFmSJmYQ53os6woh+c37lFt+r2s+ECCjOYBuuxuMbykw==';
 
 /**
  * sha256-hex of the DER bytes in {@link PLATFORM_PUBLIC_KEY_DER_B64}.
- * Empty string while we're still in placeholder mode.
+ * Empty string only in placeholder mode.
  */
-export const PLATFORM_PUBLIC_KEY_FINGERPRINT: string = '';
+export const PLATFORM_PUBLIC_KEY_FINGERPRINT: string =
+  '3f7a069ab0e30bd7c1765c8fa9f7b8f0bc164bb5363500d111f5ec0deb4a0a6d';
 
 /**
  * True iff both pin constants are non-empty (a half pin counts as unpinned).

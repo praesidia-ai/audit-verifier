@@ -8,9 +8,20 @@ package (`sdk`, `sdk-python`) as of this entry — this file establishes it here
 Versioning follows [Semantic Versioning](https://semver.org/); while the package is
 `0.x`, a backward-compatible capability addition bumps the minor version.
 
-## [0.11.0] — Unreleased
+## [0.11.0] — 2026-10-08
 
 ### Security
+- **The production platform key is pinned** (AV-0015, MIL-0003). The build-time trust
+  anchor is the SPKI DER of AWS KMS key `alias/praesidia-prod-platform-attestation`
+  (eu-central-1, `ECC_NIST_P256`, `SIGN_VERIFY`, `ECDSA_SHA_256`), SHA-256 fingerprint
+  `3f7a069ab0e30bd7c1765c8fa9f7b8f0bc164bb5363500d111f5ec0deb4a0a6d`. The bytes come from
+  `kms:GetPublicKey` and equal the key prod be serves at
+  `/.well-known/praesidia-audit-keys.json`. With no `--platform-key` or `--trust-anchor`, a
+  bundle attested by that key now gets its real verdict instead of `UNANCHORED`, and a
+  bundle attested by any other platform key fails closed with `signature: ` (exit 1).
+  Confirm the fingerprint through the second channel, the security contact in
+  `https://praesidia.ai/.well-known/security.txt` (`docs/trust-anchor-verification.md`).
+  See Compatibility.
 - **A retention seal's unsigned `deletedAt` and `id` no longer explain a checkpoint
   decrease, and no seal waives a chain-head mismatch.** A legacy seal signs only
   `{organizationId, periodStart, periodEnd, rowCount, rootHash, rekorReceipt}`. Its
@@ -414,6 +425,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `npm pack` builds, including one whose ECDSA check is a no-op.
 
 ### Compatibility
+- The production pin **changes the no-flag verdict** of every bundle; none of them could
+  read `OK` before. A bundle attested by the production key moves from `unanchored`
+  (exit 5) to its real verdict (exit 0 when it verifies). A bundle attested by any other
+  platform key, for example from a local or staging be, moves from exit 5 to `invalid`
+  (exit 1). Verify such a bundle with `--platform-key` or `--trust-anchor` holding its
+  key; those paths are unchanged. IAC lists no retired production platform key
+  (`PLATFORM_ATTESTATION_RETIRED_KEYS` is `[]`).
 - Seal envelope 2 **tightens** `integrityCheckpoints`. A bundle that verified only
   because a legacy seal exempted a checkpoint decrease or chain-head mismatch now fails
   `integrityCheckpoints`. Legacy seals still verify and still count for root coverage and

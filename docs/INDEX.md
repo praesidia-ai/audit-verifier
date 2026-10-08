@@ -46,10 +46,10 @@ required (`README.md:12` `Node.js 22.12 or newer is required.`).
 - **Trust anchor**: the platform public key this build trusts is compiled into
   `src/platform-pubkey.ts`, not fetched at verify time — reintroducing a fetch would defeat the
   tool's own offline-trust purpose
-  (`README.md:1049` `## Trust anchor — verifying the CLI's embedded pin out-of-band`). A production
-  out-of-band confirmation channel is **USER-OWED, pending the key ceremony (MIL-0003)** — that
-  README section already states this precisely; this triad does not restate the mechanism beyond
-  that.
+  (`README.md:1049` `## Trust anchor — verifying the CLI's embedded pin out-of-band`). The
+  production key is pinned since 0.11.0, and its out-of-band confirmation channel is the
+  `security.txt` contact (`docs/trust-anchor-verification.md`). That README section states this
+  precisely; this triad does not restate the mechanism beyond that.
 
 ## Verification limits
 

@@ -1,9 +1,10 @@
 /**
  * AV-0017 — `--trust-anchor <file>`: the be-published trust-anchor document
  * (`GET /.well-known/praesidia-audit-keys.json`, BE-1800) anchors the
- * platform attestation; no anchor at all is the distinct UNANCHORED verdict.
+ * platform attestation; no anchor at all is the distinct UNANCHORED verdict,
+ * which only a build without the embedded production pin can reach.
  */
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -14,8 +15,22 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const cli = path.join(root, 'dist/cli.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-0017-'));
-const run = (pkg: string, ...args: string[]) =>
-  spawnSync(process.execPath, [cli, `samples/audit-package.${pkg}.zip`, '--no-rekor', ...args], { cwd: root, encoding: 'utf8' });
+const runCli = (bin: string, pkg: string, ...args: string[]) =>
+  spawnSync(process.execPath, [bin, `samples/audit-package.${pkg}.zip`, '--no-rekor', ...args], { cwd: root, encoding: 'utf8' });
+const run = (pkg: string, ...args: string[]) => runCli(cli, pkg, ...args);
+
+/** The built package with both platform-pubkey literals emptied: the placeholder build. */
+let unpinnedCli: string;
+beforeAll(() => {
+  const build = path.join(tmp, 'unpinned');
+  fs.cpSync(path.join(root, 'package.json'), path.join(build, 'package.json'));
+  fs.cpSync(path.join(root, 'dist'), path.join(build, 'dist'), { recursive: true });
+  const pubkeyJs = path.join(build, 'dist/platform-pubkey.js');
+  const emptied = fs.readFileSync(pubkeyJs, 'utf8').replace(/(PLATFORM_PUBLIC_KEY_(?:DER_B64|FINGERPRINT) = )'[^']*'/g, "$1''");
+  expect(emptied.match(/PLATFORM_PUBLIC_KEY_(?:DER_B64|FINGERPRINT) = ''/g)).toHaveLength(2);
+  fs.writeFileSync(pubkeyJs, emptied);
+  unpinnedCli = path.join(build, 'dist/cli.js');
+});
 
 const K = fs.readFileSync(path.join(root, 'samples/sample-platform-key.pem'), 'utf8');
 const OTHER = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({ type: 'spki', format: 'pem' }).toString();
@@ -62,24 +77,34 @@ describe('AV-0017 trust anchor', () => {
     expect(r.status).toBe(1);
   });
 
-  it('with no anchor returns the UNANCHORED exit code (5), never OK', () => {
-    const json = run('valid', '--json');
+  it('an unpinned build with no anchor returns the UNANCHORED exit code (5), never OK', () => {
+    const json = runCli(unpinnedCli, 'valid', '--json');
     const report = JSON.parse(json.stdout);
     expect(report.status).toBe('unanchored');
     expect(report.ok).toBe(false);
     expect(report.platformAttestation).toMatchObject({ status: 'incomplete', reason: 'platform_key_not_pinned' });
     expect(json.status).toBe(5);
-    const summary = run('valid', '--summary');
+    const summary = runCli(unpinnedCli, 'valid', '--summary');
     expect(summary.stdout).toContain('RESULT: UNANCHORED');
     expect(summary.stdout).toContain('INCOMPLETE signature');
     expect(summary.status).toBe(5);
-    expect(run('valid', '--quiet').stdout).toBe('UNANCHORED\n');
+    expect(runCli(unpinnedCli, 'valid', '--quiet').stdout).toBe('UNANCHORED\n');
   });
 
   it('a real verification failure beats UNANCHORED', () => {
-    const r = run('corrupted', '--json');
+    const r = runCli(unpinnedCli, 'corrupted', '--json');
     expect(JSON.parse(r.stdout).status).toBe('invalid');
     expect(r.status).toBe(1);
+  });
+
+  it('the shipped build (production pin) with no anchor fails a bundle its key did not attest: exit 1, never OK or UNANCHORED', () => {
+    const json = run('valid', '--json');
+    const report = JSON.parse(json.stdout);
+    expect(report.status).toBe('invalid');
+    expect(report.ok).toBe(false);
+    expect(report.platformAttestation).toMatchObject({ status: 'invalid', reason: expect.stringMatching(/^signature: /) });
+    expect(json.status).toBe(1);
+    expect(run('valid', '--quiet').stdout).toBe('FAIL\n');
   });
 
   it.each([

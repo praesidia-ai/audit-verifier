@@ -6,11 +6,10 @@
  * correctly REQUIRES the pin to be filled in — that script is untouched by
  * this file and stays the strict publish-time gate.
  *
- * This script runs in CI on every push/PR, where the pin is CURRENTLY (and
- * legitimately) still the documented empty-string placeholder pending an
- * ops-side keypair generation (see `platform-pubkey.ts`'s
- * `TODO(AUDIT-2026-05-30 follow-up)`). Failing CI on that known, tracked,
- * pending state would not catch anything new. What CI SHOULD catch, ahead
+ * This script runs in CI on every push/PR. It also accepts the documented
+ * empty-string placeholder pair (the state before the production key was
+ * pinned in 0.11.0, and of any build from source that empties it): failing CI
+ * on that state would not catch anything new. What CI SHOULD catch, ahead
  * of a publish attempt:
  *
  *   1. A PARTIAL edit — exactly one of the two constants changed while the

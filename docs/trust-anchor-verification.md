@@ -38,32 +38,25 @@ of *this package* is exactly the attack a customer's second channel should catch
 
 ## Second channel — where to compare it against
 
-**USER-OWED, pending the production key ceremony (MIL-0003).** As of this writing
-`PLATFORM_PUBLIC_KEY_DER_B64` / `PLATFORM_PUBLIC_KEY_FINGERPRINT` are intentionally empty (the
-verifier reports every bundle verified without `--trust-anchor`/`--platform-key` as `UNANCHORED`,
-exit 5, reason `platform_key_not_pinned` — correct, not a bug) and
-there is deliberately **no URL published here yet**: a customer-facing document must never point
-an auditor at a channel that does not exist. Once the ceremony lands, publish the exact
-fingerprint on infrastructure that is:
+**The security contact in `https://praesidia.ai/.well-known/security.txt`** (RFC 9116). Email
+it and ask for the current production platform key fingerprint. A person answers, through a
+human-mediated channel that is slower than a web page but harder for a single compromised
+system to spoof. It was chosen when the production key was pinned (0.11.0, 2026-10-08), and it
+meets both requirements for a second channel:
 
 1. **Not the npm registry** — the registry is one of the two things this channel exists to
    cross-check, so it cannot vouch for itself.
 2. **Not `be-core`'s deploy pipeline** — the platform key and the application deploy share
    enough infrastructure that a deploy-pipeline compromise should not silently also compromise
-   the channel meant to catch it.
+   the channel meant to catch it. The answer comes from a person, not from be: be's own
+   `GET /.well-known/praesidia-audit-keys.json` is therefore **not** a second channel.
 
-Two concrete candidates already scoped (pick one, or both, when the ceremony happens):
+Known limit: the praesidia.ai website serves `security.txt`, so whoever controls that site
+controls the address it lists.
 
-- A static page hosted on infrastructure operated separately from both of the above (e.g. a
-  security/trust-center subdomain with its own deploy credentials), stating the current
-  `PLATFORM_PUBLIC_KEY_FINGERPRINT` in plain text alongside its `validFrom` date.
-- The `security.txt` contact response (RFC 9116) — an auditor emails the listed security
-  contact and receives the fingerprint back through a human-mediated channel, which is slower
-  but harder for a single compromised system to spoof.
-
-Whichever is chosen, put its exact URL/contact **in this file and in `README.md`'s "Trust
-anchor" section together**, in the same commit that pins the real key — never publish one
-without the other, or the pin exists with nothing to check it against.
+A static trust-center page on separately operated infrastructure (its own deploy credentials,
+stating the fingerprint with its `validFrom` date) is not built. If one is added, put its exact
+URL in this file and in `README.md`'s "Trust anchor" section together, in the same commit.
 
 ## Production release handoff
 

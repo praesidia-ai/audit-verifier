@@ -1,7 +1,8 @@
 /**
  * AV-2750 (audit F02, gap G2) — self-test of `scripts/assert-release-fixture.mjs`
- * against real `npm pack` tarballs: a build pinned to the SAMPLE key (never a
- * production key), the current unpinned build, and a CLI that accepts anything.
+ * against real `npm pack` tarballs: the current build (production pin), copies
+ * re-pinned to the SAMPLE key and to the empty placeholder, and a CLI that
+ * accepts anything.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
@@ -28,28 +29,42 @@ function pack(dir: string, dest: string): string {
   return path.join(dest, filename);
 }
 
+let current: string;
 let pinned: string;
 let unpinned: string;
 let acceptsAnything: string;
 let noSignatureCheck: string;
 
-beforeAll(() => {
-  unpinned = pack(root, path.join(tmp, 'unpinned')); // dist/ is built by vitest globalSetup
-
-  // The release edit (two literals in platform-pubkey) applied with the SAMPLE key to a copy of
-  // the built package, then packed: the same dist/ a pinned `tsc` build ships.
-  const build = path.join(tmp, 'build');
+/**
+ * The release edit (the two literals in platform-pubkey) re-applied to a copy of the built
+ * package: the same dist/ a `tsc` build with that pin ships. Returns the copy's directory.
+ */
+function repin(name: string, derB64: string, fingerprint: string): string {
+  const build = path.join(tmp, name);
   fs.cpSync(path.join(root, 'package.json'), path.join(build, 'package.json'));
   fs.cpSync(path.join(root, 'dist'), path.join(build, 'dist'), { recursive: true });
+  const pubkeyJs = path.join(build, 'dist/platform-pubkey.js');
+  let replaced = 0;
+  const js = fs.readFileSync(pubkeyJs, 'utf8').replace(
+    /(PLATFORM_PUBLIC_KEY_(DER_B64|FINGERPRINT) = )'[^']*'/g,
+    (_match, decl: string, which: string) => {
+      replaced += 1;
+      return `${decl}'${which === 'DER_B64' ? derB64 : fingerprint}'`;
+    },
+  );
+  expect(replaced).toBe(2);
+  fs.writeFileSync(pubkeyJs, js);
+  return build;
+}
+
+beforeAll(() => {
+  current = pack(root, path.join(tmp, 'current')); // dist/ is built by vitest globalSetup
+
   const der = crypto.createPublicKey(fs.readFileSync(path.join(root, 'samples/sample-platform-key.pem'), 'utf8'))
     .export({ type: 'spki', format: 'der' });
-  const pubkeyJs = path.join(build, 'dist/platform-pubkey.js');
-  const pinnedJs = fs.readFileSync(pubkeyJs, 'utf8')
-    .replace(/(PLATFORM_PUBLIC_KEY_DER_B64 = )(''|"")/, `$1'${der.toString('base64')}'`)
-    .replace(/(PLATFORM_PUBLIC_KEY_FINGERPRINT = )(''|"")/, `$1'${crypto.createHash('sha256').update(der).digest('hex')}'`);
-  expect(pinnedJs.match(/PLATFORM_PUBLIC_KEY_(DER_B64|FINGERPRINT) = '[A-Za-z0-9+/=]+'/g)).toHaveLength(2);
-  fs.writeFileSync(pubkeyJs, pinnedJs);
+  const build = repin('build', der.toString('base64'), crypto.createHash('sha256').update(der).digest('hex'));
   pinned = pack(build, path.join(tmp, 'pinned'));
+  unpinned = pack(repin('unpinned-build', '', ''), path.join(tmp, 'unpinned'));
   // The same pinned build with its ECDSA check (the platform attestation signature) a no-op.
   fs.appendFileSync(path.join(build, 'dist/crypto.js'), '\nverifyEcdsaP256 = () => true;\n');
   noSignatureCheck = pack(build, path.join(tmp, 'no-signature-check'));
@@ -100,9 +115,9 @@ describe('AV-2750 check:release-fixture (packed CLI, embedded pin only)', () => 
   });
 
   it('the packed tarball ships every script its package.json runs, and what those scripts import', () => {
-    const pkg = path.join(tmp, 'unpinned-unpacked/package');
+    const pkg = path.join(tmp, 'current-unpacked/package');
     fs.mkdirSync(path.dirname(pkg));
-    sh('tar', ['-xzf', unpinned, '-C', path.dirname(pkg)], tmp);
+    sh('tar', ['-xzf', current, '-C', path.dirname(pkg)], tmp);
     const { scripts } = JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
     const run = Object.values(scripts).flatMap((cmd) => cmd.match(/scripts\/[\w.-]+\.mjs/g) ?? []);
     expect(run).toContain('scripts/assert-release-fixture.mjs');
@@ -114,9 +129,15 @@ describe('AV-2750 check:release-fixture (packed CLI, embedded pin only)', () => 
     }
   });
 
-  it('blocks the current unpinned build: the genuine fixture is only UNANCHORED (exit 5)', () => {
+  it('blocks an unpinned build: the genuine fixture is only UNANCHORED (exit 5)', () => {
     const r = runGate({ PRAESIDIA_RELEASE_TARBALL: unpinned, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
     expect(r.stderr).toMatch(/^audit-verifier release blocked: the packed CLI did not verify the genuine fixture with its embedded pin \(exit 5\)/);
+    expect(r.status).toBe(1);
+  });
+
+  it('blocks the production-pinned release build on a fixture its pinned key did not attest (exit 1)', () => {
+    const r = runGate({ PRAESIDIA_RELEASE_TARBALL: current, PRAESIDIA_RELEASE_FIXTURE: VALID, PRAESIDIA_RELEASE_FIXTURE_NO_REKOR: '1' });
+    expect(r.stderr).toMatch(/^audit-verifier release blocked: the packed CLI did not verify the genuine fixture with its embedded pin \(exit 1\)/);
     expect(r.status).toBe(1);
   });
 
