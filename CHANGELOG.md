@@ -11,6 +11,17 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
 ## [0.11.0] — Unreleased
 
 ### Security
+- **A retention seal's unsigned `deletedAt` and `id` no longer explain a checkpoint
+  decrease, and no seal waives a chain-head mismatch.** A legacy seal signs only
+  `{organizationId, periodStart, periodEnd, rowCount, rootHash, rekorReceipt}`. Its
+  `deletedAt` and `id` could therefore be moved into any checkpoint window, or copied
+  under a new `id`, to turn a `cumulative_row_count_decreased` or
+  `chain_head_hash_mismatch` into a `seal_exempted` pass. Seal envelope 2
+  (`sealEnvelopeVersion: 2`, be's `AuditRetentionSealService`) also signs
+  `sealEnvelopeVersion`, `id`, `deletedAt`, `deletedBy` and `approvalId`, and checks
+  its format-2 cutover against `deletedAt`. Only verified envelope-2 seals reconcile a
+  decrease. A `chainHeadHash` mismatch is never exempted. A `sealEnvelopeVersion` other
+  than absent, 1 or 2 is an invalid entry. Stricter: see Compatibility.
 - **`verify-set` checks the hash chain across empty bundles** (AV-2756). A bundle with
   zero rows has no chain link of its own, and it switched the chain checks off around
   it: rows deleted under an empty middle bundle went unreported (the set read
@@ -403,6 +414,13 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `npm pack` builds, including one whose ECDSA check is a no-op.
 
 ### Compatibility
+- Seal envelope 2 **tightens** `integrityCheckpoints`. A bundle that verified only
+  because a legacy seal exempted a checkpoint decrease or chain-head mismatch now fails
+  `integrityCheckpoints`. Legacy seals still verify and still count for root coverage and
+  chain bridges. be writes `sealEnvelopeVersion` only as 2 (or not at all), so the new
+  invalid-entry rule changes no be-produced bundle. A verifier before this
+  change cannot verify an envelope-2 seal, so such a seal never helps it: the finding
+  fails closed, never a false pass (`docs/COMPATIBILITY.md`).
 - AV-2771 **tightens** Rekor receipt verification. A receipt whose `data.hash` is
   hex(`rootHash`) now fails `body_root_mismatch`. No genuine log can hold such an entry
   for a signed root, because Rekor rejects it (HTTP 400), so no anchored archive changes

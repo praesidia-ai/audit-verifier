@@ -581,6 +581,8 @@ function resolveSupersessions(roots: BundleRoot[]): Supersessions {
  * weaken any existing check.
  */
 interface BundleSealedPurge {
+  /** 1/absent: legacy period envelope. 2: binds id and deletion provenance. */
+  sealEnvelopeVersion?: 1 | 2;
   id: string;
   organizationId: string;
   /** Inclusive start of the purged period. ISO 8601. */
@@ -920,24 +922,12 @@ export interface VerifyReport {
    *      instant) is a legitimate, NOT-asserted case — see the component's
    *      own doc comment on `verifyIntegrityCheckpoints`.
    *
-   * PARTIALLY-CLOSED RESIDUAL (FIX01, audit-verifier2) —
-   * `AuditRetentionSealService.purgeWithSeal` is a real, already-shipped
-   * mechanism that legitimately hard-deletes signed `audit_logs` rows
-   * (GDPR-driven retention, feature-flagged, two-person approval-gated,
-   * off by default). A bundle spanning such a purge legitimately shows a
-   * `cumulativeRowCount` decrease and/or an unreachable earlier
-   * `chainHeadHash` between two checkpoints straddling the purge. When
-   * `sealed-purges.ndjson.gz` carries VERIFIED entries whose `deletedAt`
-   * falls in the affected checkpoint window and whose summed `rowCount`
-   * accounts for the observed decrease, this is now downgraded to a pass
-   * (recorded in `sealExemptions`, listing every contributing seal). A
-   * window with NO verified seal evidence at all, or whose seals do not
-   * account for the full decrease, still fails closed exactly as before —
-   * this is a narrowing of the failure surface, never a widening. See
-   * `verifySealedPurgeAuthenticity` / `verifyIntegrityCheckpoints` for the
-   * exact
-   * reconciliation rule, including why an empty seal window is NEVER
-   * treated as reconciling (an arithmetic coincidence is not evidence).
+   * Retention purges can legitimately lower the count. Only v2 seal
+   * envelopes authenticate deletedAt and a unique seal id; their row counts
+   * may reconcile a positive decrease in the signed checkpoint window.
+   * Legacy seals still authenticate root coverage but cannot prove timing.
+   * A row-count seal never exempts a chain-head contradiction: proving the
+   * identity of a removed head needs authenticated chain-boundary evidence.
    */
   integrityCheckpoints: ComponentResult;
   /**
@@ -2816,9 +2806,6 @@ function verifyIntegrityCheckpoints(
     (a, b) => Date.parse(a.asOf) - Date.parse(b.asOf),
   );
   const checkpointTimes = byAsOf.map((cp) => Date.parse(cp.asOf));
-  const checkpointIndexById = new Map(
-    byAsOf.map((cp, index) => [cp.id, index] as const),
-  );
 
   // Adjacent checkpoint windows are disjoint. Assign each verified seal to
   // its one `(prev.asOf, cur.asOf]` window once, instead of filtering the
@@ -2829,6 +2816,9 @@ function verifyIntegrityCheckpoints(
   );
   const sealRowsByWindow = Array.from({ length: byAsOf.length }, () => 0n);
   for (const seal of verifiedSeals) {
+    // A legacy signature authenticates the period but not deletedAt or id.
+    // It cannot place a purge in a checkpoint window or count as a unique deletion.
+    if (seal.sealEnvelopeVersion !== 2) continue;
     const sealTime = Date.parse(seal.deletedAt);
     const windowIndex = lowerBound(checkpointTimes, sealTime);
     if (
@@ -2848,7 +2838,7 @@ function verifyIntegrityCheckpoints(
   ): { exempted: boolean; seals: BundleSealedPurge[] } => {
     const seals = sealsByWindow[index] ?? [];
     return {
-      exempted: seals.length > 0 && decrease <= (sealRowsByWindow[index] ?? 0n),
+      exempted: decrease > 0n && seals.length > 0 && decrease <= (sealRowsByWindow[index] ?? 0n),
       seals,
     };
   };
@@ -2947,7 +2937,7 @@ function verifyIntegrityCheckpoints(
       }
       fail(
         cur.id,
-        `cumulative_row_count_decreased: checkpoint at ${cur.asOf} claims cumulativeRowCount ${curCount} but an earlier checkpoint at ${prev.asOf} claimed ${prevCount} — a decrease means rows were deleted between these two signed snapshots and no verified AuditRetentionSeal in sealed-purges.ndjson.gz accounts for it (confirm against the org's AuditRetentionSeal records before treating this as tampering)`,
+        `cumulative_row_count_decreased: checkpoint at ${cur.asOf} claims cumulativeRowCount ${curCount} but an earlier checkpoint at ${prev.asOf} claimed ${prevCount} — a decrease means rows were deleted between these two signed snapshots and no seal with authenticated deletion timing in sealed-purges.ndjson.gz accounts for it (legacy provenance is insufficient; confirm against the org's AuditRetentionSeal records before treating this as tampering)`,
       );
     }
   }
@@ -2977,37 +2967,11 @@ function verifyIntegrityCheckpoints(
     checked += 1;
     const computedLink = chainLinkByRow.get(tip) ?? null;
     if (computedLink !== cp.chainHeadHash) {
-      // FIX01 (audit-verifier2) — reconcile against the SAME prev/cur pair
-      // and decrease amount as check (2) above, per the spec ("For a
-      // cumulative_row_count_decreased OR chain_head_hash_mismatch finding
-      // ... collect every verifiedSeals entry ..."). Only applies when `cp`
-      // has a predecessor in asOf order; the very first checkpoint has
-      // nothing to reconcile against and keeps failing as before (no
-      // regression — this matches the pre-existing, unaffected behavior).
-      const idx = checkpointIndexById.get(cp.id) ?? -1;
-      let exempted = false;
-      let sealNames: string[] = [];
-      if (idx > 0) {
-        const prevCount = countsByAsOf[idx - 1];
-        const curCount = countsByAsOf[idx];
-        if (prevCount !== null && curCount !== null) {
-          const decrease = prevCount - curCount;
-          const reconciled = reconcileAtIndex(idx, decrease);
-          exempted = reconciled.exempted;
-          sealNames = reconciled.seals.map(
-            (s) => `${s.id} (approval ${s.approvalId})`,
-          );
-        }
-      }
-      if (exempted) {
-        sealExemptions.push(
-          `seal_exempted: chainHeadHash mismatch at checkpoint ${cp.id} (asOf ${cp.asOf}) reconciled by AuditRetentionSeal(s) ${sealNames.join(', ')}`,
-        );
-        continue;
-      }
+      // A signed row count cannot prove which chain head was removed.
+      // Never waive a head contradiction using an unrelated period seal.
       fail(
         cp.id,
-        `chain_head_hash_mismatch: checkpoint at ${cp.asOf} claims chainHeadHash ${cp.chainHeadHash} but the bundle's own rows (as of that instant) chain to ${String(computedLink)} — this means rows were altered or deleted after the checkpoint was signed and no verified AuditRetentionSeal in sealed-purges.ndjson.gz accounts for it`,
+        `chain_head_hash_mismatch: checkpoint at ${cp.asOf} claims chainHeadHash ${cp.chainHeadHash} but the bundle's own rows (as of that instant) chain to ${String(computedLink)} — this means rows were altered or deleted after the checkpoint was signed (a retention seal's row count cannot prove which chain head was removed, so no seal exempts this)`,
       );
     }
   }
@@ -6146,6 +6110,7 @@ function assertSealedPurgesStructure(
         (typeof p.rekorReceipt !== 'object' ||
           Array.isArray(p.rekorReceipt))) ||
       !(authFieldsAllNull || authFieldsAllPresent) ||
+      (p.sealEnvelopeVersion !== undefined && p.sealEnvelopeVersion !== 1 && p.sealEnvelopeVersion !== 2) ||
       (p.signingKeyVersion !== null && p.signingKeyVersion < 1) ||
       !isIsoDate(p.deletedAt) ||
       typeof p.deletedBy !== 'string' ||
@@ -6244,13 +6209,20 @@ function verifySealedPurgeAuthenticity(
       rootHash: p.rootHash,
       rekorReceipt: p.rekorReceipt,
     };
-    const currentMessage = canonicalJson(envelope);
-    // AV-0018 — the envelope's latest signed timestamp is `periodEnd`
-    // (`deletedAt` is unsigned, so it cannot be trusted for the cutover).
+    const isTemporal = p.sealEnvelopeVersion === 2;
+    const currentMessage = canonicalJson(isTemporal ? {
+      ...envelope,
+      sealEnvelopeVersion: 2,
+      id: p.id,
+      deletedAt: p.deletedAt,
+      deletedBy: p.deletedBy,
+      approvalId: p.approvalId,
+    } : envelope);
+    // V2 signs deletedAt; legacy envelopes sign only the older periodEnd.
     let authentic =
       verifyTenantSignature(
         p.signatureAlgorithm, p.signatureFormat, 'retention-seal', currentMessage, p.signature, entry.publicKey,
-        p.periodEnd, cutoverMs,
+        isTemporal ? p.deletedAt : p.periodEnd, cutoverMs,
       ) === true;
     // Compatibility for seals emitted before the producer aligned its signed
     // representation with the bigint-as-string persistence/wire contract.
@@ -6259,7 +6231,7 @@ function verifySealedPurgeAuthenticity(
     // safely representable decimal is eligible for this exact legacy fallback.
     // The legacy numeric form predates format 2, so it is format-1 only.
     const legacyRowCount = Number(p.rowCount);
-    if (!authentic && (p.signatureFormat === undefined || p.signatureFormat === 1) && Number.isSafeInteger(legacyRowCount) &&
+    if (!isTemporal && !authentic && (p.signatureFormat === undefined || p.signatureFormat === 1) && Number.isSafeInteger(legacyRowCount) &&
       signatureFormatRejection(1, p.periodEnd, cutoverMs) === null) {
       authentic = verifySignature(
         p.signatureAlgorithm,

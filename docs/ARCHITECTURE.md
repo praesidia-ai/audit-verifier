@@ -9,7 +9,7 @@ exactly that line, or when an anchor has no quote.
 - `src/cli.ts` — entrypoint and flag parsing. `runCli` dispatches on the first argument: to
   `src/cli.ts:1194` `async function main(` for one bundle (no subcommand, or `verify`), to
   `src/cli.ts:1087` `async function mainVerifySet(` for `verify-set`, or to `mainAibom` for `aibom`.
-- `src/verify.ts` — `src/verify.ts:1466` `export async function verifyBundle(` is the bundle
+- `src/verify.ts` — `src/verify.ts:1456` `export async function verifyBundle(` is the bundle
   verification pipeline: signatures, Merkle proofs, chain continuity. `verifyChainBoundary` is the
   cross-bundle boundary rule that `verify-set` uses (SCAN2-004).
 - `src/crypto.ts` — vendored Ed25519/ECDSA-P256 primitives, byte-for-byte compatible with be's
@@ -31,12 +31,12 @@ exactly that line, or when an anchor has no quote.
   (`src/rekor.ts:603` `verifySignature(expected.signatureAlgorithm, signedBytes, signature.content`).
   README step 6 states that rule (`README.md:596` `the bytes the root signature covers`).
 - `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
-  compiled-in trust anchor (`README.md:1040` `The platform public key this build trusts is compiled into`).
+  compiled-in trust anchor (`README.md:1051` `The platform public key this build trusts is compiled into`).
 - `src/http-receipt.ts` — `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION`,
   `src/http-receipt.ts:32` `export function httpTargetKeyFingerprint(`,
   `src/http-receipt.ts:37` `export function httpRequestCommitment(`,
   `src/http-receipt.ts:41` `export function verifyHttpReceipt(` — verifies independently-pinned
-  HTTP target receipts (`README.md:1423` `### Independently pinned HTTP target receipts`).
+  HTTP target receipts (`README.md:1434` `### Independently pinned HTTP target receipts`).
 - `src/aibom.ts` — verifyAibomAttestation: be's attested AIBOM envelope
   (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001).
 - `src/proofs.ts` — AV-0010: PROOF_COMPONENTS / deriveProofs / formatProofLines map components to
@@ -46,7 +46,7 @@ exactly that line, or when an anchor has no quote.
 ## Verification pipeline (high level)
 
 `src/cli.ts:1194` `async function main(` reads the CLI flags and the bundle file, and calls
-`src/verify.ts:1466` `export async function verifyBundle(`. That function is the load-bearing
+`src/verify.ts:1456` `export async function verifyBundle(`. That function is the load-bearing
 piece described in the README's "What it verifies" section (`README.md:505` `## What it verifies`):
 per-row signature checks, Merkle root/inclusion proofs, chain-continuity checks, and (unless
 `--no-rekor`) Rekor receipt verification via `src/rekor.ts:685` `export function verifyRekorReceipt(`.
@@ -121,7 +121,7 @@ trust-anchor-policy.selftest.mjs   # self-test for the policy script
 ```
 
 `prepack` rejects a missing operator-approval value, a mismatch, a non-canonical key, or any EC
-curve other than P-256 (`README.md:1088` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
+curve other than P-256 (`README.md:1099` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
 self-asserted fingerprint from being changed together and silently treated as approved.
 
 See also `docs/design/platform-key-hierarchy.md` and `docs/trust-anchor-verification.md` for the

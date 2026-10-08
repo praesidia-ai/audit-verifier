@@ -490,7 +490,7 @@ Every tenant-key signature carries `signatureFormat` next to its algorithm (abse
 | root supersession link | `merkle-supersession` | `supersessionSignatureFormat` | the root's `periodEnd` |
 | integrity checkpoint | `integrity-checkpoint` | `signatureFormat` | `asOf` |
 | protected-action event | `protected-action-event` | `signatureFormat` | `receivedAt` |
-| sealed purge (retention seal) | `retention-seal` | `signatureFormat` | `periodEnd` |
+| sealed purge (retention seal) | `retention-seal` | `signatureFormat` | `periodEnd` (seal envelope 1); `deletedAt` (seal envelope 2) |
 | sealed purge chain links | `retention-seal-link` | `chainLinkSignatureFormat` | the seal's `periodEnd` |
 
 A format-2 signature minted for one purpose does not verify in any other slot.
@@ -740,19 +740,23 @@ builds accept an all-zero key with an all-zero signature (AV-2701):
     before that instant) is a legitimate boundary case and is skipped, not
     asserted — mirroring root coverage's own boundary exemption — UNLESS
     the checkpoint claims the all-zero genesis hash, which is fully
-    consistent with an empty window and IS checked. A `(b)` decrease or
-    `(c)` mismatch between two checkpoints is downgraded to a
-    `seal_exempted` pass — listing every contributing seal's `id` — when
-    VERIFIED `sealed-purges.ndjson.gz` entries whose `deletedAt` falls
-    strictly after the earlier checkpoint and at/before the later one
-    (`(prev.asOf, cur.asOf]`) sum to at least the observed
-    `cumulativeRowCount` decrease. A window with NO verified seal evidence
-    at all — even when the arithmetic would otherwise be trivially
-    satisfied — is never treated as reconciling; an empty seal window is
-    the absence of evidence, not evidence. A decrease/mismatch the
-    verified seals do not fully account for keeps failing closed, since
-    that residual could still be genuine tampering on top of a legitimate
-    purge.
+    consistent with an empty window and IS checked. A `(b)` decrease
+    between two checkpoints is downgraded to a `seal_exempted` pass —
+    listing every contributing seal's `id` — when VERIFIED
+    `sealed-purges.ndjson.gz` entries with `sealEnvelopeVersion: 2` (whose
+    signature covers `id` and `deletedAt`, invariant 12) and whose
+    `deletedAt` falls strictly after the earlier checkpoint and at/before
+    the later one (`(prev.asOf, cur.asOf]`) sum to at least the observed
+    `cumulativeRowCount` decrease. A seal without envelope version 2 still
+    verifies, but its `deletedAt` is unsigned, so it never reconciles a
+    decrease. A window with NO such seal evidence at all, even when the
+    arithmetic would otherwise be trivially satisfied, is never treated
+    as reconciling: an empty seal window is the absence of evidence, not
+    evidence. A decrease the seals do not fully account for keeps failing
+    closed, since that residual could still be genuine tampering on top
+    of a legitimate purge. A `(c)` `chainHeadHash` mismatch is never
+    exempted by a seal: a signed row count cannot prove which chain head
+    was removed.
 12. **Sealed-purge evidence** (`sealed-purges.ndjson.gz`, wholly optional
     and never gated on `manifest.version`) — one entry per
     `AuditRetentionSeal` row whose purged period overlaps the bundle. Each
@@ -760,7 +764,12 @@ builds accept an all-zero key with an all-zero signature (AV-2701):
     every other entry, over `canonicalJson({organizationId, periodStart,
     periodEnd, rowCount, rootHash, rekorReceipt})` — the seal's existing
     envelope from `AuditRetentionSealService.purgeWithSeal`, re-emitted
-    onto the bundle wire unchanged. Current producers sign `rowCount` as
+    onto the bundle wire unchanged. An entry with `sealEnvelopeVersion: 2`
+    is signed over that object plus `sealEnvelopeVersion`, `id`,
+    `deletedAt`, `deletedBy` and `approvalId`, and its format-2 cutover is
+    checked against `deletedAt`. An absent `sealEnvelopeVersion` (or `1`)
+    is the legacy envelope. Any other value is an invalid entry and fails
+    the bundle. Current producers sign `rowCount` as
     its canonical decimal string, matching the bundle wire; the verifier
     also accepts the legacy safe-integer numeric preimage emitted by older
     backend builds. This entry is deliberately **NOT**
@@ -946,9 +955,10 @@ fields in the same change.
   tail, or a boundary period, to at most one checkpoint interval, in the
   common case where the bundle's own rows span up to (or past) the
   checkpoint's `asOf` (see invariant 11's boundary exemption and residual).
-  An unexplained decrease/mismatch across a checkpoint window still fails
-  closed; one fully accounted for by VERIFIED sealed-purge evidence in
-  that exact window is reported as a distinct, named `seal_exempted` pass.
+  An unexplained decrease or any chain-head mismatch across a checkpoint
+  window still fails closed; a decrease fully accounted for by VERIFIED
+  envelope-2 sealed-purge evidence in that exact window is reported as a
+  distinct, named `seal_exempted` pass.
 
 **Does NOT prove**, even on `ok: true`:
 
@@ -975,12 +985,13 @@ fields in the same change.
   checkpoints either, same as before; (c) a genuine, signed
   `AuditRetentionSeal` hard-purge is now reconciled — and downgraded to a
   named `seal_exempted` pass — ONLY when `sealed-purges.ndjson.gz` carries
-  a VERIFIED entry whose `deletedAt` falls in the affected checkpoint
-  window and whose summed `rowCount` accounts for the observed decrease
-  (invariant 12). A purge with no corresponding sealed-purge entry in the
-  bundle (e.g. an export produced by a `be` version that predates this
-  wiring, or one where the entry was legitimately omitted/empty) still
-  fails closed exactly as before — this closes the false-positive ONLY
+  a VERIFIED `sealEnvelopeVersion: 2` entry whose signed `deletedAt` falls
+  in the affected checkpoint window and whose summed `rowCount` accounts
+  for the observed decrease (invariant 12). A purge with no corresponding
+  envelope-2 sealed-purge entry in the bundle (e.g. an export produced by
+  a `be` version that predates this wiring or signs only the legacy
+  envelope, or one where the entry was legitimately omitted/empty) still
+  fails closed — this closes the false-positive ONLY
   when the producer actually ships the matching evidence, it does not
   weaken the check for bundles that don't.
 - **That rows at the end of the history were not deleted, together with

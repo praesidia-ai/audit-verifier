@@ -6023,6 +6023,8 @@ describe('verifyBundle', () => {
       rootHash: string;
       rekorReceipt?: Record<string, unknown> | null;
       deletedAt: string;
+      sealEnvelopeVersion?: 1 | 2;
+      exportedOverrides?: Record<string, unknown>;
       deletedBy?: string;
       approvalId?: string;
       keyVersion?: number;
@@ -6055,7 +6057,15 @@ describe('verifyBundle', () => {
           approvalId: def.approvalId ?? 'approval-1',
         };
       }
+      const provenance = def.sealEnvelopeVersion === 2 ? {
+        sealEnvelopeVersion: 2,
+        id: def.id,
+        deletedAt: def.deletedAt,
+        deletedBy: def.deletedBy ?? 'user-op-1',
+        approvalId: def.approvalId ?? 'approval-1',
+      } : {};
       const message = canonicalJson({
+        ...provenance,
         organizationId: orgId,
         periodStart: def.periodStart,
         periodEnd: def.periodEnd,
@@ -6070,6 +6080,7 @@ describe('verifyBundle', () => {
         signature = bytes.toString('base64');
       }
       return {
+        ...provenance,
         id: def.id,
         organizationId: orgId,
         periodStart: def.periodStart,
@@ -6118,7 +6129,7 @@ describe('verifyBundle', () => {
         signCheckpoint(def, orgId, def.privateKeyOverride ?? privateKey),
       );
       const sealedPurges = (opts.sealedPurgeDefs ?? []).map((def) =>
-        signSealedPurge(def, orgId, def.privateKeyOverride ?? privateKey),
+        ({ ...signSealedPurge(def, orgId, def.privateKeyOverride ?? privateKey), ...def.exportedOverrides }),
       );
 
       const version = opts.versionOverride ?? 4;
@@ -6535,6 +6546,7 @@ describe('verifyBundle', () => {
           sealedPurgeDefs: [
             {
               id: 'seal-cp-1',
+              sealEnvelopeVersion: 2,
               periodStart: '2026-04-30T00:00:00.000Z',
               periodEnd: '2026-05-01T00:00:00.000Z',
               rowCount: '2', // exactly covers the decrease
@@ -6689,7 +6701,7 @@ describe('verifyBundle', () => {
         expect(report.ok).toBe(false);
       });
 
-      it('downgrades a chain_head_hash_mismatch to a pass when the same seal window reconciles the cumulativeRowCount decrease (closes the contract residual explicitly)', async () => {
+      it('does not waive an unrelated head contradiction even with authenticated purge timing', async () => {
         const { zip } = buildV4Bundle({
           checkpointDefs: [
             {
@@ -6712,6 +6724,7 @@ describe('verifyBundle', () => {
           sealedPurgeDefs: [
             {
               id: 'seal-cp-2',
+              sealEnvelopeVersion: 2,
               periodStart: '2026-04-30T00:00:00.000Z',
               periodEnd: '2026-05-01T00:00:00.000Z',
               rowCount: '2',
@@ -6724,24 +6737,50 @@ describe('verifyBundle', () => {
           ],
         });
         const report = await verifyBundle(zip, { noRekor: true });
-        expect(report.integrityCheckpoints.ok).toBe(true);
-        expect(report.integrityCheckpoints.failed).toBe(0);
-        expect(report.integrityCheckpoints.sealExemptions).toBeDefined();
-        // Both the count-decrease (2) and the hash-mismatch (3) checks
-        // reconcile against the SAME window/seal — two distinct exemption
-        // entries, one per check.
-        expect(report.integrityCheckpoints.sealExemptions).toHaveLength(2);
-        expect(
-          report.integrityCheckpoints.sealExemptions!.some((s) =>
-            s.includes('chainHeadHash mismatch'),
-          ),
-        ).toBe(true);
-        expect(
-          report.integrityCheckpoints.sealExemptions!.every((s) =>
-            s.includes('seal-cp-2'),
-          ),
-        ).toBe(true);
-        expect(report.ok).toBe(true);
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(/chain_head_hash_mismatch/);
+        expect(report.integrityCheckpoints.sealExemptions).toHaveLength(1);
+        expect(report.ok).toBe(false);
+      });
+
+      it.each([
+        ['legacy unsigned timing', undefined, { deletedAt: '2026-05-01T00:30:00.000Z' }],
+        ['changed v2 timing', 2, { deletedAt: '2026-05-01T00:30:00.000Z' }],
+        ['changed v2 identity', 2, { id: 'duplicated-seal-with-new-id' }],
+        ['changed v2 operator', 2, { deletedBy: 'another-operator' }],
+        ['changed v2 approval', 2, { approvalId: 'another-approval' }],
+        ['downgraded v2 envelope', 2, { sealEnvelopeVersion: 1 }],
+      ] as const)('does not reconcile a decrease using %s', async (_name, version, exportedOverrides) => {
+        const base = buildFixtureBundle();
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            { id: 'before', asOfIso: '2026-04-30T23:00:00.000Z', chainHeadHash: GENESIS_PREV_ROW_HASH, cumulativeRowCount: '6' },
+            { id: 'after', asOfIso: '2026-05-01T01:30:00.000Z', chainHeadHash: tipChainHeadHash(base), cumulativeRowCount: '4' },
+          ],
+          sealedPurgeDefs: [{ id: 'seal-temporal', sealEnvelopeVersion: version,
+            periodStart: '2026-04-29T00:00:00.000Z', periodEnd: '2026-04-30T00:00:00.000Z', rowCount: '2',
+            rootHash: sha256(Buffer.from('root')).toString('base64'),
+            deletedAt: '2026-04-30T12:00:00.000Z', exportedOverrides }],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(/cumulative_row_count_decreased/);
+        expect(report.bundle.sealedPurgesVerified).toBe(version === 2 ? 0 : 1);
+      });
+
+      it.each(['4', '7'])('does not waive a false head when the count stays equal or increases to %s', async (count) => {
+        const { zip } = buildV4Bundle({
+          checkpointDefs: [
+            { id: 'before', asOfIso: '2026-04-30T23:00:00.000Z', chainHeadHash: GENESIS_PREV_ROW_HASH, cumulativeRowCount: '4' },
+            { id: 'after', asOfIso: '2026-05-01T01:30:00.000Z', chainHeadHash: GENESIS_PREV_ROW_HASH, cumulativeRowCount: count },
+          ],
+          sealedPurgeDefs: [{ id: 'seal-unrelated', sealEnvelopeVersion: 2,
+            periodStart: '2026-04-29T00:00:00.000Z', periodEnd: '2026-04-30T00:00:00.000Z', rowCount: '2',
+            rootHash: sha256(Buffer.from('root')).toString('base64'), deletedAt: '2026-05-01T00:30:00.000Z' }],
+        });
+        const report = await verifyBundle(zip, { noRekor: true });
+        expect(report.integrityCheckpoints.ok).toBe(false);
+        expect(report.integrityCheckpoints.reason).toMatch(/chain_head_hash_mismatch/);
       });
 
       it('real end-to-end round trip: a be-shaped v4 bundle with a genuine sealed-purge reconciling a checkpoint decrease verifies OK via the shipped CLI subprocess', () => {
@@ -6766,6 +6805,7 @@ describe('verifyBundle', () => {
           sealedPurgeDefs: [
             {
               id: 'seal-e2e-1',
+              sealEnvelopeVersion: 2,
               periodStart: '2026-04-30T00:00:00.000Z',
               periodEnd: '2026-05-01T00:00:00.000Z',
               rowCount: '2',
