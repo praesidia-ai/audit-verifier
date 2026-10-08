@@ -19,8 +19,9 @@ Versioning follows [Semantic Versioning](https://semver.org/); while the package
   `/.well-known/praesidia-audit-keys.json`. With no `--platform-key` or `--trust-anchor`, a
   bundle attested by that key now gets its real verdict instead of `UNANCHORED`, and a
   bundle attested by any other platform key fails closed with `signature: ` (exit 1).
-  Confirm the fingerprint through the second channel, the security contact in
-  `https://praesidia.ai/.well-known/security.txt` (`docs/trust-anchor-verification.md`).
+  The proposed second channel for confirming the fingerprint, pending operator
+  confirmation, is the security contact in `https://praesidia.ai/.well-known/security.txt`
+  (`docs/trust-anchor-verification.md`, with its limit and the alternative).
   See Compatibility.
 - **A retention seal's unsigned `deletedAt` and `id` no longer explain a checkpoint
   decrease, and no seal waives a chain-head mismatch.** A legacy seal signs only

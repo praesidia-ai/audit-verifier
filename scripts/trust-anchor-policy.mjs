@@ -16,10 +16,11 @@ function reject(message) {
 /**
  * Validate the public trust anchor embedded in a verifier build.
  *
- * `allowEmpty` exists only for ordinary PR CI while the production key
- * ceremony is outstanding. Release callers must leave it false and must
- * provide `approvedFingerprint`, an operator-owned value obtained from the
- * key ceremony rather than copied from this source tree.
+ * `allowEmpty` exists only for ordinary PR CI, which accepts the documented
+ * empty pair (the state before the production key was pinned in 0.11.0).
+ * Release callers must leave it false and must provide `approvedFingerprint`,
+ * an operator-owned value confirmed independently (from the production KMS
+ * key and the second channel) rather than copied from this source tree.
  */
 export function validateTrustAnchor({
   derBase64,

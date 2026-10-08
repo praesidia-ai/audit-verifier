@@ -38,50 +38,60 @@ of *this package* is exactly the attack a customer's second channel should catch
 
 ## Second channel — where to compare it against
 
-**The security contact in `https://praesidia.ai/.well-known/security.txt`** (RFC 9116). Email
-it and ask for the current production platform key fingerprint. A person answers, through a
-human-mediated channel that is slower than a web page but harder for a single compromised
-system to spoof. It was chosen when the production key was pinned (0.11.0, 2026-10-08), and it
-meets both requirements for a second channel:
+**Proposed, pending operator confirmation: the security contact in
+`https://praesidia.ai/.well-known/security.txt`** (RFC 9116). An auditor emails it and asks for
+the current production platform key fingerprint. A person answers, through a human-mediated
+channel that is slower than a web page but harder for a single compromised system to spoof.
+
+The other pre-listed option is a static page on infrastructure operated separately from both
+items below (e.g. a security/trust-center subdomain with its own deploy credentials), stating
+the current `PLATFORM_PUBLIC_KEY_FINGERPRINT` in plain text with its `validFrom` date. It is not
+built. An operator confirms one, or both, and records the choice in this file and in
+`README.md`'s "Trust anchor" section in the same commit.
+
+A second channel must be:
 
 1. **Not the npm registry** — the registry is one of the two things this channel exists to
    cross-check, so it cannot vouch for itself.
 2. **Not `be-core`'s deploy pipeline** — the platform key and the application deploy share
    enough infrastructure that a deploy-pipeline compromise should not silently also compromise
-   the channel meant to catch it. The answer comes from a person, not from be: be's own
-   `GET /.well-known/praesidia-audit-keys.json` is therefore **not** a second channel.
+   the channel meant to catch it. be's own `GET /.well-known/praesidia-audit-keys.json` is
+   therefore **not** a second channel.
 
-Known limit: the praesidia.ai website serves `security.txt`, so whoever controls that site
-controls the address it lists.
-
-A static trust-center page on separately operated infrastructure (its own deploy credentials,
-stating the fingerprint with its `validFrom` date) is not built. If one is added, put its exact
-URL in this file and in `README.md`'s "Trust anchor" section together, in the same commit.
+**Known limit of the proposed channel**, and the reason it is not yet confirmed: the praesidia.ai
+website serves `security.txt`, and that website is deployed into the same AWS account as be.
+Whoever controls that account controls the address the file lists, so the email answer meets
+requirement 2 only if the auditor knows the address from somewhere else. The separately operated
+page above does not have this limit.
 
 ## Production release handoff
 
-The remaining input is one operator-approved production P-256 public key; private key material
-must stay inside KMS. The release operator must complete all of these views of that same input:
+The production key is pinned in `src/platform-pubkey.ts` since 0.11.0: the canonical base64 SPKI
+bytes of the production P-256 KMS key, read with `kms:GetPublicKey`, and their lowercase SHA-256
+fingerprint. Private key material stays inside KMS. What remains operator-owned before a release:
 
-1. Fetch the SPKI public bytes directly from the production KMS key during the approved ceremony.
-   Put the canonical base64 bytes and their lowercase SHA-256 fingerprint in
+1. On a key rotation only: fetch the SPKI public bytes directly from the new production KMS key
+   and put the canonical base64 bytes and their lowercase SHA-256 fingerprint in
    `src/platform-pubkey.ts`.
-2. Confirm the fingerprint through the independent channel above. A second operator then enters
+2. Confirm the fingerprint through the second channel above, once an operator has confirmed that
+   channel. A second operator then enters
    that independently confirmed value into the protected `audit-verifier-production` Environment
    variable `PRODUCTION_PLATFORM_KEY_FINGERPRINT`. Do not derive or copy this approval value from
    the source diff under review; that would collapse two trust inputs back into one.
 3. Require reviewers on that Environment and protect release tags with the repository ruleset.
    Repository configuration is operator-owned and cannot be made trustworthy by a file in the
    repository itself.
-4. Push a version tag only after the key-bearing commit and independent publication are approved.
+4. Commit the genuine production fixture at `release-fixture/production-audit-package.zip`
+   (AV-2751) and configure the `NPM_TOKEN` secret.
+5. Push a version tag only after the key-bearing commit and independent publication are approved.
    The tagged commit must be contained in `main`. The workflow builds and tests from that tag,
    runs the release assertion explicitly and again during both dry-run pack and publish, and
    publishes with npm provenance.
 
-The ordinary PR check intentionally permits the documented pair of empty constants so development
-can continue before the ceremony. That is not a release bypass: `prepack` always runs the stricter
-policy, where the empty pair and a missing operator approval both fail closed. Do not use
-`--ignore-scripts` for a release.
+The ordinary PR check also accepts the documented pair of empty constants, the state before the
+production key was pinned and of any build from source that empties it. That is not a release
+bypass: `prepack` always runs the stricter policy, where the empty pair and a missing operator
+approval both fail closed. Do not use `--ignore-scripts` for a release.
 
 ## What to actually compare
 

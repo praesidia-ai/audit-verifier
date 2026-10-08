@@ -11,6 +11,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { repin } from './repin.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const cli = path.join(root, 'dist/cli.js');
@@ -22,14 +23,7 @@ const run = (pkg: string, ...args: string[]) => runCli(cli, pkg, ...args);
 /** The built package with both platform-pubkey literals emptied: the placeholder build. */
 let unpinnedCli: string;
 beforeAll(() => {
-  const build = path.join(tmp, 'unpinned');
-  fs.cpSync(path.join(root, 'package.json'), path.join(build, 'package.json'));
-  fs.cpSync(path.join(root, 'dist'), path.join(build, 'dist'), { recursive: true });
-  const pubkeyJs = path.join(build, 'dist/platform-pubkey.js');
-  const emptied = fs.readFileSync(pubkeyJs, 'utf8').replace(/(PLATFORM_PUBLIC_KEY_(?:DER_B64|FINGERPRINT) = )'[^']*'/g, "$1''");
-  expect(emptied.match(/PLATFORM_PUBLIC_KEY_(?:DER_B64|FINGERPRINT) = ''/g)).toHaveLength(2);
-  fs.writeFileSync(pubkeyJs, emptied);
-  unpinnedCli = path.join(build, 'dist/cli.js');
+  unpinnedCli = path.join(repin(path.join(tmp, 'unpinned'), '', ''), 'dist/cli.js');
 });
 
 const K = fs.readFileSync(path.join(root, 'samples/sample-platform-key.pem'), 'utf8');

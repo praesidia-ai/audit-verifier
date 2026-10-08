@@ -11,6 +11,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { repin } from './repin.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'av-2750-'));
@@ -35,36 +36,14 @@ let unpinned: string;
 let acceptsAnything: string;
 let noSignatureCheck: string;
 
-/**
- * The release edit (the two literals in platform-pubkey) re-applied to a copy of the built
- * package: the same dist/ a `tsc` build with that pin ships. Returns the copy's directory.
- */
-function repin(name: string, derB64: string, fingerprint: string): string {
-  const build = path.join(tmp, name);
-  fs.cpSync(path.join(root, 'package.json'), path.join(build, 'package.json'));
-  fs.cpSync(path.join(root, 'dist'), path.join(build, 'dist'), { recursive: true });
-  const pubkeyJs = path.join(build, 'dist/platform-pubkey.js');
-  let replaced = 0;
-  const js = fs.readFileSync(pubkeyJs, 'utf8').replace(
-    /(PLATFORM_PUBLIC_KEY_(DER_B64|FINGERPRINT) = )'[^']*'/g,
-    (_match, decl: string, which: string) => {
-      replaced += 1;
-      return `${decl}'${which === 'DER_B64' ? derB64 : fingerprint}'`;
-    },
-  );
-  expect(replaced).toBe(2);
-  fs.writeFileSync(pubkeyJs, js);
-  return build;
-}
-
 beforeAll(() => {
   current = pack(root, path.join(tmp, 'current')); // dist/ is built by vitest globalSetup
 
   const der = crypto.createPublicKey(fs.readFileSync(path.join(root, 'samples/sample-platform-key.pem'), 'utf8'))
     .export({ type: 'spki', format: 'der' });
-  const build = repin('build', der.toString('base64'), crypto.createHash('sha256').update(der).digest('hex'));
+  const build = repin(path.join(tmp, 'build'), der.toString('base64'), crypto.createHash('sha256').update(der).digest('hex'));
   pinned = pack(build, path.join(tmp, 'pinned'));
-  unpinned = pack(repin('unpinned-build', '', ''), path.join(tmp, 'unpinned'));
+  unpinned = pack(repin(path.join(tmp, 'unpinned-build'), '', ''), path.join(tmp, 'unpinned'));
   // The same pinned build with its ECDSA check (the platform attestation signature) a no-op.
   fs.appendFileSync(path.join(build, 'dist/crypto.js'), '\nverifyEcdsaP256 = () => true;\n');
   noSignatureCheck = pack(build, path.join(tmp, 'no-signature-check'));

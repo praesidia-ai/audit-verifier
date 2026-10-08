@@ -42,7 +42,7 @@ try {
   });
   process.stdout.write(
     result.state === 'placeholder'
-      ? 'trust-anchor CI check: both constants remain the documented empty placeholder pending the production key ceremony — OK.\n'
+      ? 'trust-anchor CI check: both constants are the documented empty placeholder (no embedded trust anchor) — OK.\n'
       : 'trust-anchor CI check: pinned key is canonical P-256 and internally consistent — OK.\n',
   );
 } catch (error) {

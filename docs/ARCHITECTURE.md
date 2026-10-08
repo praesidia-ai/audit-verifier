@@ -125,4 +125,4 @@ curve other than P-256 (`README.md:1099` `rejects a missing value, a mismatch, a
 self-asserted fingerprint from being changed together and silently treated as approved.
 
 See also `docs/design/platform-key-hierarchy.md` and `docs/trust-anchor-verification.md` for the
-full key-ceremony design (the latter also names the second channel for the production pin).
+full key-ceremony design (the latter also names the proposed second channel for the production pin).

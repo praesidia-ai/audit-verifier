@@ -1088,9 +1088,9 @@ catch.
   `RESULT: OK` for anything consequential — never take `PLATFORM_PUBLIC_KEY_FINGERPRINT`
   on the word of this package alone. Full detail on where the fingerprint lives, what the
   second channel must and must not share infrastructure with, and what to compare:
-  `docs/trust-anchor-verification.md`. **The second channel is the security contact listed in
-  `https://praesidia.ai/.well-known/security.txt`** (RFC 9116): ask it for the current production
-  platform key fingerprint; a person answers. Compare that answer, byte-for-byte, against
+  `docs/trust-anchor-verification.md`. **Proposed second channel, pending operator confirmation:
+  the security contact in `https://praesidia.ai/.well-known/security.txt`** (RFC 9116; its limit
+  and the alternative are in that document). Compare the fingerprint it gives, byte-for-byte, against
   `PLATFORM_PUBLIC_KEY_FINGERPRINT` in the exact tarball/commit you installed —
   `npm view @praesidia/audit-verifier@<version> --json | jq .dist` lets you confirm the tarball
   hash independently of `npm install`'s own trust.
@@ -1213,9 +1213,9 @@ This package is intentionally **decoupled** from `be-core`:
   bundle's signing keys" when that check was bypassed. The flag itself and its underlying
   fail-closed default were already correct and are unchanged.
 - **No verification-strictness change**: every existing pass/fail verdict is unchanged for every
-  existing bundle. `platform-pubkey.ts`'s empty trust-anchor pin and its fail-closed
-  `platform_key_not_pinned` behavior are untouched and remain user-owed (production key
-  ceremony, tracked with MIL-0003). A key-hierarchy design for in-band platform-key rotation is
+  existing bundle. `platform-pubkey.ts`'s then-empty trust-anchor pin and its fail-closed
+  `platform_key_not_pinned` behavior were untouched in 0.9.2 (the production key was pinned
+  later, in 0.11.0). A key-hierarchy design for in-band platform-key rotation is
   written up (`docs/design/platform-key-hierarchy.md`) but not built.
 
 ### 0.9.1 (PA-0033 — HIGH-1 security re-attack fix, `PA01-SEC-reattack.md`)
