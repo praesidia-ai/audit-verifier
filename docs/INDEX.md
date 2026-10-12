@@ -37,16 +37,16 @@ required (`README.md:12` `Node.js 22.12 or newer is required.`).
   package boundary (`tsconfig.json` empty `paths` map), no network calls at all. Its crypto
   primitives are vendored and are **byte-for-byte compatible** with `be`'s `CryptoUtilsService`
   (AGV-003), `canonicalJson` (AGV-030), and `MerkleRootService` (AGV-033) — same DER prefixes,
-  domain-separation bytes, and key-ordering rules (`README.md:1139` `## Architecture`).
+  domain-separation bytes, and key-ordering rules (`README.md:1140` `## Architecture`).
 - **Reads what `be` writes**: `src/zip.ts`'s PKZIP reader reads STORED-method entries produced by
-  `be`'s `BundleExporterService`'s `ZipStreamWriter` (AGV-035, `README.md:1139` `## Architecture`).
+  `be`'s `BundleExporterService`'s `ZipStreamWriter` (AGV-035, `README.md:1140` `## Architecture`).
 - **Contract gate**: `scripts/contract-drift.mjs` — the CD-0002 cross-repo contract gate,
   extended (SCAN-AV-03) to also cover the audit-row contract — checks this package's expectations
   of `be`'s signable-row/bundle shape stay in sync. See `ARCHITECTURE.md`.
 - **Trust anchor**: the platform public key this build trusts is compiled into
   `src/platform-pubkey.ts`, not fetched at verify time — reintroducing a fetch would defeat the
   tool's own offline-trust purpose
-  (`README.md:1049` `## Trust anchor — verifying the CLI's embedded pin out-of-band`). The
+  (`README.md:1050` `## Trust anchor — verifying the CLI's embedded pin out-of-band`). The
   production key is pinned since 0.11.0; its proposed out-of-band confirmation channel, pending
   operator confirmation, is the `security.txt` contact (`docs/trust-anchor-verification.md`).
   That README section states this precisely; this triad does not restate the mechanism beyond

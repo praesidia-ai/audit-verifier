@@ -29,14 +29,14 @@ exactly that line, or when an anchor has no quote.
   (`src/rekor.ts:597` `hash.value.toLowerCase() !== sha256(signedBytes)`) and a logged signature
   that does not verify over those bytes under the root's key
   (`src/rekor.ts:603` `verifySignature(expected.signatureAlgorithm, signedBytes, signature.content`).
-  README step 6 states that rule (`README.md:596` `the bytes the root signature covers`).
+  README step 6 states that rule (`README.md:597` `the bytes the root signature covers`).
 - `src/platform-pubkey.ts` — PLATFORM_PUBLIC_KEY_DER_B64 / PLATFORM_PUBLIC_KEY_FINGERPRINT, the
-  compiled-in trust anchor (`README.md:1051` `The platform public key this build trusts is compiled into`).
-- `src/http-receipt.ts` — `src/http-receipt.ts:4` `export const HTTP_RECEIPT_VERSION`,
-  `src/http-receipt.ts:32` `export function httpTargetKeyFingerprint(`,
-  `src/http-receipt.ts:37` `export function httpRequestCommitment(`,
-  `src/http-receipt.ts:41` `export function verifyHttpReceipt(` — verifies independently-pinned
-  HTTP target receipts (`README.md:1434` `### Independently pinned HTTP target receipts`).
+  compiled-in trust anchor (`README.md:1052` `The platform public key this build trusts is compiled into`).
+- `src/http-receipt.ts` — `src/http-receipt.ts:5` `export const HTTP_RECEIPT_VERSION`,
+  `src/http-receipt.ts:33` `export function httpTargetKeyFingerprint(`,
+  `src/http-receipt.ts:38` `export function httpRequestCommitment(`,
+  `src/http-receipt.ts:42` `export function verifyHttpReceipt(` — verifies independently-pinned
+  HTTP target receipts (`README.md:1435` `### Independently pinned HTTP target receipts`).
 - `src/aibom.ts` — verifyAibomAttestation: be's attested AIBOM envelope
   (praesidia-aibom-attestation/v1), pinned tenant key (AV-0001).
 - `src/proofs.ts` — AV-0010: PROOF_COMPONENTS / deriveProofs / formatProofLines map components to
@@ -121,7 +121,7 @@ trust-anchor-policy.selftest.mjs   # self-test for the policy script
 ```
 
 `prepack` rejects a missing operator-approval value, a mismatch, a non-canonical key, or any EC
-curve other than P-256 (`README.md:1099` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
+curve other than P-256 (`README.md:1100` `rejects a missing value, a mismatch, a non-canonical key, or any EC curve`) — this prevents a key and its
 self-asserted fingerprint from being changed together and silently treated as approved.
 
 See also `docs/design/platform-key-hierarchy.md` and `docs/trust-anchor-verification.md` for the
