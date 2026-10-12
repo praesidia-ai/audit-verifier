@@ -7,8 +7,8 @@
  *                   ([S]B = R + [k]A holds; only the R check rejects it);
  *   (b) forgedKey — key = identity, R = [a]B, S = a
  *                   ([k]·identity vanishes; only the key check rejects it).
- * Each test first asserts the runtime's OpenSSL ACCEPTS the forgery, so
- * removing either check alone turns exactly one of them red. A permissive
+ * OpenSSL's acceptance is simulated (verifyMock returns true) so the result
+ * does not depend on the host OpenSSL version; removing either check alone turns exactly one of them red. A permissive
  * `crypto.verify` sweep then covers every small-order / non-canonical
  * encoding on both paths.
  */
@@ -89,15 +89,15 @@ describe('AV-2702 — verifyHttpReceipt rejects small-order key / R', () => {
     expect(verifyHttpReceipt(receipt(nodeCrypto.sign(null, receiptMsg, privateKey)), pemFromRaw(raw), expected)).toBe(true);
   });
 
-  it('(a) real key + small-order R: OpenSSL accepts, the verifier rejects', () => {
+  it('(a) real key + small-order R: permissive OpenSSL (mocked) accepts, the verifier rejects', () => {
     const { key, sig } = forgedR(receiptMsg);
-    expect(realVerify(null, receiptMsg, keyFromRaw(key), sig)).toBe(true);
+    verifyMock.mockImplementation(() => true);
     expect(verifyHttpReceipt(receipt(sig), pemFromRaw(key), expected)).toBe(false);
   });
 
-  it('(b) small-order key + prime-order R: OpenSSL accepts, the verifier rejects', () => {
+  it('(b) small-order key + prime-order R: permissive OpenSSL (mocked) accepts, the verifier rejects', () => {
     const { key, sig } = forgedKey();
-    expect(realVerify(null, receiptMsg, keyFromRaw(key), sig)).toBe(true);
+    verifyMock.mockImplementation(() => true);
     expect(verifyHttpReceipt(receipt(sig), pemFromRaw(key), expected)).toBe(false);
   });
 
@@ -179,19 +179,17 @@ describe('AV-2702 — verifyRfc3161Receipt rejects a small-order TSA key / R', (
     });
   });
 
-  it('(a) real key + small-order R: OpenSSL accepts, the verifier rejects', () => {
+  it('(a) real key + small-order R: permissive OpenSSL (mocked) accepts, the verifier rejects', () => {
     const { raw, a } = realKey();
     const sign = (m: Buffer) => Buffer.concat([IDENTITY, enc((h(IDENTITY, raw, m) * a) % L)]);
-    let signed: Buffer = Buffer.alloc(0);
-    expect(verify3161(tsaCert(raw), (m) => { signed = m; return sign(m); })).toMatchObject(CMS_INVALID);
-    expect(realVerify(null, signed, keyFromRaw(raw), sign(signed))).toBe(true);
+    verifyMock.mockImplementation(() => true);
+    expect(verify3161(tsaCert(raw), sign)).toMatchObject(CMS_INVALID);
   });
 
-  it('(b) small-order key + prime-order R: OpenSSL accepts, the verifier rejects', () => {
+  it('(b) small-order key + prime-order R: permissive OpenSSL (mocked) accepts, the verifier rejects', () => {
     const { key, sig } = forgedKey();
-    let signed: Buffer = Buffer.alloc(0);
-    expect(verify3161(tsaCert(key), (m) => { signed = m; return sig; })).toMatchObject(CMS_INVALID);
-    expect(realVerify(null, signed, keyFromRaw(key), sig)).toBe(true);
+    verifyMock.mockImplementation(() => true);
+    expect(verify3161(tsaCert(key), () => sig)).toMatchObject(CMS_INVALID);
   });
 
   it.each(REJECTED)('permissive verify: rejects %s as the TSA key and as R', (_, point) => {
