@@ -360,4 +360,27 @@ describe('QA-01b — sharded rekor log: entry logIndex is global, inclusion-proo
     const tampered = JSON.stringify({ ...JSON.parse(receiptJson), logIndex: 3245350256 });
     expect(verifyRekorReceipt(tampered, logPem, expected)).toEqual({ ok: false, reason: 'set_signature_invalid' });
   });
+
+  /** A valid sharded receipt whose inclusionProof.logIndex was rewritten after signing (the SET does not cover it). */
+  function tamperedProofIndex(proofLogIndex: number) {
+    const { receiptJson, logPem, expected } = shardedReceipt({ entryLogIndex: 3245350255, proofLogIndex: 9001 });
+    const r = JSON.parse(receiptJson);
+    return { tampered: JSON.stringify({ ...r, inclusionProof: { ...r.inclusionProof, logIndex: proofLogIndex } }), logPem, expected };
+  }
+
+  it('a proof logIndex rewritten above the entry logIndex fails closed', () => {
+    const { tampered, logPem, expected } = tamperedProofIndex(3245350256);
+    expect(verifyRekorReceipt(tampered, logPem, expected)).toEqual({ ok: false, reason: 'not_a_rekor_entry' });
+  });
+
+  // 9000 keeps the path length but flips sibling order at the leaf; the others change the path shape.
+  it.each([
+    [9000, 'inclusion_root_mismatch'],
+    [8999, 'inclusion_path_length_mismatch'],
+    [4500, 'inclusion_path_length_mismatch'],
+    [0, 'inclusion_path_length_mismatch'],
+  ])('a proof logIndex rewritten to %i (still <= entry index) breaks the Merkle walk: %s', (idx, reason) => {
+    const { tampered, logPem, expected } = tamperedProofIndex(idx);
+    expect(verifyRekorReceipt(tampered, logPem, expected)).toEqual({ ok: false, reason });
+  });
 });
