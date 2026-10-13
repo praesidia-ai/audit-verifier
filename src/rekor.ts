@@ -514,7 +514,7 @@ function normalizeReceipt(raw: unknown): NormalizedEntry | null {
     obj.integratedTime < 0 ||
     obj.logIndex < 0 ||
     p.treeSize < 1 ||
-    p.logIndex !== obj.logIndex
+    p.logIndex > obj.logIndex // entry index is global (shard offset + tree index), proof index tree-local: global >= local
   ) {
     return null;
   }

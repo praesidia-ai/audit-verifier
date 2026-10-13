@@ -78,27 +78,48 @@ function rekorAccepts(body: Body, message: Buffer): boolean {
   );
 }
 
-/** A single-leaf log entry for `body`: SET, signed checkpoint, inclusion proof, under a fresh log key. */
-function logEntry(body: Body, integratedTime: number): { receiptJson: string; logPem: string } {
+/**
+ * A log entry for `body`: SET, signed checkpoint, inclusion proof, under a fresh log key.
+ * Default is a single-leaf tree at index 0. `proofLogIndex` puts the leaf right-most in a
+ * tree of `proofLogIndex + 1` leaves (random siblings); `entryLogIndex` is the GLOBAL index
+ * the SET signs. On sharded Rekor the two differ by the shard offset (QA-01b).
+ */
+function logEntry(
+  body: Body,
+  integratedTime: number,
+  o: { entryLogIndex?: number; proofLogIndex?: number } = {},
+): { receiptJson: string; logPem: string } {
+  const proofLogIndex = o.proofLogIndex ?? 0;
+  const entryLogIndex = o.entryLogIndex ?? proofLogIndex;
+  const treeSize = proofLogIndex + 1;
   const { publicKey, privateKey } = p256();
   const logPem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
   const logID = sha256(publicKey.export({ type: 'spki', format: 'der' })).toString('hex');
   const bodyB64 = Buffer.from(JSON.stringify(body)).toString('base64');
   const set = crypto.sign(
     'sha256',
-    Buffer.from(`{"body":${JSON.stringify(bodyB64)},"integratedTime":${integratedTime},"logID":"${logID}","logIndex":0}`),
+    Buffer.from(`{"body":${JSON.stringify(bodyB64)},"integratedTime":${integratedTime},"logID":"${logID}","logIndex":${entryLogIndex}}`),
     privateKey,
   );
-  const leaf = sha256(Buffer.concat([Buffer.from([0x00]), Buffer.from(bodyB64, 'base64')]));
-  const note = `rekor.test\n1\n${leaf.toString('base64')}\n`;
+  // RFC 6962 audit path for the right-most leaf: odd index takes a left sibling, the lonely right-most node is promoted.
+  let root = sha256(Buffer.concat([Buffer.from([0x00]), Buffer.from(bodyB64, 'base64')]));
+  const hashes: string[] = [];
+  for (let index = proofLogIndex, size = treeSize; size > 1; index = Math.floor(index / 2), size = Math.floor((size + 1) / 2)) {
+    if (index % 2 === 1) {
+      const sibling = crypto.randomBytes(32);
+      hashes.push(sibling.toString('hex'));
+      root = sha256(Buffer.concat([Buffer.from([0x01]), sibling, root]));
+    }
+  }
+  const note = `rekor.test\n${treeSize}\n${root.toString('base64')}\n`;
   const noteSig = Buffer.concat([Buffer.from(logID, 'hex').subarray(0, 4), crypto.sign('sha256', Buffer.from(note), privateKey)]);
   const receipt = {
-    logIndex: 0,
+    logIndex: entryLogIndex,
     logId: logID,
     integratedTime,
     body: bodyB64,
     signedEntryTimestamp: set.toString('base64'),
-    inclusionProof: { logIndex: 0, treeSize: 1, rootHash: leaf.toString('hex'), hashes: [], checkpoint: `${note}\n— rekor.test ${noteSig.toString('base64')}\n` },
+    inclusionProof: { logIndex: proofLogIndex, treeSize, rootHash: root.toString('hex'), hashes, checkpoint: `${note}\n— rekor.test ${noteSig.toString('base64')}\n` },
   };
   return { receiptJson: JSON.stringify(receipt), logPem };
 }
@@ -293,5 +314,50 @@ describe('AV-2771 — verifyRekorReceipt fails closed on an unusable expected ro
         reason: 'expected_root_malformed',
       });
     }
+  });
+});
+
+describe('QA-01b — sharded rekor log: entry logIndex is global, inclusion-proof logIndex is tree-local', () => {
+  /** A valid receipt for a fresh P-256 root plus the expected root that matches it. */
+  function shardedReceipt(o: { entryLogIndex: number; proofLogIndex: number }) {
+    const { publicKey, privateKey } = p256();
+    const env: Envelope = { rootHash: Buffer.alloc(32, 7).toString('base64'), periodStart: iso(0), periodEnd: iso(3600), rowCount: 1 };
+    const signedBytes = rootSignedBytes(2, env);
+    const signature = signP256(signedBytes, privateKey);
+    const pem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+    const entry = logEntry(hashedrekord(sha256(signedBytes).toString('hex'), signature, pem), LOG_TIME, o);
+    const expected = {
+      rootHashB64: env.rootHash,
+      periodStart: env.periodStart,
+      periodEnd: env.periodEnd,
+      rowCount: env.rowCount,
+      signatureB64: signature,
+      signatureAlgorithm: 'ECDSA_P256_SHA256' as const,
+      publicKey: publicKey.export({ type: 'spki', format: 'der' }),
+      signatureFormat: 2,
+    };
+    return { ...entry, expected };
+  }
+
+  it('global entry index = tree index + shard offset verifies (SET over the global index, Merkle walk over the tree index)', () => {
+    const { receiptJson, logPem, expected } = shardedReceipt({ entryLogIndex: 3245350255, proofLogIndex: 9001 });
+    expect(JSON.parse(receiptJson)).toMatchObject({ logIndex: 3245350255, inclusionProof: { logIndex: 9001, treeSize: 9002 } });
+    expect(verifyRekorReceipt(receiptJson, logPem, expected)).toEqual({ ok: true });
+  });
+
+  it('an unsharded receipt (equal indexes) in a multi-leaf tree still verifies', () => {
+    const { receiptJson, logPem, expected } = shardedReceipt({ entryLogIndex: 9001, proofLogIndex: 9001 });
+    expect(verifyRekorReceipt(receiptJson, logPem, expected)).toEqual({ ok: true });
+  });
+
+  it('a proof index above the entry index is impossible on a real log and fails closed', () => {
+    const { receiptJson, logPem, expected } = shardedReceipt({ entryLogIndex: 9000, proofLogIndex: 9001 });
+    expect(verifyRekorReceipt(receiptJson, logPem, expected)).toEqual({ ok: false, reason: 'not_a_rekor_entry' });
+  });
+
+  it('the SET binds the global index: a receipt whose entry logIndex was rewritten fails', () => {
+    const { receiptJson, logPem, expected } = shardedReceipt({ entryLogIndex: 3245350255, proofLogIndex: 9001 });
+    const tampered = JSON.stringify({ ...JSON.parse(receiptJson), logIndex: 3245350256 });
+    expect(verifyRekorReceipt(tampered, logPem, expected)).toEqual({ ok: false, reason: 'set_signature_invalid' });
   });
 });

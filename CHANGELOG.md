@@ -8,6 +8,26 @@ package (`sdk`, `sdk-python`) as of this entry — this file establishes it here
 Versioning follows [Semantic Versioning](https://semver.org/); while the package is
 `0.x`, a backward-compatible capability addition bumps the minor version.
 
+## [0.11.1] — 2026-10-13
+
+### Fixed
+- **Receipts from the sharded public Rekor log verify** (AUDIT-QA01B, QA-01b). On
+  `rekor.sigstore.dev` the entry `logIndex` is the GLOBAL index (shard offset + tree index)
+  and `inclusionProof.logIndex` is the index in the shard's tree (sigstore protobuf-specs
+  `sigstore_rekor.proto`: `TransparencyLogEntry.log_index` vs `InclusionProof.log_index`).
+  0.11.0 required the two to be equal and so rejected every live receipt with
+  `rekor: not_a_rekor_entry`. The receipt is now accepted when
+  `inclusionProof.logIndex <= logIndex`; a proof index above the entry index still fails
+  closed with `not_a_rekor_entry`. Nothing else changes: the SET is still verified over the
+  global `logIndex`, the RFC 6962 inclusion walk still uses the proof's tree index, and the
+  signed checkpoint still has to commit to the proof's root and tree size.
+
+### Compatibility
+- Verifier behaviour change only; the bundle format, manifest ceiling (1–7) and every
+  exported signature are unchanged. Every bundle 0.11.0 accepts, 0.11.1 accepts with the
+  same verdict. **Upgrade note:** 0.11.0 rejects receipts from the sharded public Rekor log;
+  verify bundles anchored there with 0.11.1 or later.
+
 ## [0.11.0] — 2026-10-08
 
 ### Security

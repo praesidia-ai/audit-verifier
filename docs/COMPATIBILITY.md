@@ -6,7 +6,8 @@ A verifier fails closed on a format it does not know. It never skips one.
 
 | Verifier | Bundle manifest `version` | Audit package (AV-0007) | Decision disclosure v1 (AV-0009) | `praesidia.http-receipt.v1` | AIBOM attestation v1 | Superseding root (AV-0016) | Min Node |
 |---|---|---|---|---|---|---|---|
-| 0.11.0 | 1–7 | yes | yes | yes | yes | yes | >=22.12.0 |
+| 0.11.1 | 1–7 | yes | yes | yes | yes | yes | >=22.12.0 |
+| 0.11.0 (rejects sharded public Rekor receipts) | 1–7 | yes | yes | yes | yes | yes | >=22.12.0 |
 | 0.10.0 | 1–5 | — | — | — | — | — | >=22.12.0 |
 | 0.9.0 – 0.9.2 | 1–5 | — | — | — | — | — | >=22.12.0 |
 | 0.6.0 – 0.8.0 | 1–4 | — | — | — | — | — | >=22.12.0 |
